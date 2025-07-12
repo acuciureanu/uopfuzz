@@ -1,0 +1,56 @@
+# UoPFuzz Target Configuration for Pug v3.0.2
+# Known vulnerable template engine for prototype pollution
+
+name: "pug"
+package: "pug"
+version: "3.0.2"
+description: "Template engine vulnerable to prototype pollution leading to eval"
+
+# Entry points - functions that accept user input
+entryPoints:
+  - name: "compile"
+    inputType: "template"
+    description: "Main template compilation function"
+  - name: "render"
+    inputType: "template"  
+    description: "Direct template rendering"
+  - name: "renderFile"
+    inputType: "string"
+    description: "File-based template rendering"
+
+# Dangerous sinks - functions that could lead to RCE/XSS
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+  - "vm.runInThisContext"
+  - "vm.runInNewContext"
+
+# Properties commonly used in prototype pollution
+pollutionPoints:
+  - "isDebug"
+  - "template"
+  - "cache"
+  - "filename" 
+  - "compileDebug"
+  - "self"
+  - "line"
+  - "pretty"
+
+# Known vulnerable patterns for this target
+knownPatterns:
+  - description: "Prototype pollution via template options"
+    pattern: "__proto__.template"
+    sink: "eval"
+    reference: "Silent Spring project"
+  
+  - description: "Constructor pollution affecting compilation"
+    pattern: "constructor.prototype.self"
+    sink: "Function"
+    reference: "UOPF paper"
+
+# Testing configuration
+testConfig:
+  timeout: 30
+  maxDepth: 3
+  enableAsyncTesting: true
