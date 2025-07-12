@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { Worker } from 'worker_threads';
 import { logger } from '../utils/logger.js';
 import { TargetIntegration } from '../target-integration/index.js';
 import { InputGeneration } from '../input-generation/index.js';
@@ -100,9 +101,21 @@ export class Orchestrator {
 
   async executeFuzzingWorkflow() {
     const maxIterations = this.options.maxIterations;
-    const timeout = this.options.timeout * 1000; // Convert to milliseconds
+    const parallelWorkers = this.options.parallelWorkers || 1;
     
-    logger.info(`Starting ${maxIterations} fuzzing iterations with ${timeout/1000}s timeout`);
+    logger.info(`Starting ${maxIterations} fuzzing iterations with ${this.options.timeout}s timeout`);
+    
+    if (parallelWorkers > 1) {
+      logger.info(`🚀 Using ${parallelWorkers} parallel workers for fuzzing`);
+      await this.executeParallelFuzzing(maxIterations, parallelWorkers);
+    } else {
+      logger.info(`🔄 Using sequential execution (single worker)`);
+      await this.executeSequentialFuzzing(maxIterations);
+    }
+  }
+
+  async executeSequentialFuzzing(maxIterations) {
+    const timeout = this.options.timeout * 1000; // Convert to milliseconds
     
     for (let iteration = 0; iteration < maxIterations; iteration++) {
       try {
@@ -141,6 +154,143 @@ export class Orchestrator {
       
       this.results.iterationsCompleted = iteration + 1;
     }
+  }
+
+  async executeParallelFuzzing(maxIterations, parallelWorkers) {
+    const iterationsPerWorker = Math.ceil(maxIterations / parallelWorkers);
+    const workers = [];
+    const workerPromises = [];
+    
+    // Create and start workers
+    for (let workerId = 0; workerId < parallelWorkers; workerId++) {
+      const startIteration = workerId * iterationsPerWorker;
+      const endIteration = Math.min(startIteration + iterationsPerWorker, maxIterations);
+      
+      if (startIteration >= maxIterations) break; // No more iterations for this worker
+      
+      const workerData = {
+        config: this.config,
+        options: this.options,
+        startIteration,
+        endIteration,
+        workerId
+      };
+      
+      const workerFile = path.join(__dirname, 'worker.js');
+      const worker = new Worker(workerFile, { workerData });
+      
+      workers.push({ worker, workerId, startIteration, endIteration });
+      
+      // Create promise to handle worker completion
+      const workerPromise = new Promise((resolve, reject) => {
+        const workerResults = {
+          workerId,
+          results: null,
+          error: null
+        };
+        
+        worker.on('message', (message) => {
+          switch (message.type) {
+            case 'progress':
+              logger.debug(`Worker ${message.workerId}: ${message.message}`);
+              if (message.progress) {
+                // Update overall progress periodically
+                const totalCompleted = workers.reduce((sum, w) => {
+                  return sum + (w.completedIterations || 0);
+                }, 0);
+                
+                if (totalCompleted % 50 === 0) {
+                  logger.info(`Overall progress: ~${totalCompleted}/${maxIterations} iterations across ${parallelWorkers} workers`);
+                }
+              }
+              break;
+              
+            case 'completed':
+              workerResults.results = message.results;
+              logger.info(`✅ Worker ${message.workerId} completed with ${message.results.iterationsCompleted} iterations`);
+              resolve(workerResults);
+              break;
+              
+            case 'error':
+              workerResults.error = message.error;
+              logger.error(`❌ Worker ${message.workerId} failed: ${message.error.message}`);
+              reject(new Error(`Worker ${message.workerId} failed: ${message.error.message}`));
+              break;
+          }
+        });
+        
+        worker.on('error', (error) => {
+          workerResults.error = error;
+          logger.error(`❌ Worker ${workerId} error: ${error.message}`);
+          reject(error);
+        });
+        
+        worker.on('exit', (code) => {
+          if (code !== 0 && !workerResults.results && !workerResults.error) {
+            const error = new Error(`Worker ${workerId} exited with code ${code}`);
+            workerResults.error = error;
+            reject(error);
+          }
+        });
+      });
+      
+      workerPromises.push(workerPromise);
+      
+      logger.info(`Started worker ${workerId} for iterations ${startIteration} to ${endIteration - 1}`);
+    }
+    
+    try {
+      // Wait for all workers to complete
+      logger.info(`Waiting for ${workers.length} workers to complete...`);
+      const workerResults = await Promise.allSettled(workerPromises);
+      
+      // Aggregate results from all workers
+      await this.aggregateWorkerResults(workerResults);
+      
+    } finally {
+      // Clean up workers
+      await Promise.all(workers.map(async ({ worker }) => {
+        try {
+          await worker.terminate();
+        } catch (error) {
+          logger.debug(`Error terminating worker: ${error.message}`);
+        }
+      }));
+    }
+  }
+
+  async aggregateWorkerResults(workerResults) {
+    let totalIterationsCompleted = 0;
+    let totalInputsGenerated = 0;
+    let allPotentialChains = [];
+    let allErrors = [];
+    
+    for (const result of workerResults) {
+      if (result.status === 'fulfilled' && result.value.results) {
+        const workerResult = result.value.results;
+        totalIterationsCompleted += workerResult.iterationsCompleted;
+        totalInputsGenerated += workerResult.inputsGenerated;
+        allPotentialChains.push(...workerResult.potentialChains);
+        allErrors.push(...workerResult.errors);
+        
+        logger.info(`Worker ${workerResult.workerId}: ${workerResult.iterationsCompleted} iterations, ${workerResult.inputsGenerated} inputs, ${workerResult.potentialChains.length} chains`);
+      } else {
+        // Worker failed
+        allErrors.push({
+          worker: result.value?.workerId || 'unknown',
+          error: result.reason?.message || 'Worker failed'
+        });
+        logger.warn(`Worker failed: ${result.reason?.message}`);
+      }
+    }
+    
+    // Update main results
+    this.results.iterationsCompleted = totalIterationsCompleted;
+    this.results.inputsGenerated = totalInputsGenerated;
+    this.results.potentialChains = allPotentialChains;
+    this.results.errors.push(...allErrors);
+    
+    logger.info(`🎯 Parallel execution completed: ${totalIterationsCompleted} total iterations, ${allPotentialChains.length} potential chains found`);
   }
 
   async analyzeResults() {

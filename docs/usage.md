@@ -27,6 +27,12 @@ uopfuzz --config config/targets/pug.yaml \
 uopfuzz --config config/targets/hogan.yaml \
         --max-iterations 50 \
         --timeout 30
+
+# Parallel fuzzing with multiple workers for better performance
+uopfuzz --config config/targets/pug.yaml \
+        --max-iterations 1000 \
+        --parallel 4 \
+        --output ./parallel-results
 ```
 
 ## Interpreting Results
@@ -115,7 +121,24 @@ docker run -v $(pwd)/results:/app/results uopfuzz \
 2. **Use Dry Run**: Test configurations with `--dry-run` first
 3. **Monitor Resources**: Large iteration counts may consume significant memory
 4. **Timeout Tuning**: Adjust `--timeout` based on target complexity
-5. **Parallel Processing**: Future versions will support `--parallel` option
+5. **Parallel Processing**: Use `--parallel N` to utilize multiple CPU cores for better performance
+6. **Worker Scaling**: Set `--parallel` to match your CPU core count for optimal resource utilization
+
+### Parallel Execution
+```bash
+# Use 4 workers for quad-core systems
+uopfuzz --config config/targets/pug.yaml --parallel 4 --max-iterations 1000
+
+# Scale up for high-core systems
+uopfuzz --config config/targets/pug.yaml --parallel 8 --max-iterations 2000
+
+# Combine with other options
+uopfuzz --config config/targets/squirrelly.yaml \
+        --parallel $(nproc) \
+        --max-iterations 5000 \
+        --timeout 30 \
+        --output ./results
+```
 
 ## Troubleshooting
 
