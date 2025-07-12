@@ -80,4 +80,64 @@ describe('Orchestrator Integration', () => {
     // Cleanup
     await fs.rm('./test-results-2', { recursive: true, force: true });
   });
+
+  test('should execute fuzzing with parallel workers', async () => {
+    const configPath = path.join(__dirname, '../../config/targets/pug.yaml');
+    const outputDir = path.join(__dirname, '../../test-results-parallel');
+    
+    const orchestrator = new Orchestrator({
+      configPath,
+      outputDir,
+      timeout: 5,
+      dryRun: true,
+      maxIterations: 6,
+      parallelWorkers: 2,
+      verbose: false
+    });
+
+    const results = await orchestrator.run();
+    
+    // Verify results structure
+    assert(results.startTime);
+    assert(results.endTime);
+    assert.strictEqual(results.iterationsCompleted, 6);
+    assert(results.inputsGenerated > 0);
+    assert(Array.isArray(results.potentialChains));
+    assert(Array.isArray(results.errors));
+    
+    // Verify files were created
+    const files = await fs.readdir(outputDir);
+    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    const txtFiles = files.filter(f => f.endsWith('.txt'));
+    
+    assert(jsonFiles.length > 0, 'Should create JSON results file');
+    assert(txtFiles.length > 0, 'Should create text report file');
+    
+    // Cleanup
+    await fs.rm(outputDir, { recursive: true, force: true });
+  });
+
+  test('should handle more workers than iterations gracefully', async () => {
+    const configPath = path.join(__dirname, '../../config/targets/pug.yaml');
+    const outputDir = path.join(__dirname, '../../test-results-many-workers');
+    
+    const orchestrator = new Orchestrator({
+      configPath,
+      outputDir,
+      timeout: 5,
+      dryRun: true,
+      maxIterations: 2,
+      parallelWorkers: 5, // More workers than iterations
+      verbose: false
+    });
+
+    const results = await orchestrator.run();
+    
+    // Should still complete all iterations
+    assert.strictEqual(results.iterationsCompleted, 2);
+    assert(results.inputsGenerated > 0);
+    
+    // Cleanup
+    await fs.rm(outputDir, { recursive: true, force: true });
+  });
 });

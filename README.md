@@ -10,6 +10,7 @@ UoPFuzz is a hybrid security research framework that combines fuzzing with conco
 
 - **Configuration-driven**: YAML-based target library definitions for plug-and-play usage
 - **Hybrid approach**: Combines coverage-guided fuzzing with concolic execution
+- **Parallel processing**: Utilize multiple CPU cores with configurable worker threads
 - **Modular architecture**: Easy to extend and customize for specific research needs
 - **Safety-first**: Simulates exploits without executing dangerous code
 - **Real-world focus**: Targets known vulnerable libraries like pug v3.0.2, SquirrellyJS, hogan.js
@@ -18,7 +19,10 @@ UoPFuzz is a hybrid security research framework that combines fuzzing with conco
 
 ```bash
 npm install
+# Single-threaded execution
 node src/cli.js --config config/targets/pug.yaml --output results/
+# Multi-threaded execution for better performance
+node src/cli.js --config config/targets/pug.yaml --parallel 4 --output results/
 ```
 
 ## Architecture

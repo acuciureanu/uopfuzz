@@ -329,11 +329,12 @@ export class InputGeneration {
 
   applyTypeCoercion(input, config) {
     // Apply mutations that exploit JavaScript type coercion
+    // Use serializable representations instead of actual functions for worker compatibility
     const coercions = [
-      () => ({ toString: () => 'COERCED_STRING' }),
-      () => ({ valueOf: () => 42 }),
-      () => ({ [Symbol.toPrimitive]: () => 'SYMBOL_COERCED' }),
-      () => ({ toJSON: () => ({ polluted: true }) })
+      () => ({ toString: 'COERCED_STRING', __coercionType: 'toString' }),
+      () => ({ valueOf: 42, __coercionType: 'valueOf' }),
+      () => ({ symbolToPrimitive: 'SYMBOL_COERCED', __coercionType: 'symbol' }),
+      () => ({ toJSON: { polluted: true }, __coercionType: 'toJSON' })
     ];
     
     const coercion = coercions[Math.floor(Math.random() * coercions.length)];
@@ -356,11 +357,9 @@ export class InputGeneration {
     
     try {
       // Create pollution that might affect async operations
-      input.value.then = function(callback) {
-        // Simulate async pollution without actually polluting Object.prototype
-        if (callback) callback(this);
-        return this;
-      };
+      // Use serializable representation instead of actual function
+      input.value.then = 'ASYNC_POLLUTED_FUNCTION';
+      input.value.__asyncPollutionMarker = true;
     } catch (error) {
       // Fallback to simulation
       input.value.__asyncPollution = {
