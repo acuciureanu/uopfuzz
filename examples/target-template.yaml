@@ -1,0 +1,46 @@
+# UoPFuzz Target Configuration Template
+# Copy this file and customize for your target library
+
+name: "my-target"                    # Unique identifier
+package: "target-package-name"       # NPM package name  
+version: "1.0.0"                    # Specific version to test
+description: "Description of the target library and known vulnerabilities"
+
+# Entry points - functions that accept user input
+entryPoints:
+  - name: "functionName"            # Function to test
+    inputType: "object"             # Input type: string, object, template, mixed
+    description: "What this function does"
+  - name: "anotherFunction"
+    inputType: "string"
+    description: "Another entry point"
+
+# Dangerous sinks - functions that could lead to RCE/XSS
+sinks:
+  - "eval"                          # JavaScript eval function
+  - "Function"                      # Function constructor
+  - "child_process.exec"            # Command execution
+  - "vm.runInThisContext"           # VM context execution
+  - "innerHTML"                     # DOM manipulation (for client-side)
+
+# Properties commonly used in prototype pollution
+pollutionPoints:
+  - "isAdmin"                       # Authorization flags
+  - "isDebug"                       # Debug mode flags
+  - "template"                      # Template-related properties
+  - "cache"                         # Caching properties
+  - "trusted"                       # Trust-related flags
+  - "safe"                          # Safety flags
+
+# Optional: Known vulnerability patterns
+knownPatterns:
+  - description: "Pattern description"
+    pattern: "__proto__.property"    # Pollution pattern
+    sink: "eval"                     # Target sink
+    reference: "CVE or research paper"
+
+# Optional: Testing configuration
+testConfig:
+  timeout: 30                       # Timeout in seconds
+  maxDepth: 3                       # Maximum pollution depth
+  enableAsyncTesting: true          # Test async operations

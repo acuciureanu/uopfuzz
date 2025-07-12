@@ -1,0 +1,37 @@
+# UoPFuzz Target Configuration for SquirrellyJS
+# Template engine with known prototype pollution vulnerabilities
+
+name: "squirrelly"
+package: "squirrelly"
+version: "8.0.8"
+description: "Lightweight template engine vulnerable to prototype pollution"
+
+entryPoints:
+  - name: "render"
+    inputType: "template"
+    description: "Main template rendering function"
+  - name: "compile"
+    inputType: "template"
+    description: "Template compilation function"
+
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+
+pollutionPoints:
+  - "template"
+  - "options"
+  - "cache"
+  - "tags"
+  - "defaultFilter"
+  - "autoEscape"
+
+knownPatterns:
+  - description: "Template option pollution"
+    pattern: "__proto__.options"
+    sink: "eval"
+  
+testConfig:
+  timeout: 20
+  maxDepth: 2

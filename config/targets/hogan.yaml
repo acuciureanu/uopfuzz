@@ -1,0 +1,34 @@
+# UoPFuzz Target Configuration for Hogan.js
+# Mustache template engine with potential pollution vectors
+
+name: "hogan"
+package: "hogan.js"
+version: "3.0.2"
+description: "Mustache template engine with prototype pollution potential"
+
+entryPoints:
+  - name: "compile"
+    inputType: "template"
+    description: "Template compilation"
+  - name: "render"
+    inputType: "object"
+    description: "Template rendering with data"
+
+sinks:
+  - "eval"
+  - "Function"
+
+pollutionPoints:
+  - "partials"
+  - "lambda"
+  - "template"
+  - "delimiters"
+
+knownPatterns:
+  - description: "Partial template pollution"
+    pattern: "__proto__.partials"
+    sink: "Function"
+
+testConfig:
+  timeout: 25
+  maxDepth: 2
