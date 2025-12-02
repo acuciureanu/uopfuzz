@@ -1,9 +1,31 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
-import chalk from 'chalk';
 import { Orchestrator } from './orchestrator/index.js';
 import { logger } from './utils/logger.js';
+
+// ANSI color codes (replaces chalk - zero dependencies)
+const colors = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+};
+
+const chalk = {
+  red: (text) => `${colors.red}${text}${colors.reset}`,
+  green: (text) => `${colors.green}${text}${colors.reset}`,
+  yellow: (text) => `${colors.yellow}${text}${colors.reset}`,
+  blue: (text) => `${colors.blue}${text}${colors.reset}`,
+};
+
+// Add bold variants
+chalk.red.bold = (text) => `${colors.bright}${colors.red}${text}${colors.reset}`;
+chalk.green.bold = (text) => `${colors.bright}${colors.green}${text}${colors.reset}`;
+chalk.yellow.bold = (text) => `${colors.bright}${colors.yellow}${text}${colors.reset}`;
+chalk.blue.bold = (text) => `${colors.bright}${colors.blue}${text}${colors.reset}`;
 
 const program = new Command();
 

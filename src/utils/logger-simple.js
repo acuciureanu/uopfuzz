@@ -1,19 +1,25 @@
 /**
- * Simple, secure logger with zero dependencies
- * No supply chain risk from winston or chalk
+ * Simple, secure logger replacement for winston
+ * Zero dependencies, no supply chain risk
  */
 
-// ANSI color codes
+// ANSI color codes (replaces chalk)
 const colors = {
   reset: '\x1b[0m',
   bright: '\x1b[1m',
   dim: '\x1b[2m',
+
   red: '\x1b[31m',
   green: '\x1b[32m',
   yellow: '\x1b[33m',
   blue: '\x1b[34m',
   magenta: '\x1b[35m',
   cyan: '\x1b[36m',
+  white: '\x1b[37m',
+
+  bgRed: '\x1b[41m',
+  bgGreen: '\x1b[42m',
+  bgYellow: '\x1b[43m',
 };
 
 class SimpleLogger {
@@ -44,10 +50,9 @@ class SimpleLogger {
   formatMessage(level, ...args) {
     const timestamp = new Date().toISOString();
     const levelStr = level.toUpperCase().padEnd(5);
-    const message = args.map(arg =>
+    return `[${timestamp}] ${levelStr} ${args.map(arg =>
       typeof arg === 'object' ? JSON.stringify(arg) : String(arg)
-    ).join(' ');
-    return `[${timestamp}] ${levelStr} ${message}`;
+    ).join(' ')}`;
   }
 
   error(...args) {
@@ -79,5 +84,8 @@ class SimpleLogger {
   }
 }
 
-// Export singleton instance (compatible with winston usage)
+// Export a singleton instance
 export const logger = new SimpleLogger();
+
+// Export colors for direct use (replaces chalk)
+export { colors };
