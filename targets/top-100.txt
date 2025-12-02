@@ -1,0 +1,43 @@
+# Top 100 Most Downloaded npm Packages
+# Massive impact potential - scan these first!
+
+lodash
+chalk
+debug
+express
+react
+commander
+moment
+axios
+request
+async
+underscore
+bluebird
+colors
+glob
+minimist
+mkdirp
+rimraf
+yargs
+semver
+uuid
+validator
+dotenv
+cors
+body-parser
+morgan
+winston
+pug
+ejs
+handlebars
+mustache
+nunjucks
+jade
+config
+ini
+yaml
+js-yaml
+convict
+rc
+
+# Add more from: https://www.npmjs.com/browse/depended

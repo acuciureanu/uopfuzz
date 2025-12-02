@@ -1,0 +1,13 @@
+# Object Merge/Deep Clone Libraries
+# Direct prototype pollution vectors
+
+lodash
+deep-extend@0.6.0
+deepmerge@4.3.1
+merge@2.1.1
+merge-deep@3.0.3
+defaults-deep@1.0.0
+object-assign@4.1.1
+extend@3.0.2
+assign-deep@1.0.1
+mixin-deep@2.0.1

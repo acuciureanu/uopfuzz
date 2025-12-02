@@ -9,6 +9,11 @@
   },
   "scripts": {
     "start": "node src/cli.js",
+    "scan": "node src/auto-scanner.js",
+    "batch": "node src/batch-scanner.js",
+    "scan-templates": "node src/batch-scanner.js targets/template-engines.txt --concurrency 4",
+    "scan-merge": "node src/batch-scanner.js targets/object-merge.txt --concurrency 3",
+    "scan-top100": "node src/batch-scanner.js targets/top-100.txt --concurrency 5",
     "test": "node --test tests/**/*.test.js",
     "lint": "eslint src/ tests/",
     "dev": "node --watch src/cli.js",

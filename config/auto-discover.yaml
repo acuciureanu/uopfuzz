@@ -1,0 +1,69 @@
+# Auto-Discovery Config - Works for most npm packages
+# Automatically detects common entry points and sinks
+
+name: "auto-discover"
+package: "${PACKAGE_NAME}"  # Set via CLI: --package lodash@4.17.21
+version: "${PACKAGE_VERSION}"
+description: "Auto-discovery mode - no manual config needed"
+
+# Common entry points to try (will skip if not found)
+entryPoints:
+  # Template engines
+  - name: "render"
+    inputType: "template"
+  - name: "compile"
+    inputType: "template"
+  - name: "renderFile"
+    inputType: "string"
+
+  # Object utilities
+  - name: "merge"
+    inputType: "object"
+  - name: "assign"
+    inputType: "object"
+  - name: "extend"
+    inputType: "object"
+  - name: "defaults"
+    inputType: "object"
+
+  # Config loaders
+  - name: "load"
+    inputType: "object"
+  - name: "parse"
+    inputType: "string"
+  - name: "set"
+    inputType: "object"
+
+# Standard dangerous sinks
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+  - "child_process.spawn"
+  - "vm.runInThisContext"
+  - "vm.runInNewContext"
+  - "innerHTML"
+  - "outerHTML"
+
+# Common pollution targets
+pollutionPoints:
+  - "isAdmin"
+  - "isAuthenticated"
+  - "role"
+  - "permissions"
+  - "isDebug"
+  - "debug"
+  - "template"
+  - "cache"
+  - "trusted"
+  - "safe"
+  - "sanitized"
+  - "options"
+  - "config"
+  - "settings"
+
+testConfig:
+  timeout: 30
+  maxDepth: 3
+  enableAsyncTesting: true
+  autoDiscover: true  # Enable auto-discovery
