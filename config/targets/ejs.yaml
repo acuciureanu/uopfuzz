@@ -1,0 +1,42 @@
+# UoPFuzz Target Configuration for EJS
+# Embedded JavaScript template engine
+
+name: "ejs"
+package: "ejs"
+version: "3.1.9"
+description: "EJS template engine - very popular, known vulnerabilities"
+
+# Entry points
+entryPoints:
+  - name: "render"
+    inputType: "template"
+    description: "Render template with data"
+  - name: "compile"
+    inputType: "template"
+    description: "Compile template function"
+
+# Dangerous sinks
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+  - "vm.runInThisContext"
+
+# Properties to pollute
+pollutionPoints:
+  - "outputFunctionName"
+  - "localsName"
+  - "destructuredLocals"
+  - "escape"
+  - "cache"
+  - "filename"
+  - "context"
+  - "compileDebug"
+  - "debug"
+  - "strict"
+
+# Testing configuration
+testConfig:
+  timeout: 30
+  maxDepth: 3
+  enableAsyncTesting: true

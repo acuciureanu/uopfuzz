@@ -1,0 +1,49 @@
+# UoPFuzz Target Configuration for lodash.merge
+# Deep object merging - direct prototype pollution vector
+
+name: "lodash-merge"
+package: "lodash"
+version: "4.17.21"
+description: "Lodash merge function - known prototype pollution vector"
+
+# Entry points
+entryPoints:
+  - name: "merge"
+    inputType: "object"
+    description: "Deep merge objects"
+  - name: "mergeWith"
+    inputType: "object"
+    description: "Merge with customizer"
+  - name: "defaultsDeep"
+    inputType: "object"
+    description: "Deep defaults assignment"
+
+# Dangerous sinks
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+
+# Properties to pollute
+pollutionPoints:
+  - "isAdmin"
+  - "isAuthenticated"
+  - "role"
+  - "permissions"
+  - "template"
+  - "trusted"
+  - "safe"
+  - "sanitized"
+
+# Known patterns
+knownPatterns:
+  - description: "Classic merge prototype pollution"
+    pattern: '{"__proto__": {"isAdmin": true}}'
+    sink: "N/A"
+    reference: "CVE-2018-3721 (older versions)"
+
+# Testing configuration
+testConfig:
+  timeout: 20
+  maxDepth: 5
+  enableAsyncTesting: false
