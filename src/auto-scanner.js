@@ -77,10 +77,17 @@ class AutoScanner {
         verbose: this.options.verbose || false
       });
 
-      // Inject our generated config
+      // Inject our generated config (skip loadConfiguration step)
       orchestrator.config = config;
 
-      const results = await orchestrator.run();
+      // Run the workflow without loading config
+      await orchestrator.initializeComponents();
+      await orchestrator.setupTarget();
+      await orchestrator.executeFuzzingWorkflow();
+      await orchestrator.analyzeResults();
+      await orchestrator.saveResults();
+
+      const results = orchestrator.results;
 
       logger.info(`✅ Scan complete for ${this.packageName}`);
       return results;
