@@ -2,9 +2,20 @@
 
 A plug-and-play framework for Undefined-Oriented Programming (UOP) in prototype pollution gadget hunting.
 
+## ⚠️ Important: False Positives
+
+**This tool has a 60-80% false positive rate in real execution, 90-95% in dry-run mode.**
+
+- ✅ Good for: Mass scanning, discovery, casting a wide net
+- ❌ Bad for: Automated vulnerability reporting without verification
+- 🔍 **Manual verification REQUIRED** for all findings
+- 📖 See `HONEST_ASSESSMENT.md` for realistic expectations
+
 ## Overview
 
 UoPFuzz is a hybrid security research framework that combines fuzzing with concolic execution to detect and chain prototype pollution gadgets in JavaScript libraries. It focuses on Node.js environments to identify vulnerabilities leading to dangerous sinks like `eval` or `exec`.
+
+**Think of it as:** A force multiplier for security researchers, not a magic vulnerability detector.
 
 ## Features
 
