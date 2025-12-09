@@ -35,6 +35,10 @@
     "yaml": "2.3.4",
     "commander": "11.1.0"
   },
+  "optionalDependencies": {
+    "chromadb": "^1.8.1",
+    "@xenova/transformers": "^2.10.0"
+  },
   "devDependencies": {
     "eslint": "8.57.0"
   },
