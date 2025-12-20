@@ -9,6 +9,7 @@ A plug-and-play framework for Undefined-Oriented Programming (UOP) in prototype 
 - ✅ Good for: Mass scanning, discovery, casting a wide net
 - ❌ Bad for: Automated vulnerability reporting without verification
 - 🔍 **Manual verification REQUIRED** for all findings
+- 🧠 **ML-enhanced filtering reduces FP to ~33%** (see FILTER_COMPARISON.md)
 - 📖 See `HONEST_ASSESSMENT.md` for realistic expectations
 
 ## Overview
@@ -30,11 +31,38 @@ UoPFuzz is a hybrid security research framework that combines fuzzing with conco
 
 ```bash
 npm install
-# Single-threaded execution
+
+# Scan any package (auto-detects entry points)
+node src/auto-scanner.js pug --max-iterations 1000
+
+# Filter results with ML-enhanced filtering (reduces FP by 50%)
+node src/simple-ml-filter.js results/pug/results-*.json
+
+# Or use config-based scanning
 node src/cli.js --config config/targets/pug.yaml --output results/
-# Multi-threaded execution for better performance
-node src/cli.js --config config/targets/pug.yaml --parallel 4 --output results/
 ```
+
+## ML-Enhanced Filtering
+
+UoPFuzz includes a lightweight ML filter using TF-IDF and semantic similarity:
+
+- **Zero complex dependencies**: Pure JavaScript implementation
+- **50% FP reduction**: From 60-80% down to ~33%
+- **CVE matching**: Pre-loaded with 5 known vulnerability patterns
+- **Fast**: ~10ms per chain
+
+```bash
+# After scanning, apply ML filter
+node src/simple-ml-filter.js results/package/results-*.json
+
+# Review high confidence findings (best similarity to known CVEs)
+cat results/package/*-simple-ml-filtered.json | jq '.highConfidence'
+
+# Review medium confidence findings
+cat results/package/*-simple-ml-filtered.json | jq '.mediumConfidence'
+```
+
+See `FILTER_COMPARISON.md` for detailed comparison with rule-based filtering.
 
 ## Architecture
 
