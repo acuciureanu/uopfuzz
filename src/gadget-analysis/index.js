@@ -119,20 +119,23 @@ export class GadgetAnalysis {
     const chains = [];
 
     if (trace.prototypeChanges.length > 0 && trace.sinkAccesses.length > 0) {
-      for (const pollution of trace.prototypeChanges) {
-        for (const sinkAccess of trace.sinkAccesses) {
-          if (sinkAccess.timestamp > pollution.timestamp) {
-            const chain = this.createChain({
-              type: 'direct',
-              pollution,
-              sink: sinkAccess,
-              trace,
-              config,
-              steps: [pollution, sinkAccess]
-            });
+      // Pre-sort sinks by timestamp to skip early entries faster
+      const sortedSinks = [...trace.sinkAccesses].sort((a, b) => a.timestamp - b.timestamp);
 
-            chains.push(chain);
-          }
+      for (const pollution of trace.prototypeChanges) {
+        for (const sinkAccess of sortedSinks) {
+          if (sinkAccess.timestamp <= pollution.timestamp) continue;
+
+          const chain = this.createChain({
+            type: 'direct',
+            pollution,
+            sink: sinkAccess,
+            trace,
+            config,
+            steps: [pollution, sinkAccess]
+          });
+
+          chains.push(chain);
         }
       }
     }
@@ -147,6 +150,9 @@ export class GadgetAnalysis {
         trace.propertyAccesses.length > 0 &&
         trace.sinkAccesses.length > 0) {
 
+      // Pre-sort sinks by timestamp to enable binary-search-style skipping
+      const sortedSinks = [...trace.sinkAccesses].sort((a, b) => a.timestamp - b.timestamp);
+
       for (const pollution of trace.prototypeChanges) {
         const relevantAccesses = trace.propertyAccesses.filter(
           access => access.timestamp > pollution.timestamp &&
@@ -154,11 +160,10 @@ export class GadgetAnalysis {
         );
 
         for (const access of relevantAccesses) {
-          const relevantSinks = trace.sinkAccesses.filter(
-            sink => sink.timestamp > access.timestamp
-          );
+          // Use pre-sorted sinks: find first sink after access.timestamp
+          for (const sink of sortedSinks) {
+            if (sink.timestamp <= access.timestamp) continue;
 
-          for (const sink of relevantSinks) {
             const chain = this.createChain({
               type: 'multi-step',
               pollution,
