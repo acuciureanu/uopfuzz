@@ -236,7 +236,8 @@ export function analyzeTaintLog(log) {
 
   // Compute Shannon entropy of property access distribution
   // Higher entropy = more diverse exploration
-  const totalAccesses = Array.from(accessFrequency.values()).reduce((a, b) => a + b, 0);
+  let totalAccesses = 0;
+  for (const count of accessFrequency.values()) totalAccesses += count;
   let accessEntropy = 0;
   if (totalAccesses > 0) {
     for (const count of accessFrequency.values()) {

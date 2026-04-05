@@ -2,6 +2,10 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+let childProcessModule;
+try { childProcessModule = require('child_process'); } catch { childProcessModule = null; }
 
 /**
  * Instrumentation Engine - Real V8 Coverage + Proxy Taint Tracking
@@ -397,10 +401,9 @@ export class Instrumentation {
     }
 
     try {
-      const childProcess = require('child_process');
-      if (childProcess && childProcess.exec) {
-        const originalExec = childProcess.exec;
-        childProcess.exec = function(command, options, callback) {
+      if (childProcessModule && childProcessModule.exec) {
+        const originalExec = childProcessModule.exec;
+        childProcessModule.exec = function(command, options, callback) {
           trace.sinkAccesses.push({
             sink: 'child_process.exec',
             arguments: [command],

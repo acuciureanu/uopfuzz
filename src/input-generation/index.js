@@ -34,8 +34,9 @@ export class InputGeneration {
     ];
     this.generatedCount = 0;
 
-    // Seed corpus with energy-based scheduling
+    // Seed corpus with energy-based scheduling (capped to prevent unbounded growth)
     this.seedCorpus = [];
+    this.maxSeedCorpusSize = 500;
     // Coverage feedback from instrumentation
     this.coverageFeedback = { novelInputs: [], coverageMap: new Map() };
     // Track mutation effectiveness per strategy (Thompson sampling)
@@ -378,11 +379,18 @@ export class InputGeneration {
       // Add to seed corpus with boosted energy
       const energyBoost = Math.min(8, Math.pow(2, coverageResult.newEdges));
       this.seedCorpus.push({
-        input: JSON.parse(JSON.stringify(input)),
+        input: structuredClone(input),
         energy: energyBoost,
         novelEdges: coverageResult.newEdges,
         addedAt: Date.now()
       });
+
+      // Evict lowest-energy seeds when corpus exceeds size cap
+      if (this.seedCorpus.length > this.maxSeedCorpusSize) {
+        this.seedCorpus.sort((a, b) => b.energy - a.energy);
+        this.seedCorpus.length = this.maxSeedCorpusSize;
+      }
+
       this.coverageFeedback.novelInputs.push(input);
 
       // Update strategy feedback
@@ -397,7 +405,7 @@ export class InputGeneration {
   }
 
   async applyMutationStrategy(input, strategy, config) {
-    const cloned = JSON.parse(JSON.stringify(input));
+    const cloned = structuredClone(input);
     cloned.metadata.generation = 'mutation';
     cloned.metadata.strategy = strategy;
 
@@ -652,6 +660,9 @@ export class InputGeneration {
       // Select seeds proportional to their energy (power schedule)
       const totalEnergy = this.seedCorpus.reduce((s, seed) => s + seed.energy, 0);
 
+      // Sample strategies once per call (avoids repeated Beta sampling in loop)
+      const rankedStrategies = this.selectStrategiesByThompson();
+
       for (let i = 0; i < Math.min(count, 3); i++) {
         let r = Math.random() * totalEnergy;
         let selectedSeed = this.seedCorpus[0];
@@ -665,11 +676,11 @@ export class InputGeneration {
         }
 
         // Mutate the selected seed
-        const base = JSON.parse(JSON.stringify(selectedSeed.input));
+        const base = structuredClone(selectedSeed.input);
         base.metadata.generation = 'coverage_guided';
         base.metadata.parentEnergy = selectedSeed.energy;
 
-        const strategy = this.selectStrategiesByThompson()[0];
+        const strategy = rankedStrategies[i % rankedStrategies.length];
         const mutated = await this.applyMutationStrategy(base, strategy, config);
         if (mutated) inputs.push(mutated);
       }
