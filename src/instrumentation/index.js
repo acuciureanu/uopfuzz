@@ -1,24 +1,37 @@
 import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
+import { V8CoverageCollector } from '../utils/v8-coverage.js';
+import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 
 /**
- * Instrumentation Engine with Coverage-Guided Feedback
+ * Instrumentation Engine - Real V8 Coverage + Proxy Taint Tracking
  *
- * Combines dynamic taint tracking with AFL-style edge coverage to
- * provide feedback for the input generation power schedule.
+ * Three layers of instrumentation, each grounded in research:
  *
- * Instrumentation approach based on:
+ * Layer 1 - V8 Precise Coverage (real):
+ *   Uses the V8 Inspector Profiler.takePreciseCoverage API to collect
+ *   actual basic-block and branch coverage from the JS engine.
+ *   This is the same mechanism used by c8/istanbul/nyc.
+ *   Reference: V8 Inspector Protocol, Profiler domain
  *
- * 1. Dynamic Taint Analysis (Schwartz et al., IEEE S&P 2010):
- *    Tracks data flow from pollution sources to sinks through
- *    property accesses and function calls.
+ * Layer 2 - Proxy-Based Taint Tracking (real):
+ *   ES6 Proxy intercepts EVERY property access (.get, .set, .has)
+ *   on input objects, creating a complete data-flow trace from
+ *   pollution source to sink. Catches the fundamental operation
+ *   that prototype pollution exploits.
+ *   Reference: Schwartz et al., IEEE S&P 2010
  *
- * 2. Edge Coverage (Zalewski, AFL 2014): Records control-flow
- *    edges exercised during execution for novelty detection.
+ * Layer 3 - Global Sink Interception:
+ *   Replaces dangerous global functions (eval, Function, exec) with
+ *   logging wrappers that record sink access without executing.
  *
- * 3. Prototype Chain Monitoring: Hooks into Object.setPrototypeOf,
- *    Object.defineProperty, and property access methods to detect
- *    prototype modifications at runtime.
+ * Layer 1 answers: "what code paths did this input exercise?"
+ * Layer 2 answers: "how did data flow through the target?"
+ * Layer 3 answers: "did the data reach a dangerous function?"
+ *
+ * Together they close the loop: coverage novelty feeds back to the
+ * input generator's power schedule, taint flow feeds into gadget
+ * chain analysis, and sink hits confirm exploitability.
  */
 export class Instrumentation {
   constructor(options) {
@@ -27,7 +40,48 @@ export class Instrumentation {
     this.propertyAccesses = new Map();
     this.originalConsole = {};
     this.instrumentedFunctions = new Set();
+
+    // Layer 1: AFL-style edge coverage (computed from trace events)
     this.coverageTracker = new CoverageTracker();
+
+    // Layer 1b: Real V8 coverage (from inspector protocol)
+    this.v8Collector = new V8CoverageCollector();
+    this.v8CoverageEnabled = false;
+
+    // Accumulated V8 metrics across all executions
+    this.v8Metrics = {
+      totalBlocks: 0,
+      coveredBlocks: 0,
+      totalBranches: 0,
+      coveredBranches: 0,
+      totalFunctions: 0,
+      coveredFunctions: 0
+    };
+  }
+
+  /**
+   * Initialize V8 coverage collection.
+   * Called once before the fuzzing loop starts.
+   */
+  async enableV8Coverage() {
+    try {
+      await this.v8Collector.start();
+      this.v8CoverageEnabled = true;
+      logger.debug('V8 precise coverage collection enabled');
+    } catch (error) {
+      logger.warn(`V8 coverage unavailable: ${error.message}. Falling back to trace-based coverage.`);
+      this.v8CoverageEnabled = false;
+    }
+  }
+
+  /**
+   * Stop V8 coverage collection.
+   */
+  async disableV8Coverage() {
+    if (this.v8CoverageEnabled) {
+      await this.v8Collector.stop();
+      this.v8CoverageEnabled = false;
+    }
   }
 
   async executeWithTracing(inputs, config) {
@@ -77,15 +131,41 @@ export class Instrumentation {
       errors: [],
       success: false,
       startTime: Date.now(),
-      endTime: null
+      endTime: null,
+      // New: taint analysis results
+      taintAnalysis: null,
+      // New: V8 coverage metrics for this input
+      v8Coverage: null
     };
 
     try {
-      this.setupPropertyTracing(trace);
-      this.setupPrototypeTracing(trace);
+      // Layer 3: Set up global sink interception
       this.setupSinkTracing(trace, config.sinks);
 
-      await this.executeInput(input, config, trace);
+      // Execute the input with Layer 2 (Proxy taint tracking)
+      await this.executeInputWithTaintTracking(input, config, trace);
+
+      // Layer 1b: Collect V8 coverage snapshot for this input
+      if (this.v8CoverageEnabled) {
+        try {
+          const rawCoverage = await this.v8Collector.takeCoverage();
+          const metrics = this.v8Collector.extractMetrics(rawCoverage);
+          trace.v8Coverage = metrics.summary;
+
+          // Feed V8 block data into the AFL-style bitmap
+          this.feedV8CoverageIntoBitmap(metrics, trace);
+
+          // Accumulate V8 metrics
+          this.v8Metrics.totalBlocks += metrics.summary.totalBlocks;
+          this.v8Metrics.coveredBlocks += metrics.summary.coveredBlocks;
+          this.v8Metrics.totalBranches += metrics.summary.totalBranches;
+          this.v8Metrics.coveredBranches += metrics.summary.coveredBranches;
+          this.v8Metrics.totalFunctions += metrics.summary.totalFunctions;
+          this.v8Metrics.coveredFunctions += metrics.summary.coveredFunctions;
+        } catch (error) {
+          logger.debug(`V8 coverage snapshot failed: ${error.message}`);
+        }
+      }
 
       trace.success = true;
 
@@ -99,12 +179,127 @@ export class Instrumentation {
       trace.endTime = Date.now();
       this.cleanupTracing();
 
-      // Compute edge coverage from trace events
+      // Layer 1: Compute edge coverage from trace events
+      // (this always runs, even if V8 coverage is also available)
       trace.coverage = this.coverageTracker.computeCoverageFromTrace(trace);
       trace.coverageResult = this.coverageTracker.mergeAndCheckNovelty(trace.coverage);
     }
 
     return trace;
+  }
+
+  /**
+   * Execute an input with Proxy-based taint tracking (Layer 2).
+   *
+   * Wraps the input value in a recursive Proxy that logs every
+   * property access. This catches `.property` reads that the old
+   * hasOwnProperty hook completely missed.
+   *
+   * After execution, analyzes the taint log for:
+   * - UOP candidates (undefined property reads)
+   * - Prototype chain lookups (values from proto chain)
+   * - Read-then-write patterns (common gadget shape)
+   */
+  async executeInputWithTaintTracking(input, config, trace) {
+    const taintLog = [];
+
+    // Wrap input in taint-tracking proxy
+    let trackedInput = input.value;
+    if (trackedInput && typeof trackedInput === 'object' && !Buffer.isBuffer(trackedInput)) {
+      try {
+        trackedInput = createTaintProxy(trackedInput, taintLog);
+      } catch (error) {
+        logger.debug(`Taint proxy creation failed: ${error.message}`);
+      }
+    }
+
+    // Also set up old-style prototype/property hooks for compatibility
+    this.setupPropertyTracing(trace);
+    this.setupPrototypeTracing(trace);
+
+    // Execute with the tainted input
+    await this.executeInput(
+      { ...input, value: trackedInput },
+      config,
+      trace
+    );
+
+    // Analyze taint log
+    if (taintLog.length > 0) {
+      trace.taintAnalysis = analyzeTaintLog(taintLog);
+
+      // Convert taint events to trace-compatible property accesses
+      // so the existing gadget analysis can use them
+      for (const event of taintLog) {
+        if (event.type === 'get') {
+          trace.propertyAccesses.push({
+            type: 'taint_proxy',
+            object: event.path.split('.').slice(0, -1).join('.') || '$',
+            property: event.property,
+            timestamp: event.timestamp,
+            result: event.isUndefined ? undefined : '[value]',
+            isUOPCandidate: event.isUOPCandidate,
+            isPrototypeChainLookup: event.isPrototypeChainLookup
+          });
+        }
+        if (event.type === 'setPrototypeOf') {
+          trace.prototypeChanges.push({
+            type: 'setPrototypeOf',
+            target: event.path,
+            property: '__proto__',
+            timestamp: event.timestamp
+          });
+        }
+      }
+    }
+  }
+
+  /**
+   * Feed V8 block coverage data into the AFL-style bitmap.
+   *
+   * Maps V8's (scriptId, startOffset, endOffset) tuples to bitmap
+   * positions using the same hash function. This means the power
+   * schedule receives REAL coverage feedback from the JS engine,
+   * not just our hook-based approximation.
+   */
+  feedV8CoverageIntoBitmap(metrics, trace) {
+    const localBitmap = this.coverageTracker.createLocalBitmap();
+    let prevLoc = 0;
+
+    for (const block of metrics.blocks) {
+      if (block.count === 0) continue;
+
+      // Use script + offset as the location identifier
+      const loc = this.coverageTracker.hashLocation(
+        'v8',
+        `${block.scriptId}:${block.startOffset}`,
+        block.functionName || ''
+      );
+
+      // Record as edge: prevBlock -> thisBlock
+      this.coverageTracker.recordEdge(localBitmap, prevLoc, loc);
+      prevLoc = loc >> 1;
+    }
+
+    // For branches: record taken/not-taken edges
+    for (const branch of metrics.branches) {
+      const loc = this.coverageTracker.hashLocation(
+        'v8br',
+        `${branch.scriptUrl}:${branch.startOffset}`,
+        branch.taken ? 'T' : 'F'
+      );
+      this.coverageTracker.recordEdge(localBitmap, prevLoc, loc);
+      prevLoc = loc >> 1;
+    }
+
+    // Merge V8-derived bitmap into global
+    const result = this.coverageTracker.mergeAndCheckNovelty(localBitmap);
+
+    // If V8 coverage found new edges, mark in trace
+    if (result.isNovel && trace.coverageResult) {
+      trace.coverageResult.v8NewEdges = result.newEdges;
+      trace.coverageResult.isNovel = true;
+    }
   }
 
   setupPropertyTracing(trace) {
@@ -190,7 +385,7 @@ export class Instrumentation {
               callStack: new Error().stack
             });
 
-            logger.warn(`🚨 Potential sink access detected: ${sink}`);
+            logger.warn(`Potential sink access detected: ${sink}`);
             return '[SIMULATED_SINK_RESULT]';
           };
 
@@ -213,7 +408,7 @@ export class Instrumentation {
             callStack: new Error().stack
           });
 
-          logger.warn(`🚨 Command execution attempt detected: ${command}`);
+          logger.warn(`Command execution attempt detected: ${command}`);
           if (callback) callback(null, '[SIMULATED_EXEC_RESULT]', '');
           return { pid: 12345 };
         };
@@ -385,16 +580,17 @@ export class Instrumentation {
   }
 
   /**
-   * Get coverage statistics from the coverage tracker.
+   * Get coverage statistics combining both trace-based and V8 coverage.
    */
   getCoverageStats() {
-    return this.coverageTracker.getStats();
+    const traceStats = this.coverageTracker.getStats();
+    return {
+      ...traceStats,
+      v8CoverageEnabled: this.v8CoverageEnabled,
+      v8Metrics: this.v8CoverageEnabled ? { ...this.v8Metrics } : null
+    };
   }
 
-  /**
-   * Get the coverage tracker instance for external use
-   * (e.g., by the orchestrator for convergence detection).
-   */
   getCoverageTracker() {
     return this.coverageTracker;
   }
@@ -408,7 +604,18 @@ export class Instrumentation {
       coverageEdges: coverageStats.coveredEdges,
       coverageDensity: coverageStats.bitmapDensity,
       coverageEntropy: this.coverageTracker.getCoverageEntropy(),
-      saturationRate: coverageStats.saturationRate
+      saturationRate: coverageStats.saturationRate,
+      v8CoverageEnabled: this.v8CoverageEnabled,
+      v8BlockCoverage: this.v8CoverageEnabled
+        ? (this.v8Metrics.totalBlocks > 0
+          ? this.v8Metrics.coveredBlocks / this.v8Metrics.totalBlocks
+          : 0)
+        : null,
+      v8BranchCoverage: this.v8CoverageEnabled
+        ? (this.v8Metrics.totalBranches > 0
+          ? this.v8Metrics.coveredBranches / this.v8Metrics.totalBranches
+          : 0)
+        : null
     };
   }
 }

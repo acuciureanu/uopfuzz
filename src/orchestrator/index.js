@@ -105,6 +105,11 @@ export class Orchestrator {
     this.instrumentation = new Instrumentation(this.options);
     this.gadgetAnalysis = new GadgetAnalysis(this.options);
 
+    // Enable real V8 coverage collection when not in dry-run mode
+    if (!this.options.dryRun) {
+      await this.instrumentation.enableV8Coverage();
+    }
+
     logger.debug('All components initialized');
   }
 
@@ -353,6 +358,9 @@ export class Orchestrator {
     this.results.coverageStats = this.instrumentation.getCoverageStats();
     this.results.strategyEffectiveness = this.inputGeneration.getGenerationStats();
 
+    // Stop V8 coverage collection
+    await this.instrumentation.disableV8Coverage();
+
     logger.info(`Analysis complete: ${rankedChains.length} unique potential chains identified`);
   }
 
@@ -393,12 +401,23 @@ export class Orchestrator {
     // Coverage Analysis
     if (this.results.coverageStats) {
       const cs = this.results.coverageStats;
-      report += `Coverage Analysis (AFL-style edge coverage)\n`;
-      report += `--------------------------------------------\n`;
-      report += `  Edges Discovered: ${cs.coveredEdges}\n`;
-      report += `  Bitmap Density: ${(cs.bitmapDensity * 100).toFixed(4)}%\n`;
-      report += `  Saturation Rate: ${(cs.saturationRate * 100).toFixed(1)}%\n`;
-      report += `  Inputs Processed: ${cs.totalInputsProcessed}\n\n`;
+      report += `Coverage Analysis\n`;
+      report += `-----------------\n`;
+      report += `  Edge Coverage (AFL-style bitmap):\n`;
+      report += `    Edges Discovered: ${cs.coveredEdges}\n`;
+      report += `    Bitmap Density: ${(cs.bitmapDensity * 100).toFixed(4)}%\n`;
+      report += `    Saturation Rate: ${(cs.saturationRate * 100).toFixed(1)}%\n`;
+      report += `    Inputs Processed: ${cs.totalInputsProcessed}\n`;
+      if (cs.v8CoverageEnabled && cs.v8Metrics) {
+        const v8 = cs.v8Metrics;
+        report += `  V8 Precise Coverage (real engine data):\n`;
+        report += `    Block Coverage: ${v8.coveredBlocks}/${v8.totalBlocks} (${v8.totalBlocks > 0 ? ((v8.coveredBlocks/v8.totalBlocks)*100).toFixed(1) : 0}%)\n`;
+        report += `    Branch Coverage: ${v8.coveredBranches}/${v8.totalBranches} (${v8.totalBranches > 0 ? ((v8.coveredBranches/v8.totalBranches)*100).toFixed(1) : 0}%)\n`;
+        report += `    Function Coverage: ${v8.coveredFunctions}/${v8.totalFunctions} (${v8.totalFunctions > 0 ? ((v8.coveredFunctions/v8.totalFunctions)*100).toFixed(1) : 0}%)\n`;
+      } else {
+        report += `  V8 Precise Coverage: disabled (dry-run mode)\n`;
+      }
+      report += `\n`;
     }
 
     // Convergence Info
@@ -448,12 +467,15 @@ export class Orchestrator {
     report += `\nMethodology\n`;
     report += `===========\n`;
     report += `This analysis uses evidence-based techniques:\n`;
-    report += `- Coverage guidance: AFL-style edge coverage (Böhme et al., CCS 2016)\n`;
-    report += `- Risk scoring: CVSS v3.1 aligned (FIRST, 2019)\n`;
-    report += `- Confidence: Bayesian inference with empirical priors\n`;
-    report += `- Strategy selection: Thompson Sampling (Thompson, 1933)\n`;
-    report += `- Diversity: Shannon entropy measurement (Shannon, 1948)\n`;
-    report += `- Gadget taxonomy: Silent Spring classification (USENIX 2023)\n`;
+    report += `- Coverage guidance: AFL-style edge coverage bitmap (Böhme et al., CCS 2016)\n`;
+    report += `- V8 precise coverage: Real block/branch coverage via Inspector protocol\n`;
+    report += `- Taint tracking: ES6 Proxy deep property interception (Schwartz et al., IEEE S&P 2010)\n`;
+    report += `- Risk scoring: CVSS v3.1 aligned base metrics (FIRST, 2019)\n`;
+    report += `- Confidence: Bayesian inference with empirical priors (Bayes, 1763)\n`;
+    report += `- Strategy selection: Thompson Sampling with Beta posteriors (Thompson, 1933)\n`;
+    report += `- Diversity: Shannon entropy for corpus and coverage (Shannon, 1948)\n`;
+    report += `- Gadget taxonomy: Silent Spring classification (Shcherbakov et al., USENIX 2023)\n`;
+    report += `- UOP detection: Proxy-based undefined property access tracking\n`;
 
     return report;
   }
