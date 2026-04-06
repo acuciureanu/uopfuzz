@@ -14,6 +14,7 @@ program
 
 program
   .option('-c, --config <path>', 'Target configuration file (YAML)')
+  .option('--target <package>', 'Target package (e.g., pug@3.0.2) — auto-discovers everything')
   .option('-o, --output <dir>', 'Output directory for results', './results')
   .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '60')
   .option('-v, --verbose', 'Enable verbose logging')
@@ -27,35 +28,50 @@ program.action(async (options) => {
       logger.level = 'debug';
     }
 
-    logger.info(chalk.blue.bold('🔍 UoPFuzz - Prototype Pollution Gadget Hunter'));
+    logger.info(chalk.blue.bold('UoPFuzz - Prototype Pollution Gadget Hunter'));
     logger.info('Starting fuzzing session...');
 
-    if (!options.config) {
-      logger.error(chalk.red('❌ Configuration file is required. Use --config <path>'));
+    if (!options.config && !options.target) {
+      logger.error(chalk.red('Either --config <path> or --target <package@version> is required'));
+      logger.info('Examples:');
+      logger.info('  uopfuzz --target pug@3.0.2');
+      logger.info('  uopfuzz --target squirrelly@8.0.8 --max-iterations 500');
+      logger.info('  uopfuzz --config config/targets/pug.yaml');
       process.exit(1);
     }
 
-    const orchestrator = new Orchestrator({
-      configPath: options.config,
+    const orchestratorOpts = {
+      configPath: options.config || null,
+      targetPackage: options.target || null,
       outputDir: options.output,
       timeout: parseInt(options.timeout),
       dryRun: options.dryRun || false,
       maxIterations: parseInt(options.maxIterations),
       parallelWorkers: parseInt(options.parallel),
       verbose: options.verbose || false
-    });
+    };
 
+    const orchestrator = new Orchestrator(orchestratorOpts);
     const results = await orchestrator.run();
-    
-    logger.info(chalk.green.bold('✅ Fuzzing session completed'));
+
+    logger.info(chalk.green.bold('Fuzzing session completed'));
     logger.info(`Results saved to: ${options.output}`);
-    
-    if (results.potentialChains.length > 0) {
-      logger.warn(chalk.yellow.bold(`⚠️  Found ${results.potentialChains.length} potential gadget chains`));
+
+    const confirmed = results.confirmedChains?.length || 0;
+    const candidates = results.potentialChains?.length || 0;
+
+    if (confirmed > 0) {
+      logger.warn(chalk.red.bold(`${confirmed} CONFIRMED gadget chains found`));
+    }
+    if (candidates > 0) {
+      logger.info(`${candidates} unconfirmed candidates`);
+    }
+    if (confirmed === 0 && candidates === 0) {
+      logger.info('No gadget chains found');
     }
 
   } catch (error) {
-    logger.error(chalk.red.bold('❌ Fatal error:'), error.message);
+    logger.error(chalk.red.bold('Fatal error:'), error.message);
     if (options.verbose) {
       logger.error(error.stack);
     }

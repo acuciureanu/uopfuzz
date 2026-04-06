@@ -3,6 +3,7 @@ import path from 'path';
 import { execSync } from 'child_process';
 import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
+import { discoverTarget } from './discovery.js';
 
 export class TargetIntegration {
   constructor(options) {
@@ -187,6 +188,59 @@ export class TargetIntegration {
       throw new Error(`Target ${targetName} not found in cache. Call setupTarget() first.`);
     }
     return cached.config;
+  }
+
+  /**
+   * Set up a target from just a package name and version — no YAML config needed.
+   * Auto-discovers entry points, call sequences, and pollution candidates.
+   *
+   * @param {string} packageSpec - e.g., "pug@3.0.2" or "squirrelly@8.0.8"
+   * @returns {{ config: object, module: object }} The auto-generated config and loaded module
+   */
+  async setupTargetFromPackage(packageSpec) {
+    const { name, version } = this.parsePackageSpec(packageSpec);
+
+    logger.info(`Setting up target from package: ${name}@${version}`);
+
+    // Install the package
+    await this.installPackage(name, version);
+
+    if (this.options.dryRun) {
+      const config = {
+        name, package: name, version,
+        description: `Dry-run target: ${name}@${version}`,
+        entryPoints: [{ name: 'compile', inputType: 'template' }],
+        sinks: ['eval', 'Function', 'child_process.exec'],
+        pollutionPoints: ['debug', 'template', 'cache'],
+        _autoDiscovered: true
+      };
+      return { config, module: { name, version, isDryRun: true } };
+    }
+
+    // Load the module
+    const targetModule = await import(name);
+
+    // Auto-discover everything
+    const config = await discoverTarget(targetModule, name, version);
+
+    // Cache
+    this.targetCache.set(name, {
+      config,
+      module: targetModule,
+      setupTime: new Date()
+    });
+
+    logger.info(`Target ${name}@${version} auto-discovered and ready`);
+    return { config, module: targetModule };
+  }
+
+  parsePackageSpec(spec) {
+    // Handle "pug@3.0.2", "pug@^3.0.0", "pug" (latest)
+    const atIdx = spec.lastIndexOf('@');
+    if (atIdx > 0) {
+      return { name: spec.substring(0, atIdx), version: spec.substring(atIdx + 1) };
+    }
+    return { name: spec, version: 'latest' };
   }
 
   async cleanup() {

@@ -84,6 +84,13 @@ export class Orchestrator {
   }
 
   async loadConfiguration() {
+    if (this.options.targetPackage) {
+      // Auto-discovery mode: config will be generated after install
+      logger.info(`Target package: ${this.options.targetPackage} (auto-discovery mode)`);
+      this.config = null; // Will be set in setupTarget
+      return;
+    }
+
     try {
       const configPath = path.resolve(this.options.configPath);
       logger.debug(`Loading config from: ${configPath}`);
@@ -114,13 +121,25 @@ export class Orchestrator {
   }
 
   async setupTarget() {
+    if (this.options.targetPackage) {
+      // Auto-discovery: install, load, inspect, and generate config
+      const { config, module: targetModule } = await this.targetIntegration.setupTargetFromPackage(
+        this.options.targetPackage
+      );
+      this.config = config;
+      if (!this.options.dryRun) {
+        this.instrumentation.setTargetModule(targetModule);
+      }
+      logger.info(`Target ${config.name}@${config.version} auto-discovered and ready`);
+      return;
+    }
+
     if (this.options.dryRun) {
-      logger.info('🏃‍♂️ Dry run mode - skipping actual target setup');
+      logger.info('Dry run mode - skipping actual target setup');
       return;
     }
 
     const targetModule = await this.targetIntegration.setupTarget(this.config);
-    // Wire the loaded module into instrumentation so executeInput uses real code
     this.instrumentation.setTargetModule(targetModule);
     logger.info(`Target ${this.config.name} setup completed`);
   }
