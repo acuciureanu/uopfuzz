@@ -250,35 +250,99 @@ export class TargetIntegration {
    * (jQuery, Backbone, etc.) that require window/document at load time.
    */
   async importWithDOMFallback(name) {
-    // First attempt — most packages work fine
+    // For known browser-only packages, go straight to jsdom
+    const browserOnlyPackages = ['jquery', 'jquery-ui', 'backbone', 'underscore'];
+    const isLikelyBrowserOnly = browserOnlyPackages.some(pkg => name === pkg || name.startsWith(pkg + '@'));
+    
     try {
       return await import(name);
     } catch (err) {
       const msg = err.message || '';
       const needsDom = /window|document|DOM|browser|navigator/i.test(msg);
-      if (!needsDom) throw err;
+      if (!needsDom && !isLikelyBrowserOnly) throw err;
 
+      // Browser-only or needs DOM shim
       logger.info(`${name} requires a DOM environment — installing minimal window/document shim`);
       this._installDOMShim();
-      try {
-        return await import(name);
-      } catch (err2) {
-        // Shim wasn't enough — try jsdom if available
+      
+      if (!isLikelyBrowserOnly) {
         try {
-          const { JSDOM } = await import('jsdom');
-          const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
-          global.window = dom.window;
-          global.document = dom.window.document;
-          global.navigator = dom.window.navigator;
-          logger.info(`Using jsdom for ${name}`);
           return await import(name);
-        } catch {
-          // jsdom not installed — re-throw original error with helpful message
-          throw new Error(
-            `${name} requires a browser DOM. Install jsdom to enable browser package support: npm install jsdom\nOriginal error: ${err2.message}`
-          );
+        } catch (err2) {
+          // Will try jsdom below
         }
       }
+
+      // Shim wasn't enough — try jsdom if available
+      let jsdomErr;
+      try {
+        const { JSDOM } = await import('jsdom');
+        const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+        global.window = dom.window;
+        global.document = dom.window.document;
+        try {
+          Object.defineProperty(global, 'navigator', {
+            value: dom.window.navigator,
+            writable: true,
+            configurable: true
+          });
+        } catch { /* ignore */ }
+        logger.info(`Using jsdom for ${name}`);
+        // Use a child module to import with fresh ESM cache
+        return await this._importWithFreshCache(name);
+      } catch (err_jsdom) {
+        jsdomErr = err_jsdom;
+      }
+      throw new Error(
+        `${name} requires a browser DOM. Install jsdom to enable browser package support: npm install jsdom\nOriginal error: ${err?.message}\nJSDOM error: ${jsdomErr?.message}`
+      );
+    }
+  }
+
+  /**
+   * Import a module with fresh ESM cache by loading via CommonJS.
+   * This completely bypasses ESM module caching issues.
+   */
+  async _importWithFreshCache(name) {
+    const tmpDir = path.join(process.cwd(), '.uopfuzz-temp');
+    const loaderPath = path.join(tmpDir, `loader-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
+    
+    const loaderCode = `
+const { JSDOM } = require('jsdom');
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+global.window = dom.window;
+global.document = dom.window.document;
+try {
+  Object.defineProperty(global, 'navigator', {
+    value: dom.window.navigator,
+    writable: true,
+    configurable: true
+  });
+} catch {}
+
+// Try factory entry point first (for jquery and similar)
+try {
+  const factory = require('${name}/factory');
+  module.exports = factory(dom.window);
+} catch {
+  // Fall back to regular require
+  module.exports = require('${name}');
+}
+`;
+    
+    try {
+      await fs.mkdir(tmpDir, { recursive: true });
+      await fs.writeFile(loaderPath, loaderCode, 'utf8');
+      const cjsModule = require(loaderPath);
+      
+      // Convert to ESM-like format with default and named exports
+      if (cjsModule && typeof cjsModule === 'object') {
+        return cjsModule;
+      }
+      // If it's a function (like jQuery), wrap it
+      return { default: cjsModule, ...cjsModule };
+    } finally {
+      try { await fs.unlink(loaderPath); } catch { /* ignore */ }
     }
   }
 
@@ -295,6 +359,13 @@ export class TargetIntegration {
     // Use defineProperty for read-only globals — many Node.js globals (navigator,
     // location) have a getter but no setter, so direct assignment throws TypeError.
     const defineGlobal = (name, value) => {
+      const desc = Object.getOwnPropertyDescriptor(global, name);
+      if (desc && !desc.configurable) {
+        if (desc.set) {
+          try { global[name] = value; } catch { /* ignore */ }
+        }
+        return;
+      }
       try {
         global[name] = value;
       } catch {

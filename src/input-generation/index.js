@@ -108,7 +108,18 @@ export class InputGeneration {
   async generateBaseInputs(config, count) {
     const inputs = [];
 
-    for (let i = 0; i < count; i++) {
+    // Always include merge first — it's the most likely source of prototype pollution
+    const mergeEP = config.entryPoints?.find(ep => ep.name === 'merge');
+    if (mergeEP) {
+      inputs.push({
+        entryPoint: 'merge',
+        type: 'object',
+        value: this.generateObjectInput(),
+        metadata: { pollution: false, generation: 'base', energy: 1.0 }
+      });
+    }
+
+    for (let i = inputs.length; i < count; i++) {
       const input = this.createBaseInput(config);
       inputs.push(input);
     }
@@ -454,29 +465,15 @@ export class InputGeneration {
     const pollutionTargets = config.pollutionPoints || ['isAdmin', 'isDebug', 'template', 'eval'];
     const target = pollutionTargets[Math.floor(Math.random() * pollutionTargets.length)];
 
-    // Pollution payload values based on known gadget patterns
-    const payloads = [
-      'POLLUTED',
-      'true',
-      '1',
-      'require("child_process").execSync("id")',
-      '(() => { return process })()',
-      'constructor.constructor("return this")()',
-    ];
-    const payload = payloads[Math.floor(Math.random() * payloads.length)];
-
     try {
-      input.value.__proto__ = input.value.__proto__ || {};
-      input.value.__proto__[target] = payload;
-      input.metadata.pollution = true;
-      input.metadata.pollutionTarget = target;
-      input.metadata.pollutionPayload = payload;
+      input.value.__proto__ = { [target]: 'POLLUTED' };
     } catch (error) {
-      input.value.__protoPollution = { [target]: payload };
-      input.metadata.pollution = true;
-      input.metadata.pollutionTarget = target;
+      input.value.__protoPollution = { [target]: 'POLLUTED' };
       input.metadata.pollutionMethod = 'fallback';
     }
+
+    input.metadata.pollution = true;
+    input.metadata.pollutionTarget = target;
 
     return input;
   }
@@ -484,11 +481,12 @@ export class InputGeneration {
   /**
    * Constructor.prototype pollution.
    *
-   * Exploits the constructor property chain: obj.constructor.prototype
-   * This is an alternative pollution vector when __proto__ is filtered.
+   * Bypasses __proto__ protections by using the constructor property
+   * chain: obj.constructor.prototype.target = value.
    *
-   * Reference: Arteau, "Prototype pollution attack in NodeJS application",
-   * NorthSec 2018
+   * Also generates merge-specific payloads that are JSON-parseable
+   * objects like {constructor: {prototype: {key: val}}}, which trigger
+   * deep-merge-based prototype pollution in libraries like lodash.
    */
   applyConstructorPollution(input, config) {
     if (input.type !== 'object') return null;
@@ -496,17 +494,34 @@ export class InputGeneration {
     const pollutionTargets = config.pollutionPoints || ['isAdmin', 'template'];
     const target = pollutionTargets[Math.floor(Math.random() * pollutionTargets.length)];
 
-    try {
-      input.value.constructor = input.value.constructor || {};
-      input.value.constructor.prototype = input.value.constructor.prototype || {};
-      input.value.constructor.prototype[target] = 'CONSTRUCTOR_POLLUTED';
+    const mode = Math.random();
+
+    if (mode < 0.5) {
+      try {
+        input.value.constructor = input.value.constructor || {};
+        input.value.constructor.prototype = input.value.constructor.prototype || {};
+        input.value.constructor.prototype[target] = 'CONSTRUCTOR_POLLUTED';
+        input.metadata.pollution = true;
+        input.metadata.pollutionTarget = target;
+        input.metadata.pollutionMode = 'direct';
+      } catch (error) {
+        input.value.__constructorPollution = { [target]: 'CONSTRUCTOR_POLLUTED' };
+        input.metadata.pollution = true;
+        input.metadata.pollutionTarget = target;
+        input.metadata.pollutionMethod = 'fallback';
+      }
+    } else {
+      input.value = {
+        ...input.value,
+        constructor: {
+          prototype: {
+            [target]: 'MERGE_PP_PAYLOAD'
+          }
+        }
+      };
       input.metadata.pollution = true;
       input.metadata.pollutionTarget = target;
-    } catch (error) {
-      input.value.__constructorPollution = { [target]: 'CONSTRUCTOR_POLLUTED' };
-      input.metadata.pollution = true;
-      input.metadata.pollutionTarget = target;
-      input.metadata.pollutionMethod = 'fallback';
+      input.metadata.pollutionMode = 'merge_payload';
     }
 
     return input;

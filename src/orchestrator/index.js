@@ -67,13 +67,15 @@ export class Orchestrator {
       logger.info('📊 Analyzing results...');
       await this.analyzeResults();
 
+      this.results.endTime = new Date();
+
       logger.info('💾 Saving results...');
       await this.saveResults();
 
-      this.results.endTime = new Date();
       return this.results;
 
     } catch (error) {
+      this.results.endTime = this.results.endTime || new Date();
       this.results.errors.push({
         timestamp: new Date(),
         error: error.message,
@@ -303,12 +305,43 @@ export class Orchestrator {
     // Differential testing: generate pollution descriptors and test them
     const descriptors = this.inputGeneration.generatePollutionDescriptors(
       this.config,
-      Math.min(10, 3 + Math.floor(iteration / 10)) // Ramp up faster, test more
+      Math.min(10, 3 + Math.floor(iteration / 10))
     );
 
     // Use multiple representative inputs for differential testing (different entry points)
     const testInputs = [];
     const seenEP = new Set();
+
+    // Always include merge/set entry points if they exist anywhere in the generated inputs
+    // or in the seed corpus. Prototype pollution gadgets are most likely in these functions.
+    const dangerousEPs = ['merge', 'set', 'extend', 'defaults', 'defaultsDeep', 'assign', 'mergeWith', 'setWith'];
+
+    // Search current inputs first
+    for (const ep of dangerousEPs) {
+      if (seenEP.has(ep)) continue;
+      const inp = inputs.find(i => i.entryPoint === ep);
+      if (inp) {
+        testInputs.push(inp);
+        seenEP.add(ep);
+      }
+      if (testInputs.length >= 3) break;
+    }
+
+    // Also search seed corpus for dangerous EPs we might have missed
+    if (testInputs.length < 3) {
+      const corpus = this.inputGeneration.seedCorpus || [];
+      for (const ep of dangerousEPs) {
+        if (seenEP.has(ep)) continue;
+        const seed = corpus.find(s => s.input && s.input.entryPoint === ep);
+        if (seed) {
+          testInputs.push(seed.input);
+          seenEP.add(ep);
+        }
+        if (testInputs.length >= 3) break;
+      }
+    }
+
+    // Fill remaining slots with diverse entry points
     for (const inp of inputs) {
       if (!seenEP.has(inp.entryPoint) && testInputs.length < 3) {
         seenEP.add(inp.entryPoint);
@@ -330,29 +363,83 @@ export class Orchestrator {
       let confirmed = false;
       for (const testInput of testInputs) {
         try {
+          // Mode 1: Standard differential (pre-pollute Object.prototype)
           const diffResult = await this.instrumentation.executeDifferentialTracing(
             testInput, this.config, descriptor
           );
 
-          if (!diffResult) continue;
+          if (diffResult) {
+            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+              diffResult, testInput, this.config
+            );
 
-          const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
-            diffResult, testInput, this.config
+            if (confirmedChain) {
+              this._confirmedSignatures.add(sig);
+              this.results.confirmedChains.push(confirmedChain);
+              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+              logger.warn(
+                `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
+                `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
+                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+              );
+            }
+          }
+
+          // Mode 2: Merge-PP test (crafted input causes Object.prototype mutation)
+          const mergeResult = await this.instrumentation.executeMergePPDifferential(
+            testInput, this.config, descriptor
           );
 
-          if (confirmedChain) {
-            this._confirmedSignatures.add(sig);
-            this.results.confirmedChains.push(confirmedChain);
-            this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-            this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-            logger.warn(
-              `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
-              `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
-              `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+          if (mergeResult) {
+            const mergeChain = this.gadgetAnalysis.analyzeDifferentialResult(
+              mergeResult, testInput, this.config
             );
-            confirmed = true;
-            break; // No need to try other inputs for this descriptor
+
+            if (mergeChain) {
+              this._confirmedSignatures.add(sig);
+              this.results.confirmedChains.push(mergeChain);
+              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+              logger.warn(
+                `CONFIRMED PROTOTYPE POLLUTION: ${descriptor.property} via merge payload ` +
+                `-> ${mergeChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
+                `(confidence: ${(mergeChain.confidence * 100).toFixed(0)}%)`
+              );
+            }
+          }
+
+          // Mode 3: URL gadget test (URL query string → parser → target function)
+          // This is the most important mode — always try it even if Mode 1 or 2 found something
+          const urlResult = await this.instrumentation.executeURLGadgetDifferential(
+            testInput, this.config, descriptor
+          );
+
+          if (urlResult) {
+            const urlChain = this.gadgetAnalysis.analyzeDifferentialResult(
+              urlResult, testInput, this.config
+            );
+
+            if (urlChain) {
+              this._confirmedSignatures.add(sig);
+              this.results.confirmedChains.push(urlChain);
+              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+              const exploitURL = urlResult.diff?.details?.exploitURL || '';
+              logger.warn(
+                `CONFIRMED URL GADGET: ${descriptor.property} via ${testInput.entryPoint} ` +
+                `-> ${urlChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
+                `(confidence: ${(urlChain.confidence * 100).toFixed(0)}%)`
+              );
+              if (exploitURL) {
+                logger.warn(`  Exploit: ${exploitURL}`);
+              }
+              confirmed = true;
+              break;
+            }
           }
         } catch (error) {
           logger.debug(`Differential test failed for ${descriptor.property} via ${testInput.entryPoint}: ${error.message}`);
@@ -536,56 +623,65 @@ export class Orchestrator {
    * coverage metrics, and strategy effectiveness analysis.
    */
   generateReport() {
-    const duration = this.results.endTime - this.results.startTime;
+    const end = this.results.endTime || new Date();
+    const start = this.results.startTime || new Date();
+    const duration = end - start;
     const durationStr = `${Math.round(duration / 1000)}s`;
     const confirmedChains = this.results.confirmedChains || [];
 
-    let report = `UoPFuzz Analysis Report\n`;
-    report += `======================\n\n`;
-    report += `Target: ${this.config?.name || 'Unknown'} v${this.config?.version || '?'}\n`;
-    report += `Duration: ${durationStr}\n`;
-    report += `Iterations: ${this.results.iterationsCompleted}\n`;
-    report += `Inputs Generated: ${this.results.inputsGenerated}\n`;
-    report += `Confirmed Gadgets: ${confirmedChains.length}\n`;
-    report += `Unconfirmed Candidates: ${this.results.potentialChains.length}\n`;
-    report += `Errors: ${this.results.errors.length}\n\n`;
+    let report = '';
+    report += '================================================================================\n';
+    report += '                              UoPFuzz Report\n';
+    report += '================================================================================\n\n';
+    report += `Target:    ${this.config?.name || 'Unknown'}@${this.config?.version || '?'}\n`;
+    report += `Confirmed: ${confirmedChains.length} gadget${confirmedChains.length !== 1 ? 's' : ''} | Unconfirmed: ${this.results.potentialChains?.length || 0} | Errors: ${this.results.errors?.length || 0}\n`;
+    report += `Time:     ${durationStr} | Iterations: ${this.results.iterationsCompleted} | Inputs: ${this.results.inputsGenerated}\n`;
+    report += '\n';
 
-    // === CONFIRMED GADGETS (differential oracle) ===
     if (confirmedChains.length > 0) {
-      report += `CONFIRMED GADGET CHAINS (Differential Oracle)\n`;
-      report += `=============================================\n`;
-      report += `These gadgets were confirmed by differential testing:\n`;
-      report += `clean execution vs polluted execution produced different behavior.\n\n`;
-
       for (const [index, chain] of confirmedChains.entries()) {
-        report += `${index + 1}. ${chain.description}\n`;
-        report += `   Risk: ${chain.riskLevel}/10.0\n`;
-        report += `   Confidence: ${(chain.confidence * 100).toFixed(0)}%\n`;
-        report += `   Property: Object.prototype.${chain.source?.property}\n`;
-        report += `   Payload: ${chain.source?.payload}\n`;
-        if (chain.sink && typeof chain.sink === 'object') {
-          report += `   Sink: ${chain.sink.name}\n`;
-        }
-        if (chain.differential) {
-          if (chain.differential.payloadReachedOutput) {
-            report += `   Evidence: Payload reached output (confirmed injection)\n`;
-          }
-          if (chain.differential.outputChanged) {
-            report += `   Clean output: ${chain.differential.cleanOutput?.substring(0, 100) || 'N/A'}\n`;
-            report += `   Polluted output: ${chain.differential.pollutedOutput?.substring(0, 100) || 'N/A'}\n`;
-          }
-          if (chain.differential.errorChanged) {
-            report += `   Clean error: ${chain.differential.cleanError || 'none'}\n`;
-            report += `   Polluted error: ${chain.differential.pollutedError || 'none'}\n`;
-          }
-        }
+        const poc = chain.poc;
+        const isURL = poc?.type === 'url_gadget';
+
+        report += '--------------------------------------------------------------------------------\n';
+        report += `GADGET #${index + 1}  [${chain.riskLevel}/10 RISK]  ${(chain.confidence * 100).toFixed(0)}% confidence\n`;
+        report += '--------------------------------------------------------------------------------\n';
+        report += `Library:     ${this.config?.name}@${this.config?.version}\n`;
+        report += `Function:    ${chain.input?.entryPoint}\n`;
+        report += `Property:    Object.prototype.${chain.source?.property} = ${chain.source?.payload}\n`;
         if (chain.metadata?.cvssVector) {
-          report += `   CVSS: ${chain.metadata.cvssVector}\n`;
+          report += `CVSS:       ${chain.metadata.cvssVector}\n`;
         }
-        report += `\n`;
+        report += '\n';
+
+        if (isURL && poc?.attackerInput?.url) {
+          report += 'ATTACKER INPUT\n';
+          report += '==============\n';
+          report += `  URL:  ${poc.attackerInput.url}\n\n`;
+        }
+
+        report += 'PROOF OF CONCEPT\n';
+        report += '=================\n';
+        if (poc?.exploit?.code) {
+          report += '\n' + poc.exploit.code + '\n';
+        }
+
+        if (isURL && poc?.vulnerablePattern?.description) {
+          report += '\nATTACK CHAIN\n';
+          report += '============\n';
+          report += '  ' + poc.vulnerablePattern.description + '\n';
+        }
+
+        if (chain.differential?.pollutedProperties?.length > 0) {
+          report += '\nPOLLUTED PROPERTIES: ' + chain.differential.pollutedProperties.join(', ') + '\n';
+        }
+
+        report += '\n';
       }
+      report += '================================================================================\n';
+      report += `Generated by UoPFuzz | ${new Date().toISOString()}\n`;
     } else {
-      report += `No confirmed gadgets found.\n\n`;
+      report += 'No confirmed gadgets found.\n';
     }
 
     // UOP Property Discovery

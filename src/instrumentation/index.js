@@ -2,7 +2,7 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
-import { executeDifferential, discoverUOPProperties } from './differential.js';
+import { executeDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let childProcessModule;
@@ -302,6 +302,38 @@ export class Instrumentation {
       return await executeDifferential(fn, args, pollutionDescriptor, timeoutMs);
     } catch (error) {
       logger.debug(`Differential execution failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  async executeMergePPDifferential(input, config, descriptor) {
+    if (!this.targetModule || this.options.dryRun) return null;
+
+    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+    if (!rawFn) return null;
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+
+    try {
+      return await executeMergePPTest(rawFn, [{}], descriptor.property, descriptor.value, timeoutMs);
+    } catch (error) {
+      logger.debug(`Merge PP test failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  async executeURLGadgetDifferential(input, config, descriptor) {
+    if (!this.targetModule || this.options.dryRun) return null;
+
+    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+    if (!rawFn) return null;
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+
+    try {
+      return await executeURLGadgetTest(rawFn, descriptor.property, descriptor.value, timeoutMs);
+    } catch (error) {
+      logger.debug(`URL gadget test failed: ${error.message}`);
       return null;
     }
   }

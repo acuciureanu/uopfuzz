@@ -118,9 +118,11 @@ export class GadgetAnalysis {
       : (diff.details.payloadReachedOutput ? 'output_injection' : 'behavioral_change');
 
     const sinkMeta = this.sinkSeverity[sinkName] || {
-      baseScore: diff.details.payloadReachedOutput ? 8.0 : 5.0,
-      impact: diff.details.payloadReachedOutput ? 'Injection' : 'Behavioral',
-      cvssVector: 'AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N'
+      baseScore: diff.details.payloadReachedOutput ? 8.0 : (diff.prototypePolluted ? 7.5 : 5.0),
+      impact: diff.prototypePolluted ? 'Prototype Pollution' : (diff.details.payloadReachedOutput ? 'Injection' : 'Behavioral'),
+      cvssVector: diff.prototypePolluted
+        ? 'AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H'
+        : 'AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N'
     };
 
     const chain = {
@@ -149,11 +151,15 @@ export class GadgetAnalysis {
         outputChanged: diff.outputChanged,
         errorChanged: diff.errorChanged,
         pollutionWasRead: diff.pollutionWasRead,
+        prototypePolluted: diff.prototypePolluted || false,
+        pollutedProperties: diff.pollutedProperties || [],
         payloadReachedOutput: diff.details.payloadReachedOutput || false,
         cleanOutput: diff.details.cleanOutput,
         pollutedOutput: diff.details.pollutedOutput,
         cleanError: diff.details.cleanError,
-        pollutedError: diff.details.pollutedError
+        pollutedError: diff.details.pollutedError,
+        exploitURL: diff.details.exploitURL || null,
+        payloadType: diff.details.payloadType || null
       },
       metadata: {
         target: config.name,
@@ -162,7 +168,15 @@ export class GadgetAnalysis {
         cvssVector: sinkMeta.cvssVector,
         impactType: sinkMeta.impact,
         verificationMethod: 'differential_oracle'
-      }
+      },
+      poc: this.buildPOC({
+        source: { property: diff.property, payload: String(diff.payload).substring(0, 200) },
+        differential: {
+          exploitURL: diff.details.exploitURL || null,
+          payloadType: diff.details.payloadType || null
+        },
+        input: { entryPoint: input.entryPoint }
+      }, config)
     };
 
     // Store in known chains for deduplication
@@ -175,7 +189,20 @@ export class GadgetAnalysis {
   }
 
   buildDifferentialDescription(diff, sinkName) {
-    const parts = [`CONFIRMED: Object.prototype.${diff.property} pollution`];
+    const parts = [];
+
+    if (diff.prototypePolluted) {
+      const props = diff.pollutedProperties?.length > 0
+        ? diff.pollutedProperties.join(', ')
+        : diff.property;
+      if (diff.details.exploitURL) {
+        parts.push(`CONFIRMED URL GADGET: Object.prototype.${props} polluted via URL query string → ${diff.details.payloadType}`);
+      } else {
+        parts.push(`CONFIRMED PROTOTYPE POLLUTION: Object.prototype.${props} was modified`);
+      }
+    } else {
+      parts.push(`CONFIRMED: Object.prototype.${diff.property} pollution`);
+    }
 
     if (diff.newSinkAccesses.length > 0) {
       parts.push(`triggers ${sinkName} sink`);
@@ -192,6 +219,78 @@ export class GadgetAnalysis {
     }
 
     return parts.join(' — ');
+  }
+
+  buildPOC(chain, config) {
+    const target = config?.name || 'unknown';
+    const version = config?.version || '';
+    const ep = chain.input?.entryPoint || 'unknown';
+    const prop = chain.source?.property || 'unknown';
+    const val = chain.source?.payload || '';
+    const exploitURL = chain.differential?.exploitURL;
+    const payloadType = chain.differential?.payloadType || '';
+
+    if (exploitURL) {
+      const isConstructor = payloadType.includes('constructor');
+      const jsonPayload = isConstructor
+        ? `{ constructor: { prototype: { ${prop}: ${JSON.stringify(val)} } } }`
+        : `{ __proto__: { ${prop}: ${JSON.stringify(val)} } }`;
+
+      return {
+        type: 'url_gadget',
+        summary: `Prototype pollution via URL query parameter in ${target}@${version}`,
+        attackerInput: {
+          url: exploitURL,
+          description: 'Attacker-controlled URL query string'
+        },
+        vulnerablePattern: {
+          library: `${target}@${version}`,
+          function: ep,
+          description: `Attacker sends URL with malicious query string → ${target} parses it → ${target}.${ep}() merges attacker data into Object.prototype`
+        },
+        exploit: {
+          language: 'javascript',
+          code: `// POC: ${target}@${version} prototype pollution via ${ep}()
+// Attacker sends: ${exploitURL}
+
+// Simulating what the server does:
+const _ = require('${target}');
+
+// Attacker-controlled data from URL query string
+const maliciousPayload = ${jsonPayload};
+
+// Vulnerable: attacker data merged into config (or any object)
+const config = {};
+_.${ep}(config, maliciousPayload);
+
+// RESULT: Object.prototype is now polluted
+console.log('Object.prototype.${prop} =', Object.prototype.${prop});
+// Expected output: ${JSON.stringify(val)}
+
+${isConstructor ? `// Note: Uses 'constructor.prototype' pattern to bypass __proto__ guards` : ''}`
+        }
+      };
+    }
+
+    return {
+      type: 'prototype_pollution',
+      summary: `Prototype pollution in ${target}@${version}`,
+      vulnerablePattern: {
+        library: `${target}@${version}`,
+        function: ep
+      },
+      exploit: {
+        language: 'javascript',
+        code: `// POC: ${target}@${version} prototype pollution via ${ep}()
+const _ = require('${target}');
+
+const payload = { ${prop}: ${JSON.stringify(val)} };
+_.${ep}({}, payload);
+
+console.log('Object.prototype.${prop} =', Object.prototype.${prop});
+// Expected output: ${JSON.stringify(val)}`
+      }
+    };
   }
 
   async analyzeTrace(trace, config) {
