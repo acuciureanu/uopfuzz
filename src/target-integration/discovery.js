@@ -247,35 +247,22 @@ function prioritizeExports(exports) {
  * - Whether it returns an object with interesting methods
  */
 async function probeFunction(fn, name) {
+  // Try regular function calls first
   for (const probe of PROBE_INPUTS) {
     const result = await tryCall(fn, probe.args);
     if (!result.success) continue;
 
-    const returnedMethods = [];
-    if (result.value && typeof result.value === 'object') {
-      // Discover methods on the returned object
-      try {
-        const proto = Object.getPrototypeOf(result.value);
-        const keys = new Set([
-          ...Object.keys(result.value),
-          ...(proto && proto !== Object.prototype ? Object.getOwnPropertyNames(proto) : [])
-        ]);
-        for (const key of keys) {
-          if (typeof result.value[key] === 'function' && !SKIP_NAMES.has(key) && !key.startsWith('_')) {
-            returnedMethods.push(key);
-          }
-        }
-      } catch { /* ignore */ }
-    }
+    return buildProbeResult(result.value, probe);
+  }
 
-    return {
-      inputType: probe.type === 'none' ? 'object' : probe.type,
-      returnsFunction: typeof result.value === 'function',
-      returnsRenderable: result.value && typeof result.value === 'object' && typeof result.value.render === 'function',
-      returnedMethods,
-      acceptedArgs: probe.args.map(a => typeof a === 'string' ? 'input' : 'options'),
-      acceptedInput: probe.args[0] ?? null
-    };
+  // If all regular calls fail, try as constructor (class)
+  if (isLikelyConstructor(fn)) {
+    for (const probe of PROBE_INPUTS) {
+      const result = await tryConstruct(fn, probe.args);
+      if (!result.success) continue;
+
+      return buildProbeResult(result.value, probe);
+    }
   }
 
   // Couldn't probe successfully — still include with defaults
@@ -289,6 +276,44 @@ async function probeFunction(fn, name) {
   };
 }
 
+function buildProbeResult(value, probe) {
+  const returnedMethods = [];
+  if (value && typeof value === 'object') {
+    try {
+      const proto = Object.getPrototypeOf(value);
+      const keys = new Set([
+        ...Object.keys(value),
+        ...(proto && proto !== Object.prototype ? Object.getOwnPropertyNames(proto) : [])
+      ]);
+      for (const key of keys) {
+        if (typeof value[key] === 'function' && !SKIP_NAMES.has(key) && !key.startsWith('_')) {
+          returnedMethods.push(key);
+        }
+      }
+    } catch { /* ignore */ }
+  }
+
+  return {
+    inputType: probe.type === 'none' ? 'object' : probe.type,
+    returnsFunction: typeof value === 'function',
+    returnsRenderable: value && typeof value === 'object' && typeof value.render === 'function',
+    returnedMethods,
+    acceptedArgs: probe.args.map(a => typeof a === 'string' ? 'input' : 'options'),
+    acceptedInput: probe.args[0] ?? null
+  };
+}
+
+function isLikelyConstructor(fn) {
+  // Class constructors: fn.toString() starts with "class "
+  // or fn.prototype has methods beyond constructor
+  try {
+    const src = fn.toString();
+    if (src.startsWith('class ')) return true;
+    if (fn.prototype && Object.getOwnPropertyNames(fn.prototype).length > 1) return true;
+  } catch { /* ignore */ }
+  return false;
+}
+
 /**
  * Try calling a function with given args, with timeout protection.
  */
@@ -299,6 +324,25 @@ async function tryCall(fn, args, timeoutMs = 2000) {
       timer = setTimeout(() => reject(new Error('probe timeout')), timeoutMs);
     });
     const execution = Promise.resolve(fn(...args));
+    const value = await Promise.race([execution, timeout]);
+    return { success: true, value };
+  } catch {
+    return { success: false, value: null };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Try calling a function as a constructor (new Fn(args)).
+ */
+async function tryConstruct(fn, args, timeoutMs = 2000) {
+  let timer;
+  try {
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('probe timeout')), timeoutMs);
+    });
+    const execution = Promise.resolve(new fn(...args));
     const value = await Promise.race([execution, timeout]);
     return { success: true, value };
   } catch {
@@ -356,8 +400,17 @@ async function discoverPropertiesFromProbe(fn, probe) {
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('probe timeout')), 2000);
     });
-    const execution = Promise.resolve(fn(...args));
-    const result = await Promise.race([execution, timeout]);
+    // Try regular call; if it fails and fn looks like a constructor, try new
+    let result;
+    try {
+      result = await Promise.race([Promise.resolve(fn(...args)), timeout]);
+    } catch {
+      if (isLikelyConstructor(fn)) {
+        result = await Promise.race([Promise.resolve(new fn(...args)), timeout]);
+      } else {
+        throw new Error('call failed');
+      }
+    }
 
     // If result is callable, probe it too
     if (typeof result === 'function') {

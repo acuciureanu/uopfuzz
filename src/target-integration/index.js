@@ -1,9 +1,13 @@
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
+import { createRequire } from 'module';
 import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
 import { discoverTarget } from './discovery.js';
+
+const require = createRequire(import.meta.url);
 
 export class TargetIntegration {
   constructor(options) {
@@ -242,56 +246,158 @@ export class TargetIntegration {
   }
 
   /**
-   * Try importing common sub-paths of a package.
-   * Many packages (Next.js, Express, etc.) export useful functions from sub-paths
-   * that aren't accessible from the main entry point.
+   * Load sub-path modules from a package using multiple strategies:
+   * 1. Read package.json exports map for declared sub-paths
+   * 2. Scan the installed package's dist directory for utility files
+   * 3. Try common sub-path patterns
+   * Uses both ESM import() and CJS require() as fallbacks.
    */
   async loadSubPathModules(packageName) {
-    // Common sub-path patterns used by popular packages
+    const subModules = {};
+    const tried = new Set();
+
+    // Strategy 1: Read package.json exports map via filesystem
+    const subPathsFromExports = this.getExportsSubPaths(packageName);
+    for (const sub of subPathsFromExports) {
+      await this.tryLoadSubModule(packageName, sub, subModules, tried);
+    }
+
+    // Strategy 2: Scan for utility files in the installed package
+    const utilityFiles = this.scanForUtilityFiles(packageName);
+    for (const relPath of utilityFiles) {
+      await this.tryLoadSubModule(packageName, relPath, subModules, tried);
+    }
+
+    // Strategy 3: Try common sub-path patterns
     const commonSubPaths = [
       'server', 'client', 'utils', 'helpers', 'lib', 'core',
-      'router', 'middleware', 'config', 'types',
-      'dist', 'build', 'src',
-      'head', 'link', 'image', 'script', 'dynamic',  // Next.js-style
-      'navigation', 'headers', 'cookies',              // Next.js app router
-      'parser', 'compiler', 'renderer', 'transformer', // Build tools
-      'merge', 'clone', 'defaults', 'extend',          // Utility libraries
+      'router', 'middleware', 'config',
+      'head', 'link', 'image', 'script', 'dynamic',
+      'navigation', 'headers', 'cookies',
+      'parser', 'compiler', 'renderer', 'transformer',
+      'merge', 'clone', 'defaults', 'extend',
     ];
-
-    const subModules = {};
-
-    // Also try reading package.json exports field for declared sub-paths
-    try {
-      const pkgPath = `${packageName}/package.json`;
-      const pkg = await import(pkgPath, { with: { type: 'json' } }).catch(() => null);
-      if (pkg?.default?.exports && typeof pkg.default.exports === 'object') {
-        for (const key of Object.keys(pkg.default.exports)) {
-          if (key !== '.' && key !== './package.json' && key.startsWith('./')) {
-            const subPath = `${packageName}/${key.slice(2)}`;
-            commonSubPaths.push(key.slice(2));
-          }
-        }
-      }
-    } catch { /* package.json not importable as JSON, that's fine */ }
-
     for (const sub of commonSubPaths) {
-      const fullPath = `${packageName}/${sub}`;
-      try {
-        const mod = await import(fullPath);
-        if (mod && (typeof mod === 'object' || typeof mod === 'function')) {
-          subModules[fullPath] = mod;
-          logger.debug(`Loaded sub-module: ${fullPath}`);
-        }
-      } catch {
-        // Expected — most sub-paths won't exist
-      }
+      await this.tryLoadSubModule(packageName, sub, subModules, tried);
     }
 
     if (Object.keys(subModules).length > 0) {
       logger.info(`Loaded ${Object.keys(subModules).length} sub-modules: ${Object.keys(subModules).map(k => k.replace(`${packageName}/`, '')).join(', ')}`);
+    } else {
+      logger.debug(`No sub-modules loadable for ${packageName}`);
     }
 
     return subModules;
+  }
+
+  /**
+   * Read the package.json exports field and extract importable sub-paths.
+   */
+  getExportsSubPaths(packageName) {
+    const subPaths = [];
+    try {
+      const pkgJsonPath = require.resolve(`${packageName}/package.json`);
+      const pkg = JSON.parse(fsSync.readFileSync(pkgJsonPath, 'utf8'));
+
+      if (pkg.exports && typeof pkg.exports === 'object') {
+        const extractPaths = (obj, prefix = '') => {
+          for (const [key, value] of Object.entries(obj)) {
+            if (key.startsWith('./') && key !== '.' && key !== './package.json') {
+              // Remove ./ prefix and any wildcard
+              const clean = key.slice(2).replace(/\/\*$/, '');
+              if (clean && !clean.includes('*')) {
+                subPaths.push(clean);
+              }
+            }
+          }
+        };
+        extractPaths(pkg.exports);
+      }
+
+      logger.debug(`Found ${subPaths.length} sub-paths from exports map: ${subPaths.slice(0, 10).join(', ')}`);
+    } catch (err) {
+      logger.debug(`Could not read exports map for ${packageName}: ${err.message}`);
+    }
+    return subPaths;
+  }
+
+  /**
+   * Scan the installed package directory for utility/shared files that
+   * are likely to contain pure functions (merge, parse, config utils, etc.).
+   */
+  scanForUtilityFiles(packageName) {
+    const files = [];
+    try {
+      const pkgJsonPath = require.resolve(`${packageName}/package.json`);
+      const pkgDir = path.dirname(pkgJsonPath);
+
+      // Directories likely to contain reusable utilities
+      const scanDirs = [
+        'dist/shared', 'dist/lib', 'dist/utils', 'dist/shared/lib',
+        'lib', 'lib/utils', 'lib/shared',
+        'utils', 'shared', 'helpers',
+        'dist/compiled', 'dist/server/lib',
+      ];
+
+      // Patterns in filenames that suggest interesting targets
+      const interestingPatterns = /\b(util|helper|merge|config|parse|route|url|path|header|cookie|query|param|option|default|extend|assign|clone|deep|share|common)\b/i;
+
+      for (const dir of scanDirs) {
+        const fullDir = path.join(pkgDir, dir);
+        try {
+          if (!fsSync.existsSync(fullDir) || !fsSync.statSync(fullDir).isDirectory()) continue;
+
+          const entries = fsSync.readdirSync(fullDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isFile() && /\.(js|mjs|cjs)$/.test(entry.name) && interestingPatterns.test(entry.name)) {
+              // Convert filesystem path to a require-able path relative to package
+              const relPath = path.join(dir, entry.name).replace(/\\/g, '/').replace(/\.(js|mjs|cjs)$/, '');
+              files.push(relPath);
+            }
+          }
+        } catch { /* directory not readable */ }
+      }
+
+      logger.debug(`Found ${files.length} utility files to probe: ${files.slice(0, 10).join(', ')}`);
+    } catch (err) {
+      logger.debug(`Could not scan package directory for ${packageName}: ${err.message}`);
+    }
+    return files;
+  }
+
+  /**
+   * Try loading a sub-module using both ESM import() and CJS require().
+   */
+  async tryLoadSubModule(packageName, subPath, subModules, tried) {
+    const fullPath = `${packageName}/${subPath}`;
+    if (tried.has(fullPath)) return;
+    tried.add(fullPath);
+
+    // Try ESM import first
+    try {
+      const mod = await import(fullPath);
+      if (mod && (typeof mod === 'object' || typeof mod === 'function')) {
+        const exportCount = Object.keys(mod).filter(k => k !== '__esModule' && k !== 'default').length;
+        if (exportCount > 0 || mod.default) {
+          subModules[fullPath] = mod;
+          logger.debug(`Loaded (ESM): ${fullPath} (${exportCount} exports)`);
+          return;
+        }
+      }
+    } catch { /* ESM import failed */ }
+
+    // Try CJS require as fallback
+    try {
+      const mod = require(fullPath);
+      if (mod && (typeof mod === 'object' || typeof mod === 'function')) {
+        const exportCount = typeof mod === 'function' ? 1 : Object.keys(mod).filter(k => k !== '__esModule').length;
+        if (exportCount > 0) {
+          subModules[fullPath] = mod;
+          logger.debug(`Loaded (CJS): ${fullPath} (${exportCount} exports)`);
+          return;
+        }
+      }
+    } catch { /* CJS require failed */ }
   }
 
   parsePackageSpec(spec) {
