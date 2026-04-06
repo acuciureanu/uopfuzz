@@ -1,22 +1,34 @@
 # UoPFuzz Target Configuration for Pug v3.0.2
 # Known vulnerable template engine for prototype pollution
+# CVE-2021-21353: PP in pug leads to RCE via code generation
 
 name: "pug"
 package: "pug"
 version: "3.0.2"
-description: "Template engine vulnerable to prototype pollution leading to eval"
+description: "Template engine vulnerable to prototype pollution leading to RCE"
 
 # Entry points - functions that accept user input
 entryPoints:
   - name: "compile"
     inputType: "template"
-    description: "Main template compilation function"
+    description: "Compile template string into a function"
   - name: "render"
-    inputType: "template"  
-    description: "Direct template rendering"
-  - name: "renderFile"
-    inputType: "string"
-    description: "File-based template rendering"
+    inputType: "template"
+    description: "Compile and render template in one call"
+
+# Multi-step call sequences for gadget discovery
+# Pug's compile() returns a function; calling it triggers code generation
+sequences:
+  - entryPoint: "compile"
+    steps:
+      - call: "compile"
+        args: ["template", "options"]
+      - call: "__result__"
+        args: ["locals"]
+  - entryPoint: "render"
+    steps:
+      - call: "render"
+        args: ["template", "options"]
 
 # Dangerous sinks - functions that could lead to RCE/XSS
 sinks:
@@ -26,26 +38,43 @@ sinks:
   - "vm.runInThisContext"
   - "vm.runInNewContext"
 
-# Properties commonly used in prototype pollution
+# Properties that pug's compiler actually reads from options.
+# These are the real properties checked in pug's source code
+# (pug-code-gen, pug-filters, pug-lexer, pug-parser).
 pollutionPoints:
-  - "isDebug"
-  - "template"
-  - "cache"
-  - "filename" 
+  # Code generation options (pug-code-gen/index.js)
+  - "block"
+  - "debug"
   - "compileDebug"
   - "self"
-  - "line"
   - "pretty"
+  - "inlineRuntimeFunctions"
+  - "globals"
+  - "doctype"
+  # Parser/Lexer options
+  - "filename"
+  - "basedir"
+  - "plugins"
+  - "filters"
+  # Cache and runtime
+  - "cache"
+  - "name"
+  - "module"
 
 # Known vulnerable patterns for this target
 knownPatterns:
-  - description: "Prototype pollution via template options"
-    pattern: "__proto__.template"
+  - description: "PP via block property leads to code injection in compiled function"
+    pattern: "__proto__.block"
+    sink: "Function"
+    reference: "CVE-2021-21353, Silent Spring (USENIX 2023)"
+
+  - description: "PP via compileDebug enables debug code path with eval"
+    pattern: "__proto__.compileDebug"
     sink: "eval"
-    reference: "Silent Spring project"
-  
-  - description: "Constructor pollution affecting compilation"
-    pattern: "constructor.prototype.self"
+    reference: "Feng et al., prototype pollution analysis"
+
+  - description: "PP via self changes variable scoping in compiled template"
+    pattern: "__proto__.self"
     sink: "Function"
     reference: "UOPF paper"
 

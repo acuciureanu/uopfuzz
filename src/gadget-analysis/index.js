@@ -97,6 +97,103 @@ export class GadgetAnalysis {
     }
   }
 
+  /**
+   * Analyze a differential oracle result to create a confirmed gadget chain.
+   *
+   * Unlike analyzeTraces (which uses timestamp correlation and produces
+   * unconfirmed candidates), this method uses causal evidence from the
+   * differential oracle: the pollution actually changed behavior.
+   *
+   * @param {object} diffResult - Result from executeDifferential()
+   * @param {object} input - The fuzzer input that triggered this
+   * @param {object} config - Target configuration
+   * @returns {object|null} A confirmed gadget chain, or null
+   */
+  analyzeDifferentialResult(diffResult, input, config) {
+    if (!diffResult?.diff?.isConfirmedGadget) return null;
+
+    const diff = diffResult.diff;
+    const sinkName = diff.newSinkAccesses.length > 0
+      ? diff.newSinkAccesses[0].sink
+      : (diff.details.payloadReachedOutput ? 'output_injection' : 'behavioral_change');
+
+    const sinkMeta = this.sinkSeverity[sinkName] || {
+      baseScore: diff.details.payloadReachedOutput ? 8.0 : 5.0,
+      impact: diff.details.payloadReachedOutput ? 'Injection' : 'Behavioral',
+      cvssVector: 'AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N'
+    };
+
+    const chain = {
+      id: `confirmed_${diff.property}_${sinkName}_${Date.now()}`,
+      type: 'differential_confirmed',
+      riskLevel: Math.min(sinkMeta.baseScore + (diff.pollutionWasRead ? 0.5 : 0), 10),
+      confidence: diff.confidence,
+      confirmed: true,
+      description: this.buildDifferentialDescription(diff, sinkName),
+      source: {
+        type: 'Object.prototype',
+        property: diff.property,
+        payload: String(diff.payload).substring(0, 200)
+      },
+      sink: sinkName !== 'behavioral_change' ? {
+        name: sinkName,
+        arguments: diff.newSinkAccesses[0]?.arguments || [],
+        confirmed: true
+      } : 'behavioral_change',
+      input: {
+        entryPoint: input.entryPoint,
+        type: input.type,
+        polluted: true
+      },
+      differential: {
+        outputChanged: diff.outputChanged,
+        errorChanged: diff.errorChanged,
+        pollutionWasRead: diff.pollutionWasRead,
+        payloadReachedOutput: diff.details.payloadReachedOutput || false,
+        cleanOutput: diff.details.cleanOutput,
+        pollutedOutput: diff.details.pollutedOutput,
+        cleanError: diff.details.cleanError,
+        pollutedError: diff.details.pollutedError
+      },
+      metadata: {
+        target: config.name,
+        version: config.version,
+        discoveredAt: new Date(),
+        cvssVector: sinkMeta.cvssVector,
+        impactType: sinkMeta.impact,
+        verificationMethod: 'differential_oracle'
+      }
+    };
+
+    // Store in known chains for deduplication
+    const sig = `${diff.property}_${sinkName}`;
+    if (!this.knownChains.has(sig)) {
+      this.knownChains.set(sig, chain);
+    }
+
+    return chain;
+  }
+
+  buildDifferentialDescription(diff, sinkName) {
+    const parts = [`CONFIRMED: Object.prototype.${diff.property} pollution`];
+
+    if (diff.newSinkAccesses.length > 0) {
+      parts.push(`triggers ${sinkName} sink`);
+    } else if (diff.details.payloadReachedOutput) {
+      parts.push(`payload reaches output (injection)`);
+    } else if (diff.outputChanged) {
+      parts.push(`changes execution output`);
+    } else if (diff.errorChanged) {
+      parts.push(`changes error behavior`);
+    }
+
+    if (diff.pollutionWasRead) {
+      parts.push(`(property read via prototype chain)`);
+    }
+
+    return parts.join(' — ');
+  }
+
   async analyzeTrace(trace, config) {
     const chains = [];
 

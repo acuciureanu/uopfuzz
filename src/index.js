@@ -5,4 +5,5 @@ export { TargetIntegration } from './target-integration/index.js';
 export { InputGeneration } from './input-generation/index.js';
 export { Instrumentation } from './instrumentation/index.js';
 export { GadgetAnalysis } from './gadget-analysis/index.js';
+export { executeDifferential, discoverUOPProperties } from './instrumentation/differential.js';
 export { logger } from './utils/logger.js';

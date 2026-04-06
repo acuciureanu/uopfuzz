@@ -119,7 +119,9 @@ export class Orchestrator {
       return;
     }
 
-    await this.targetIntegration.setupTarget(this.config);
+    const targetModule = await this.targetIntegration.setupTarget(this.config);
+    // Wire the loaded module into instrumentation so executeInput uses real code
+    this.instrumentation.setTargetModule(targetModule);
     logger.info(`Target ${this.config.name} setup completed`);
   }
 
@@ -139,28 +141,38 @@ export class Orchestrator {
   }
 
   /**
-   * Sequential fuzzing with coverage feedback loop.
+   * Sequential fuzzing with coverage feedback loop and differential oracle.
    *
-   * Each iteration:
-   * 1. Generate inputs (using power schedule from coverage feedback)
-   * 2. Execute with tracing (records edge coverage + taint data)
-   * 3. Feed coverage results back to input generator
-   * 4. Check convergence (saturation rate)
-   * 5. Analyze traces for gadget chains
+   * Two-phase approach per iteration:
+   *
+   * Phase A — Coverage exploration (unchanged):
+   * 1. Generate inputs with power-scheduled mutations
+   * 2. Execute with tracing (V8 coverage + taint proxy)
+   * 3. Feed coverage back to input generator
+   *
+   * Phase B — Differential gadget confirmation (NEW):
+   * 4. Discover UOP properties from taint logs
+   * 5. Generate pollution descriptors (property + payload pairs)
+   * 6. Run differential oracle: clean vs polluted execution
+   * 7. Confirmed gadgets are stored with causal evidence
    */
   async executeSequentialFuzzing(maxIterations) {
     const timeout = this.options.timeout * 1000;
     let consecutiveSaturatedIterations = 0;
 
+    // Track confirmed chains separately from candidates
+    if (!this.results.confirmedChains) {
+      this.results.confirmedChains = [];
+    }
+
     for (let iteration = 0; iteration < maxIterations; iteration++) {
       try {
         const iterationStart = Date.now();
 
-        // Generate test inputs (coverage-guided from iteration 1+)
+        // === Phase A: Coverage exploration ===
         const inputs = await this.inputGeneration.generateInputs(this.config, iteration);
         this.results.inputsGenerated += inputs.length;
 
-        // Execute instrumented testing with coverage tracking
         const traces = await Promise.race([
           this.instrumentation.executeWithTracing(inputs, this.config),
           new Promise((_, reject) =>
@@ -168,7 +180,7 @@ export class Orchestrator {
           )
         ]);
 
-        // Feed coverage results back to input generator (closes the loop)
+        // Feed coverage results back to input generator
         for (const trace of traces) {
           if (trace.coverageResult && trace.input) {
             this.inputGeneration.integrateCoverageFeedback(
@@ -177,19 +189,24 @@ export class Orchestrator {
           }
         }
 
-        // Analyze for gadget chains
+        // Standard chain analysis (timestamp-correlation candidates)
         const chains = await this.gadgetAnalysis.analyzeTraces(traces, this.config);
         this.results.potentialChains.push(...chains);
+
+        // === Phase B: Differential gadget confirmation ===
+        if (!this.options.dryRun) {
+          await this.executeDifferentialPhase(inputs, iteration);
+        }
 
         const iterationTime = Date.now() - iterationStart;
         logger.debug(`Iteration ${iteration + 1}/${maxIterations} completed in ${iterationTime}ms`);
 
-        // Convergence detection: check coverage saturation
+        // Convergence detection
         const saturation = this.instrumentation.getCoverageTracker().getSaturationRate();
         if (saturation > 0.98) {
           consecutiveSaturatedIterations++;
           if (consecutiveSaturatedIterations >= 10) {
-            logger.info(`📈 Coverage saturated at ${(saturation * 100).toFixed(1)}% after ${iteration + 1} iterations - convergence reached`);
+            logger.info(`Coverage saturated at ${(saturation * 100).toFixed(1)}% after ${iteration + 1} iterations`);
             this.results.convergenceInfo = {
               convergedAt: iteration + 1,
               saturationRate: saturation,
@@ -201,9 +218,16 @@ export class Orchestrator {
           consecutiveSaturatedIterations = 0;
         }
 
-        if (iteration % 100 === 0) {
+        if (iteration % 50 === 0) {
           const coverageStats = this.instrumentation.getCoverageStats();
-          logger.info(`Progress: ${iteration + 1}/${maxIterations} iterations | ${chains.length} chains | ${coverageStats.coveredEdges} edges | saturation: ${(saturation * 100).toFixed(1)}%`);
+          const confirmedCount = this.results.confirmedChains.length;
+          const uopCount = this.inputGeneration.discoveredUOPProperties.size;
+          logger.info(
+            `Progress: ${iteration + 1}/${maxIterations} | ` +
+            `${confirmedCount} confirmed gadgets | ${uopCount} UOP properties | ` +
+            `${coverageStats.coveredEdges} edges | ` +
+            `saturation: ${(saturation * 100).toFixed(1)}%`
+          );
         }
 
       } catch (error) {
@@ -215,6 +239,72 @@ export class Orchestrator {
       }
 
       this.results.iterationsCompleted = iteration + 1;
+    }
+  }
+
+  /**
+   * Differential gadget confirmation phase.
+   *
+   * 1. UOP Discovery: Run a clean execution to find what properties the
+   *    library reads as undefined. These are pollution candidates.
+   * 2. Pollution Testing: For each candidate property × payload combination,
+   *    run the differential oracle (clean vs polluted) and confirm gadgets.
+   */
+  async executeDifferentialPhase(inputs, iteration) {
+    // UOP discovery: pick a representative input and trace property accesses
+    // Do this every 5 iterations to discover new properties as coverage grows
+    if (iteration % 5 === 0 && inputs.length > 0) {
+      const sampleInput = inputs[0];
+      try {
+        const uopProps = await this.instrumentation.discoverUOPCandidates(sampleInput, this.config);
+        const newCount = this.inputGeneration.integrateUOPDiscovery(uopProps);
+        if (newCount > 0) {
+          logger.info(`Discovered ${newCount} new UOP properties: ${uopProps.slice(0, 5).join(', ')}${uopProps.length > 5 ? '...' : ''}`);
+        }
+      } catch (error) {
+        logger.debug(`UOP discovery failed: ${error.message}`);
+      }
+    }
+
+    // Differential testing: generate pollution descriptors and test them
+    const descriptors = this.inputGeneration.generatePollutionDescriptors(
+      this.config,
+      Math.min(5, 2 + Math.floor(iteration / 20)) // Ramp up over time
+    );
+
+    // Use a representative input for differential testing
+    const testInput = inputs.find(i => i.type === 'template') || inputs[0];
+    if (!testInput) return;
+
+    for (const descriptor of descriptors) {
+      try {
+        const diffResult = await this.instrumentation.executeDifferentialTracing(
+          testInput, this.config, descriptor
+        );
+
+        if (!diffResult) continue;
+
+        // Analyze the differential result
+        const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+          diffResult, testInput, this.config
+        );
+
+        if (confirmedChain) {
+          this.results.confirmedChains.push(confirmedChain);
+          this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+          this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+          logger.warn(
+            `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
+            `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
+            `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+          );
+        } else {
+          this.inputGeneration.updatePropertyFeedback(descriptor.property, false);
+        }
+      } catch (error) {
+        logger.debug(`Differential test failed for ${descriptor.property}: ${error.message}`);
+      }
     }
   }
 
@@ -348,20 +438,24 @@ export class Orchestrator {
   }
 
   async analyzeResults() {
-    // Deduplicate and rank potential chains
+    // Deduplicate and rank potential chains (timestamp-correlation candidates)
     const uniqueChains = this.gadgetAnalysis.deduplicateChains(this.results.potentialChains);
     const rankedChains = this.gadgetAnalysis.rankChains(uniqueChains);
-
     this.results.potentialChains = rankedChains;
 
-    // Collect science-based metrics
+    // Confirmed chains from differential oracle (causal evidence)
+    if (!this.results.confirmedChains) this.results.confirmedChains = [];
+
+    // Collect metrics
     this.results.coverageStats = this.instrumentation.getCoverageStats();
     this.results.strategyEffectiveness = this.inputGeneration.getGenerationStats();
 
     // Stop V8 coverage collection
     await this.instrumentation.disableV8Coverage();
 
-    logger.info(`Analysis complete: ${rankedChains.length} unique potential chains identified`);
+    const confirmed = this.results.confirmedChains.length;
+    const candidates = rankedChains.length;
+    logger.info(`Analysis complete: ${confirmed} confirmed gadgets, ${candidates} unconfirmed candidates`);
   }
 
   async saveResults() {
@@ -388,15 +482,70 @@ export class Orchestrator {
   generateReport() {
     const duration = this.results.endTime - this.results.startTime;
     const durationStr = `${Math.round(duration / 1000)}s`;
+    const confirmedChains = this.results.confirmedChains || [];
 
     let report = `UoPFuzz Analysis Report\n`;
     report += `======================\n\n`;
-    report += `Target: ${this.config?.name || 'Unknown'}\n`;
+    report += `Target: ${this.config?.name || 'Unknown'} v${this.config?.version || '?'}\n`;
     report += `Duration: ${durationStr}\n`;
     report += `Iterations: ${this.results.iterationsCompleted}\n`;
     report += `Inputs Generated: ${this.results.inputsGenerated}\n`;
-    report += `Potential Chains: ${this.results.potentialChains.length}\n`;
+    report += `Confirmed Gadgets: ${confirmedChains.length}\n`;
+    report += `Unconfirmed Candidates: ${this.results.potentialChains.length}\n`;
     report += `Errors: ${this.results.errors.length}\n\n`;
+
+    // === CONFIRMED GADGETS (differential oracle) ===
+    if (confirmedChains.length > 0) {
+      report += `CONFIRMED GADGET CHAINS (Differential Oracle)\n`;
+      report += `=============================================\n`;
+      report += `These gadgets were confirmed by differential testing:\n`;
+      report += `clean execution vs polluted execution produced different behavior.\n\n`;
+
+      for (const [index, chain] of confirmedChains.entries()) {
+        report += `${index + 1}. ${chain.description}\n`;
+        report += `   Risk: ${chain.riskLevel}/10.0\n`;
+        report += `   Confidence: ${(chain.confidence * 100).toFixed(0)}%\n`;
+        report += `   Property: Object.prototype.${chain.source?.property}\n`;
+        report += `   Payload: ${chain.source?.payload}\n`;
+        if (chain.sink && typeof chain.sink === 'object') {
+          report += `   Sink: ${chain.sink.name}\n`;
+        }
+        if (chain.differential) {
+          if (chain.differential.payloadReachedOutput) {
+            report += `   Evidence: Payload reached output (confirmed injection)\n`;
+          }
+          if (chain.differential.outputChanged) {
+            report += `   Clean output: ${chain.differential.cleanOutput?.substring(0, 100) || 'N/A'}\n`;
+            report += `   Polluted output: ${chain.differential.pollutedOutput?.substring(0, 100) || 'N/A'}\n`;
+          }
+          if (chain.differential.errorChanged) {
+            report += `   Clean error: ${chain.differential.cleanError || 'none'}\n`;
+            report += `   Polluted error: ${chain.differential.pollutedError || 'none'}\n`;
+          }
+        }
+        if (chain.metadata?.cvssVector) {
+          report += `   CVSS: ${chain.metadata.cvssVector}\n`;
+        }
+        report += `\n`;
+      }
+    } else {
+      report += `No confirmed gadgets found.\n\n`;
+    }
+
+    // UOP Property Discovery
+    if (this.results.strategyEffectiveness?.discoveredUOPProperties?.length > 0) {
+      const props = this.results.strategyEffectiveness.discoveredUOPProperties;
+      report += `UOP Property Discovery\n`;
+      report += `----------------------\n`;
+      report += `Properties the target reads as undefined (pollution candidates):\n`;
+      for (const prop of props.slice(0, 30)) {
+        report += `  - ${prop}\n`;
+      }
+      if (props.length > 30) {
+        report += `  ... and ${props.length - 30} more\n`;
+      }
+      report += `\n`;
+    }
 
     // Coverage Analysis
     if (this.results.coverageStats) {
@@ -430,7 +579,7 @@ export class Orchestrator {
       report += `  Reason: ${ci.reason}\n\n`;
     }
 
-    // Strategy Effectiveness (Thompson Sampling results)
+    // Strategy Effectiveness
     if (this.results.strategyEffectiveness) {
       const se = this.results.strategyEffectiveness;
       report += `Mutation Strategy Effectiveness (Thompson Sampling)\n`;
@@ -445,37 +594,35 @@ export class Orchestrator {
       report += `\n`;
     }
 
-    // Gadget Chains with CVSS and Bayesian confidence
+    // Unconfirmed candidates (timestamp-correlation based)
     if (this.results.potentialChains.length > 0) {
-      report += `Potential Gadget Chains (ranked by CVSS score)\n`;
+      report += `Unconfirmed Candidates (timestamp correlation)\n`;
       report += `----------------------------------------------\n`;
-      this.results.potentialChains.forEach((chain, index) => {
+      this.results.potentialChains.slice(0, 20).forEach((chain, index) => {
         report += `${index + 1}. ${chain.description || 'Unknown chain'}\n`;
         report += `   CVSS Score: ${chain.riskLevel || 'N/A'}/10.0\n`;
-        report += `   Confidence: ${((chain.confidence || 0) * 100).toFixed(1)}% (Bayesian posterior)\n`;
-        if (chain.metadata?.cvssVector) {
-          report += `   CVSS Vector: ${chain.metadata.cvssVector}\n`;
-        }
-        if (chain.metadata?.impactType) {
-          report += `   Impact: ${chain.metadata.impactType}\n`;
-        }
+        report += `   Confidence: ${((chain.confidence || 0) * 100).toFixed(1)}%\n`;
         report += `   Source: ${typeof chain.source === 'object' ? JSON.stringify(chain.source) : chain.source}\n`;
         report += `   Sink: ${typeof chain.sink === 'object' ? JSON.stringify(chain.sink) : chain.sink}\n\n`;
       });
+      if (this.results.potentialChains.length > 20) {
+        report += `... and ${this.results.potentialChains.length - 20} more candidates\n\n`;
+      }
     }
 
     report += `\nMethodology\n`;
     report += `===========\n`;
     report += `This analysis uses evidence-based techniques:\n`;
+    report += `- Differential oracle: Clean vs polluted execution comparison (causal confirmation)\n`;
+    report += `- UOP discovery: Proxy-based detection of undefined property reads (attack surface mapping)\n`;
+    report += `- Real Object.prototype pollution: Actual global pollution with cleanup\n`;
+    report += `- Multi-step harnesses: Compile-then-render sequences for template engines\n`;
     report += `- Coverage guidance: AFL-style edge coverage bitmap (Böhme et al., CCS 2016)\n`;
     report += `- V8 precise coverage: Real block/branch coverage via Inspector protocol\n`;
     report += `- Taint tracking: ES6 Proxy deep property interception (Schwartz et al., IEEE S&P 2010)\n`;
     report += `- Risk scoring: CVSS v3.1 aligned base metrics (FIRST, 2019)\n`;
-    report += `- Confidence: Bayesian inference with empirical priors (Bayes, 1763)\n`;
     report += `- Strategy selection: Thompson Sampling with Beta posteriors (Thompson, 1933)\n`;
-    report += `- Diversity: Shannon entropy for corpus and coverage (Shannon, 1948)\n`;
     report += `- Gadget taxonomy: Silent Spring classification (Shcherbakov et al., USENIX 2023)\n`;
-    report += `- UOP detection: Proxy-based undefined property access tracking\n`;
 
     return report;
   }
