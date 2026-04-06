@@ -322,9 +322,12 @@ export class Instrumentation {
     const timeoutMs = (this.options.timeout || 5) * 1000;
 
     try {
+      // executeMergePPTest now internally tries multiple calling conventions:
+      // fn({}, payload), fn(true, {}, payload), and fn(obj, path, val)
+      logger.debug(`MergePP testing entry point: ${input.entryPoint} (fn=${rawFn?.name || 'anonymous'})`);
       return await executeMergePPTest(rawFn, [{}], descriptor.property, descriptor.value, timeoutMs);
     } catch (error) {
-      logger.debug(`Merge PP test failed: ${error.message}`);
+      logger.debug(`Merge PP test failed for ${input.entryPoint}: ${error.message}`);
       return null;
     }
   }

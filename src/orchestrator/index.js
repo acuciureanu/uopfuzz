@@ -312,32 +312,41 @@ export class Orchestrator {
     const testInputs = [];
     const seenEP = new Set();
 
-    // Always include merge/set entry points if they exist anywhere in the generated inputs
-    // or in the seed corpus. Prototype pollution gadgets are most likely in these functions.
-    const dangerousEPs = ['merge', 'set', 'extend', 'defaults', 'defaultsDeep', 'assign', 'mergeWith', 'setWith'];
+    // Always include merge/extend/set entry points if they exist anywhere in the generated
+    // inputs or seed corpus. Prototype pollution gadgets are most likely in these functions.
+    // Priority order: highest-risk merge functions first, then set/assign, then general.
+    const highPriorityEPs = ['extend', 'merge', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge'];
+    const medPriorityEPs = ['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'clone', 'cloneDeep'];
 
-    // Search current inputs first
-    for (const ep of dangerousEPs) {
-      if (seenEP.has(ep)) continue;
-      const inp = inputs.find(i => i.entryPoint === ep);
-      if (inp) {
-        testInputs.push(inp);
-        seenEP.add(ep);
-      }
+    // Helper: check if entry point name ends with a dangerous method (handles dotted names like "jquery.extend")
+    const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
+
+    // Search inputs and seed corpus for dangerous EPs, prioritizing high-risk ones
+    const allSources = [
+      ...inputs.map(inp => ({ input: inp })),
+      ...(this.inputGeneration.seedCorpus || []).map(s => ({ input: s.input })).filter(s => s.input),
+    ];
+
+    // Pass 1: High-priority EPs (extend, merge, defaults)
+    for (const { input: inp } of allSources) {
       if (testInputs.length >= 3) break;
+      if (!inp || seenEP.has(inp.entryPoint)) continue;
+      if (highPriorityEPs.includes(getBaseName(inp.entryPoint))) {
+        testInputs.push(inp);
+        seenEP.add(inp.entryPoint);
+      }
     }
 
-    // Also search seed corpus for dangerous EPs we might have missed
-    if (testInputs.length < 3) {
-      const corpus = this.inputGeneration.seedCorpus || [];
-      for (const ep of dangerousEPs) {
-        if (seenEP.has(ep)) continue;
-        const seed = corpus.find(s => s.input && s.input.entryPoint === ep);
-        if (seed) {
-          testInputs.push(seed.input);
-          seenEP.add(ep);
-        }
-        if (testInputs.length >= 3) break;
+    // Pass 2: Medium-priority EPs (set, assign — only top-level, not nested like attrHooks.type.set)
+    for (const { input: inp } of allSources) {
+      if (testInputs.length >= 3) break;
+      if (!inp || seenEP.has(inp.entryPoint)) continue;
+      const base = getBaseName(inp.entryPoint);
+      // Only match top-level or 1-deep dotted names to avoid noise like "cssHooks.width.set"
+      const depth = inp.entryPoint.split('.').length;
+      if (medPriorityEPs.includes(base) && depth <= 2) {
+        testInputs.push(inp);
+        seenEP.add(inp.entryPoint);
       }
     }
 

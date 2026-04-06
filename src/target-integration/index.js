@@ -250,53 +250,75 @@ export class TargetIntegration {
    * (jQuery, Backbone, etc.) that require window/document at load time.
    */
   async importWithDOMFallback(name) {
-    // For known browser-only packages, go straight to jsdom
+    // Known browser-only packages that export a factory requiring window/document.
+    // These may import() successfully but return a useless factory without DOM globals.
+    // Go straight to jsdom for these to get a fully-initialized module.
     const browserOnlyPackages = ['jquery', 'jquery-ui', 'backbone', 'underscore'];
     const isLikelyBrowserOnly = browserOnlyPackages.some(pkg => name === pkg || name.startsWith(pkg + '@'));
-    
+
+    if (isLikelyBrowserOnly) {
+      logger.info(`${name} is a known browser-only package — loading with jsdom`);
+      return await this._loadWithJsdom(name);
+    }
+
     try {
-      return await import(name);
+      const mod = await import(name);
+      // Heuristic: if the default export is a function with zero enumerable properties,
+      // it's likely a factory that needs a DOM environment (e.g., jQuery returns function(window))
+      if (mod.default && typeof mod.default === 'function' && Object.keys(mod.default).length === 0) {
+        const modKeys = Object.keys(mod).filter(k => k !== 'default' && k !== '__esModule');
+        if (modKeys.length === 0) {
+          logger.info(`${name} exports a bare factory function — retrying with jsdom`);
+          try {
+            return await this._loadWithJsdom(name);
+          } catch {
+            return mod; // jsdom failed, return what we have
+          }
+        }
+      }
+      return mod;
     } catch (err) {
       const msg = err.message || '';
       const needsDom = /window|document|DOM|browser|navigator/i.test(msg);
-      if (!needsDom && !isLikelyBrowserOnly) throw err;
+      if (!needsDom) throw err;
 
-      // Browser-only or needs DOM shim
-      logger.info(`${name} requires a DOM environment — installing minimal window/document shim`);
-      this._installDOMShim();
-      
-      if (!isLikelyBrowserOnly) {
-        try {
-          return await import(name);
-        } catch (err2) {
-          // Will try jsdom below
-        }
-      }
-
-      // Shim wasn't enough — try jsdom if available
-      let jsdomErr;
-      try {
-        const { JSDOM } = await import('jsdom');
-        const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
-        global.window = dom.window;
-        global.document = dom.window.document;
-        try {
-          Object.defineProperty(global, 'navigator', {
-            value: dom.window.navigator,
-            writable: true,
-            configurable: true
-          });
-        } catch { /* ignore */ }
-        logger.info(`Using jsdom for ${name}`);
-        // Use a child module to import with fresh ESM cache
-        return await this._importWithFreshCache(name);
-      } catch (err_jsdom) {
-        jsdomErr = err_jsdom;
-      }
-      throw new Error(
-        `${name} requires a browser DOM. Install jsdom to enable browser package support: npm install jsdom\nOriginal error: ${err?.message}\nJSDOM error: ${jsdomErr?.message}`
-      );
+      // Needs DOM shim
+      logger.info(`${name} requires a DOM environment — loading with jsdom`);
+      return await this._loadWithJsdom(name);
     }
+  }
+
+  /**
+   * Load a module with full jsdom environment.
+   * Uses CJS require with jsdom globals for proper jQuery-style initialization.
+   */
+  async _loadWithJsdom(name) {
+    // Try minimal shim first
+    this._installDOMShim();
+
+    // Full jsdom for complete browser environment
+    let jsdomErr;
+    try {
+      const { JSDOM } = await import('jsdom');
+      const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+      global.window = dom.window;
+      global.document = dom.window.document;
+      try {
+        Object.defineProperty(global, 'navigator', {
+          value: dom.window.navigator,
+          writable: true,
+          configurable: true
+        });
+      } catch { /* ignore */ }
+      logger.info(`Using jsdom for ${name}`);
+      // Use CJS loader for fresh cache and proper DOM initialization
+      return await this._importWithFreshCache(name);
+    } catch (err_jsdom) {
+      jsdomErr = err_jsdom;
+    }
+    throw new Error(
+      `${name} requires a browser DOM. Install jsdom to enable browser package support: npm install jsdom\nJSDOM error: ${jsdomErr?.message}`
+    );
   }
 
   /**

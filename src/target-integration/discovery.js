@@ -41,6 +41,9 @@ const PROBE_INPUTS = [
   // Key-value / merge patterns (lodash-like)
   { type: 'object', args: [{}, { a: 1 }] },
   { type: 'object', args: ['key', 'value'] },
+  // Deep merge patterns (jQuery.extend(true, target, source))
+  { type: 'object', args: [true, {}, { a: 1 }] },
+  { type: 'object', args: [true, { x: 1 }, { y: 2 }] },
   // No args
   { type: 'none', args: [] },
 ];
@@ -220,6 +223,11 @@ function discoverExports(targetModule, packageName) {
       if (typeof value === 'function' && !seen.has(name)) {
         seen.add(name);
         exports.push({ name, fn: value });
+        // Also walk function properties — libraries like jQuery attach methods
+        // directly on the main function ($.extend, $.merge, $.each, etc.)
+        if (depth < 3) {
+          walk(value, name, depth + 1);
+        }
       } else if (typeof value === 'object' && value !== null && !seen.has(name)) {
         seen.add(name);
         walk(value, name, depth + 1);
@@ -246,12 +254,24 @@ function discoverExports(targetModule, packageName) {
   return exports;
 }
 
+// Methods most likely to contain prototype pollution vulnerabilities
+const DANGEROUS_MERGE_METHODS = new Set([
+  'merge', 'extend', 'defaults', 'defaultsDeep', 'assign',
+  'mergeWith', 'setWith', 'set', 'mixin', 'clone', 'cloneDeep',
+  'deepExtend', 'deepMerge', 'deepAssign',
+]);
+
 /**
  * Prioritize exports: put likely-interesting names first.
+ * Dangerous merge/extend methods get highest priority.
  */
 function prioritizeExports(exports) {
   return [...exports].sort((a, b) => {
     const baseName = (name) => name.includes('.') ? name.split('.').pop() : name;
+    const aDangerous = DANGEROUS_MERGE_METHODS.has(baseName(a.name));
+    const bDangerous = DANGEROUS_MERGE_METHODS.has(baseName(b.name));
+    if (aDangerous && !bDangerous) return -1;
+    if (!aDangerous && bDangerous) return 1;
     const aInteresting = INTERESTING_METHODS.has(baseName(a.name));
     const bInteresting = INTERESTING_METHODS.has(baseName(b.name));
     if (aInteresting && !bInteresting) return -1;
