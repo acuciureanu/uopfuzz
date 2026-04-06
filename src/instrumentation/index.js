@@ -534,13 +534,32 @@ export class Instrumentation {
       return;
     }
 
+    // Skip entry points that consistently fail (> 5 consecutive errors)
+    if (!this._entryPointFailures) this._entryPointFailures = new Map();
+    const epKey = input.entryPoint;
+    if ((this._entryPointFailures.get(epKey) || 0) > 5) {
+      trace.errors.push({ message: `Skipped ${epKey} (too many failures)`, timestamp: Date.now() });
+      return;
+    }
+
     // Check if config defines call sequences for this entry point
     const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
 
-    if (sequence) {
-      await this.executeCallSequence(input, config, trace, sequence);
-    } else {
-      await this.executeSingleCall(input, config, trace);
+    try {
+      if (sequence) {
+        await this.executeCallSequence(input, config, trace, sequence);
+      } else {
+        await this.executeSingleCall(input, config, trace);
+      }
+      // Reset failure count on success
+      this._entryPointFailures.set(epKey, 0);
+    } catch (error) {
+      const count = (this._entryPointFailures.get(epKey) || 0) + 1;
+      this._entryPointFailures.set(epKey, count);
+      if (count === 5) {
+        logger.debug(`Disabling entry point ${epKey} after 5 consecutive failures`);
+      }
+      throw error;
     }
   }
 
@@ -672,6 +691,12 @@ export class Instrumentation {
 
   async safeExecute(fn, args) {
     let timer;
+    // Suppress console.error/warn during execution — React hooks and other
+    // framework internals spam stderr with multi-line messages on every call
+    const origError = console.error;
+    const origWarn = console.warn;
+    console.error = () => {};
+    console.warn = () => {};
     try {
       const timeout = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('Execution timeout')), 5000);
@@ -686,6 +711,8 @@ export class Instrumentation {
       return `[ERROR: ${error.message}]`;
     } finally {
       clearTimeout(timer);
+      console.error = origError;
+      console.warn = origWarn;
     }
   }
 

@@ -66,6 +66,24 @@ const SKIP_NAMES = new Set([
 ]);
 
 /**
+ * Should this export name be skipped?
+ * Filters React hooks, internal names, and known-useless patterns.
+ */
+function shouldSkipExport(name) {
+  const baseName = name.includes('.') ? name.split('.').pop() : name;
+  if (SKIP_NAMES.has(baseName)) return true;
+  if (baseName.startsWith('_')) return true;
+  // React hooks — these CANNOT run outside a component render context
+  if (/^use[A-Z]/.test(baseName)) return true;
+  // React internal patterns
+  if (/^(create|forward|lazy|memo|Children|Fragment|Suspense|Profiler|StrictMode)$/.test(baseName)) return true;
+  // Common React component indicators (PascalCase single-word + returns JSX)
+  // We can't detect JSX statically, but we can skip known React exports
+  if (/^(Component|PureComponent|createElement|cloneElement|isValidElement|createContext|createRef)$/.test(baseName)) return true;
+  return false;
+}
+
+/**
  * Discover target configuration automatically from a loaded module.
  */
 export async function discoverTarget(targetModule, packageName, version, subModules = {}) {
@@ -193,7 +211,7 @@ function discoverExports(targetModule, packageName) {
     }
 
     for (const [key, value] of entries) {
-      if (SKIP_NAMES.has(key) || key.startsWith('_')) continue;
+      if (shouldSkipExport(key)) continue;
       const name = prefix ? `${prefix}.${key}` : key;
 
       if (typeof value === 'function' && !seen.has(name)) {
@@ -315,6 +333,22 @@ function isLikelyConstructor(fn) {
 }
 
 /**
+ * Temporarily suppress console.error (React/framework internals spam stderr).
+ */
+function withSuppressedConsole(fn) {
+  const origError = console.error;
+  const origWarn = console.warn;
+  console.error = () => {};
+  console.warn = () => {};
+  try {
+    return fn();
+  } finally {
+    console.error = origError;
+    console.warn = origWarn;
+  }
+}
+
+/**
  * Try calling a function with given args, with timeout protection.
  */
 async function tryCall(fn, args, timeoutMs = 2000) {
@@ -323,7 +357,7 @@ async function tryCall(fn, args, timeoutMs = 2000) {
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('probe timeout')), timeoutMs);
     });
-    const execution = Promise.resolve(fn(...args));
+    const execution = withSuppressedConsole(() => Promise.resolve(fn(...args)));
     const value = await Promise.race([execution, timeout]);
     return { success: true, value };
   } catch {
@@ -342,7 +376,7 @@ async function tryConstruct(fn, args, timeoutMs = 2000) {
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('probe timeout')), timeoutMs);
     });
-    const execution = Promise.resolve(new fn(...args));
+    const execution = withSuppressedConsole(() => Promise.resolve(new fn(...args)));
     const value = await Promise.race([execution, timeout]);
     return { success: true, value };
   } catch {
