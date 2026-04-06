@@ -34,14 +34,17 @@ async function executeClean(fn, args, timeoutMs = 5000) {
     return arg;
   });
 
+  let timer;
   try {
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Execution timeout')), timeoutMs)
-    );
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+    });
     const execution = Promise.resolve(fn(...trackedArgs));
     result.output = await Promise.race([execution, timeout]);
   } catch (error) {
     result.error = error.message;
+  } finally {
+    clearTimeout(timer);
   }
 
   if (taintLog.length > 0) {
@@ -76,17 +79,19 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
   const hadProperty = Object.prototype.hasOwnProperty.call(Object.prototype, prop);
   const originalValue = Object.prototype[prop];
 
+  let timer;
   try {
     Object.prototype[prop] = val;
 
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Execution timeout')), timeoutMs)
-    );
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+    });
     const execution = Promise.resolve(fn(...trackedArgs));
     result.output = await Promise.race([execution, timeout]);
   } catch (error) {
     result.error = error.message;
   } finally {
+    clearTimeout(timer);
     // Always clean up — never leave Object.prototype polluted
     if (hadProperty) {
       Object.prototype[prop] = originalValue;
@@ -225,13 +230,16 @@ export async function discoverUOPProperties(fn, args, timeoutMs = 5000) {
     return arg;
   });
 
+  let timer;
   try {
-    const timeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('Execution timeout')), timeoutMs)
-    );
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+    });
     await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
   } catch {
     // Errors are expected - we just want the taint log
+  } finally {
+    clearTimeout(timer);
   }
 
   // Extract unique property names that were read as undefined

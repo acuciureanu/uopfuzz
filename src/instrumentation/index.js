@@ -496,7 +496,7 @@ export class Instrumentation {
               callStack: new Error().stack
             });
 
-            logger.warn(`Potential sink access detected: ${sink}`);
+            logger.debug(`Sink access detected: ${sink}`);
             return '[SIMULATED_SINK_RESULT]';
           };
 
@@ -671,10 +671,11 @@ export class Instrumentation {
   }
 
   async safeExecute(fn, args) {
+    let timer;
     try {
-      const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Execution timeout')), 5000)
-      );
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Execution timeout')), 5000);
+      });
 
       const execution = Promise.resolve(fn(...args));
 
@@ -683,6 +684,8 @@ export class Instrumentation {
     } catch (error) {
       logger.debug(`Safe execution failed: ${error.message}`);
       return `[ERROR: ${error.message}]`;
+    } finally {
+      clearTimeout(timer);
     }
   }
 

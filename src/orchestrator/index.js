@@ -276,7 +276,14 @@ export class Orchestrator {
     const testInput = inputs.find(i => i.type === 'template') || inputs[0];
     if (!testInput) return;
 
+    // Track confirmed property+payloadType combos to avoid re-testing
+    if (!this._confirmedSignatures) this._confirmedSignatures = new Set();
+
     for (const descriptor of descriptors) {
+      // Skip combos already confirmed — no need to re-verify
+      const sig = `${descriptor.property}:${descriptor.payloadType}`;
+      if (this._confirmedSignatures.has(sig)) continue;
+
       try {
         const diffResult = await this.instrumentation.executeDifferentialTracing(
           testInput, this.config, descriptor
@@ -284,12 +291,12 @@ export class Orchestrator {
 
         if (!diffResult) continue;
 
-        // Analyze the differential result
         const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
           diffResult, testInput, this.config
         );
 
         if (confirmedChain) {
+          this._confirmedSignatures.add(sig);
           this.results.confirmedChains.push(confirmedChain);
           this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
           this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
