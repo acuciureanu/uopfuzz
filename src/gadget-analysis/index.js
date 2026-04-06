@@ -350,17 +350,16 @@ console.log('Object.prototype.${prop} =', Object.prototype.${prop});
       const sortedSinks = [...trace.sinkAccesses].sort((a, b) => a.timestamp - b.timestamp);
 
       for (const pollution of trace.prototypeChanges) {
-        const relevantAccesses = trace.propertyAccesses.filter(
-          access => access.timestamp > pollution.timestamp &&
-                   this.isRelevantPropertyAccess(access, pollution, config)
-        );
+        // Avoid .filter() — iterate once, skip non-qualifying accesses inline
+        for (const access of trace.propertyAccesses) {
+          if (access.timestamp <= pollution.timestamp) continue;
+          if (!this.isRelevantPropertyAccess(access, pollution, config)) continue;
 
-        for (const access of relevantAccesses) {
           // Use pre-sorted sinks: find first sink after access.timestamp
           for (const sink of sortedSinks) {
             if (sink.timestamp <= access.timestamp) continue;
 
-            const chain = this.createChain({
+            chains.push(this.createChain({
               type: 'multi-step',
               pollution,
               propertyAccess: access,
@@ -368,9 +367,7 @@ console.log('Object.prototype.${prop} =', Object.prototype.${prop});
               trace,
               config,
               steps: [pollution, access, sink]
-            });
-
-            chains.push(chain);
+            }));
           }
         }
       }

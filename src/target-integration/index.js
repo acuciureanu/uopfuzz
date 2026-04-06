@@ -494,7 +494,7 @@ try {
         'dist/compiled', 'dist/server/lib',
       ];
 
-      // Patterns in filenames that suggest interesting targets
+      const jsExtRe = /\.(js|mjs|cjs)$/;
       const interestingPatterns = /\b(util|helper|merge|config|parse|route|url|path|header|cookie|query|param|option|default|extend|assign|clone|deep|share|common)\b/i;
 
       for (const dir of scanDirs) {
@@ -504,9 +504,8 @@ try {
 
           const entries = fsSync.readdirSync(fullDir, { withFileTypes: true });
           for (const entry of entries) {
-            if (entry.isFile() && /\.(js|mjs|cjs)$/.test(entry.name) && interestingPatterns.test(entry.name)) {
-              // Convert filesystem path to a require-able path relative to package
-              const relPath = path.join(dir, entry.name).replace(/\\/g, '/').replace(/\.(js|mjs|cjs)$/, '');
+            if (entry.isFile() && jsExtRe.test(entry.name) && interestingPatterns.test(entry.name)) {
+              const relPath = path.join(dir, entry.name).replace(/\\/g, '/').replace(jsExtRe, '');
               files.push(relPath);
             }
           }

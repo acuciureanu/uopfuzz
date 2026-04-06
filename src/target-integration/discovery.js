@@ -45,6 +45,9 @@ const PROBE_INPUTS = [
   { type: 'none', args: [] },
 ];
 
+// Pre-sliced for UOP discovery — avoids creating a new array per export
+const UOP_PROBES = PROBE_INPUTS.slice(0, 5);
+
 // Method names that indicate interesting fuzzing targets
 const INTERESTING_METHODS = new Set([
   'compile', 'render', 'renderString', 'renderFile', 'renderToString',
@@ -332,19 +335,19 @@ function isLikelyConstructor(fn) {
   return false;
 }
 
-/**
- * Temporarily suppress console.error (React/framework internals spam stderr).
- */
+// Cached console references — avoid saving/restoring per call
+const _origConsoleError = console.error;
+const _origConsoleWarn = console.warn;
+const _noopFn = () => {};
+
 function withSuppressedConsole(fn) {
-  const origError = console.error;
-  const origWarn = console.warn;
-  console.error = () => {};
-  console.warn = () => {};
+  console.error = _noopFn;
+  console.warn = _noopFn;
   try {
     return fn();
   } finally {
-    console.error = origError;
-    console.warn = origWarn;
+    console.error = _origConsoleError;
+    console.warn = _origConsoleWarn;
   }
 }
 
@@ -395,7 +398,7 @@ async function discoverAllUOPProperties(exports) {
   const allProperties = new Set();
 
   for (const exp of exports) {
-    for (const probe of PROBE_INPUTS.slice(0, 5)) {
+    for (const probe of UOP_PROBES) {
       const props = await discoverPropertiesFromProbe(exp.fn, probe);
       for (const p of props) allProperties.add(p);
     }

@@ -1,5 +1,14 @@
 import { logger } from '../utils/logger.js';
 
+// Pre-allocated constant — avoids recreating this array on every call
+const GENERIC_POLLUTION_PROPS = [
+  'block', 'debug', 'compileDebug', 'self', 'line', 'pretty', 'filename',
+  'basedir', 'doctype', 'globals', 'filters', 'plugins', 'cache',
+  'template', 'autoEscape', 'defaultFilter', 'tags', 'rmWhitespace',
+  'e', 'async', 'root', 'views', 'partials', 'helpers', 'layout',
+  'outputFunctionName', 'localsName', 'destructuredLocals', 'escape'
+];
+
 /**
  * Science-Based Input Generation Engine
  *
@@ -398,16 +407,25 @@ export class InputGeneration {
       // Add to seed corpus with boosted energy
       const energyBoost = Math.min(8, Math.pow(2, coverageResult.newEdges));
       this.seedCorpus.push({
-        input: structuredClone(input),
+        input: { ...input, metadata: { ...input.metadata } },
         energy: energyBoost,
         novelEdges: coverageResult.newEdges,
         addedAt: Date.now()
       });
 
-      // Evict lowest-energy seeds when corpus exceeds size cap
+      // Evict lowest-energy seed when corpus exceeds size cap.
+      // O(n) single-pass min-find instead of O(n log n) sort.
       if (this.seedCorpus.length > this.maxSeedCorpusSize) {
-        this.seedCorpus.sort((a, b) => b.energy - a.energy);
-        this.seedCorpus.length = this.maxSeedCorpusSize;
+        let minIdx = 0;
+        let minEnergy = this.seedCorpus[0].energy;
+        for (let i = 1; i < this.seedCorpus.length; i++) {
+          if (this.seedCorpus[i].energy < minEnergy) {
+            minEnergy = this.seedCorpus[i].energy;
+            minIdx = i;
+          }
+        }
+        this.seedCorpus[minIdx] = this.seedCorpus[this.seedCorpus.length - 1];
+        this.seedCorpus.length--;
       }
 
       this.coverageFeedback.novelInputs.push(input);
@@ -424,9 +442,9 @@ export class InputGeneration {
   }
 
   async applyMutationStrategy(input, strategy, config) {
-    const cloned = structuredClone(input);
-    cloned.metadata.generation = 'mutation';
-    cloned.metadata.strategy = strategy;
+    // Shallow clone — mutations overwrite fields, don't mutate nested refs in-place.
+    // structuredClone is 10-100x slower and called thousands of times per session.
+    const cloned = { ...input, metadata: { ...input.metadata, generation: 'mutation', strategy } };
 
     switch (strategy) {
       case 'prototypePollution':
@@ -699,9 +717,10 @@ export class InputGeneration {
         }
 
         // Mutate the selected seed
-        const base = structuredClone(selectedSeed.input);
-        base.metadata.generation = 'coverage_guided';
-        base.metadata.parentEnergy = selectedSeed.energy;
+        const base = {
+          ...selectedSeed.input,
+          metadata: { ...selectedSeed.input.metadata, generation: 'coverage_guided', parentEnergy: selectedSeed.energy }
+        };
 
         const strategy = rankedStrategies[i % rankedStrategies.length];
         const mutated = await this.applyMutationStrategy(base, strategy, config);
@@ -759,33 +778,24 @@ export class InputGeneration {
    * Get prioritized list of properties to try polluting.
    */
   getPollutionProperties(config) {
+    const seen = new Set();
     const properties = [];
 
+    const addUnique = (prop) => {
+      if (!seen.has(prop)) {
+        seen.add(prop);
+        properties.push(prop);
+      }
+    };
+
     // Highest priority: UOP properties discovered from actual execution
-    for (const prop of this.discoveredUOPProperties) {
-      properties.push(prop);
-    }
+    for (const prop of this.discoveredUOPProperties) addUnique(prop);
 
     // Medium priority: config-defined pollution points
-    for (const prop of (config.pollutionPoints || [])) {
-      if (!properties.includes(prop)) {
-        properties.push(prop);
-      }
-    }
+    for (const prop of (config.pollutionPoints || [])) addUnique(prop);
 
     // Low priority: generic high-value targets for template engines
-    const generic = [
-      'block', 'debug', 'compileDebug', 'self', 'line', 'pretty', 'filename',
-      'basedir', 'doctype', 'globals', 'filters', 'plugins', 'cache',
-      'template', 'autoEscape', 'defaultFilter', 'tags', 'rmWhitespace',
-      'e', 'async', 'root', 'views', 'partials', 'helpers', 'layout',
-      'outputFunctionName', 'localsName', 'destructuredLocals', 'escape'
-    ];
-    for (const prop of generic) {
-      if (!properties.includes(prop)) {
-        properties.push(prop);
-      }
-    }
+    for (const prop of GENERIC_POLLUTION_PROPS) addUnique(prop);
 
     return properties;
   }

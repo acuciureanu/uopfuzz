@@ -186,14 +186,17 @@ export function analyzeTaintLog(log) {
   const prototypeChainLookups = [];
   const propertyWriteAfterRead = [];
   const accessFrequency = new Map();
+  let totalAccesses = 0;
 
+  // Single pass: collect all analysis results together
   for (let i = 0; i < log.length; i++) {
     const event = log[i];
 
     if (event.type === 'get') {
-      // Track access frequency for information-theoretic analysis
-      const count = accessFrequency.get(event.property) || 0;
-      accessFrequency.set(event.property, count + 1);
+      // Track access frequency inline
+      const count = (accessFrequency.get(event.property) || 0) + 1;
+      accessFrequency.set(event.property, count);
+      totalAccesses++;
 
       // UOP: reading a property that doesn't exist
       if (event.isUOPCandidate) {
@@ -202,23 +205,11 @@ export function analyzeTaintLog(log) {
           property: event.property,
           timestamp: event.timestamp
         });
-      }
 
-      // Prototype chain lookup: property doesn't exist on own object
-      // but resolves to a value (came from prototype)
-      if (event.isPrototypeChainLookup) {
-        prototypeChainLookups.push({
-          path: event.path,
-          property: event.property,
-          valueType: event.valueType,
-          timestamp: event.timestamp
-        });
-      }
-
-      // Pattern: read undefined property, then write to it later
-      // This is a common gadget pattern: if (!obj.prop) obj.prop = default
-      if (event.isUOPCandidate) {
-        for (let j = i + 1; j < Math.min(i + 20, log.length); j++) {
+        // Pattern: read undefined property, then write to it later
+        // Common gadget pattern: if (!obj.prop) obj.prop = default
+        const end = Math.min(i + 20, log.length);
+        for (let j = i + 1; j < end; j++) {
           if (log[j].type === 'set' && log[j].property === event.property) {
             propertyWriteAfterRead.push({
               readPath: event.path,
@@ -231,13 +222,20 @@ export function analyzeTaintLog(log) {
           }
         }
       }
+
+      // Prototype chain lookup
+      if (event.isPrototypeChainLookup) {
+        prototypeChainLookups.push({
+          path: event.path,
+          property: event.property,
+          valueType: event.valueType,
+          timestamp: event.timestamp
+        });
+      }
     }
   }
 
-  // Compute Shannon entropy of property access distribution
-  // Higher entropy = more diverse exploration
-  let totalAccesses = 0;
-  for (const count of accessFrequency.values()) totalAccesses += count;
+  // Compute Shannon entropy in single pass over frequency map
   let accessEntropy = 0;
   if (totalAccesses > 0) {
     for (const count of accessFrequency.values()) {

@@ -8,6 +8,11 @@ const require = createRequire(import.meta.url);
 let childProcessModule;
 try { childProcessModule = require('child_process'); } catch { childProcessModule = null; }
 
+// Cached console references — avoid saving/restoring per call (hot path)
+const _origConsoleError = console.error;
+const _origConsoleWarn = console.warn;
+const _noopFn = () => {};
+
 /**
  * Instrumentation Engine - Real V8 Coverage + Proxy Taint Tracking
  *
@@ -48,6 +53,8 @@ export class Instrumentation {
 
     // The loaded target module (set by orchestrator after setupTarget)
     this.targetModule = null;
+    // Track entry points that consistently fail to avoid retrying
+    this._entryPointFailures = new Map();
 
     // Layer 1: AFL-style edge coverage (computed from trace events)
     this.coverageTracker = new CoverageTracker();
@@ -567,7 +574,6 @@ export class Instrumentation {
     }
 
     // Skip entry points that consistently fail (> 5 consecutive errors)
-    if (!this._entryPointFailures) this._entryPointFailures = new Map();
     const epKey = input.entryPoint;
     if ((this._entryPointFailures.get(epKey) || 0) > 5) {
       trace.errors.push({ message: `Skipped ${epKey} (too many failures)`, timestamp: Date.now() });
@@ -723,12 +729,9 @@ export class Instrumentation {
 
   async safeExecute(fn, args) {
     let timer;
-    // Suppress console.error/warn during execution — React hooks and other
-    // framework internals spam stderr with multi-line messages on every call
-    const origError = console.error;
-    const origWarn = console.warn;
-    console.error = () => {};
-    console.warn = () => {};
+    // Suppress console.error/warn — frameworks spam stderr on every call
+    console.error = _noopFn;
+    console.warn = _noopFn;
     try {
       const timeout = new Promise((_, reject) => {
         timer = setTimeout(() => reject(new Error('Execution timeout')), 5000);
@@ -743,8 +746,8 @@ export class Instrumentation {
       return `[ERROR: ${error.message}]`;
     } finally {
       clearTimeout(timer);
-      console.error = origError;
-      console.warn = origWarn;
+      console.error = _origConsoleError;
+      console.warn = _origConsoleWarn;
     }
   }
 
