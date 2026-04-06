@@ -6,6 +6,7 @@ import { createRequire } from 'module';
 import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
 import { discoverTarget } from './discovery.js';
+import { verifyPackageIntegrity } from '../utils/package-safety.js';
 
 const require = createRequire(import.meta.url);
 
@@ -77,7 +78,7 @@ export class TargetIntegration {
 
   async installPackage(packageName, version) {
     const packageId = `${packageName}@${version}`;
-    
+
     if (this.installedPackages.has(packageId)) {
       logger.debug(`Package ${packageId} already installed`);
       return;
@@ -85,23 +86,40 @@ export class TargetIntegration {
 
     try {
       logger.info(`Installing package: ${packageId}`);
-      
+
       if (this.options.dryRun) {
         logger.info(`🏃‍♂️ Dry run - would install ${packageId}`);
         this.installedPackages.add(packageId);
         return;
       }
 
-      // Use npm to install the specific package version
-      const installCommand = `npm install ${packageId} --no-save --silent`;
-      execSync(installCommand, { 
+      // SECURITY: Validate package name to prevent command injection
+      if (!/^(@[a-z0-9\-~][a-z0-9\-._~]*\/)?[a-z0-9\-~][a-z0-9\-._~]*$/.test(packageName)) {
+        throw new Error(`Invalid package name: ${packageName}`);
+      }
+      if (version !== 'latest' && !/^[\w.^~<>=\-|* ]+$/.test(version)) {
+        throw new Error(`Invalid version specifier: ${version}`);
+      }
+
+      // SECURITY: --ignore-scripts prevents postinstall/preinstall attacks.
+      // Malicious packages commonly use lifecycle scripts for RCE.
+      // If a package legitimately needs postinstall (e.g., native addons),
+      // use --allow-scripts to opt in explicitly.
+      const ignoreScripts = this.options.allowScripts ? '' : '--ignore-scripts';
+      const installCommand = `npm install ${packageId} --no-save --silent ${ignoreScripts}`.trim();
+
+      logger.debug(`Running: ${installCommand}`);
+      execSync(installCommand, {
         stdio: this.options.verbose ? 'inherit' : 'pipe',
         timeout: 30000 // 30 second timeout for package installation
       });
-      
+
+      // SECURITY: Verify package integrity after install
+      await verifyPackageIntegrity(packageName, version, this.options);
+
       this.installedPackages.add(packageId);
       logger.debug(`Successfully installed ${packageId}`);
-      
+
     } catch (error) {
       throw new Error(`Failed to install ${packageId}: ${error.message}`);
     }

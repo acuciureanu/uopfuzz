@@ -20,7 +20,14 @@ program
   .option('-v, --verbose', 'Enable verbose logging')
   .option('--dry-run', 'Simulate execution without running actual tests')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations', '1000')
-  .option('--parallel <num>', 'Number of parallel workers', '1');
+  .option('--parallel <num>', 'Number of parallel workers', '1')
+  // Supply chain security options
+  .option('--allow-scripts', 'Allow npm lifecycle scripts during install (DANGEROUS)')
+  .option('--allow-suspicious', 'Allow packages with suspicious install scripts (DANGEROUS)')
+  .option('--skip-integrity-check', 'Skip package integrity verification')
+  .option('--sandbox', 'Run target code in isolated child process (recommended)', true)
+  .option('--no-sandbox', 'Disable child process isolation (faster, less safe)')
+  .option('--allow-network', 'Allow network access during target execution');
 
 program.action(async (options) => {
   try {
@@ -40,6 +47,26 @@ program.action(async (options) => {
       process.exit(1);
     }
 
+    // Security warnings
+    if (options.allowScripts) {
+      logger.warn(chalk.red('⚠ --allow-scripts: npm lifecycle scripts will run during install'));
+      logger.warn(chalk.red('  Malicious packages can execute arbitrary code via postinstall'));
+    }
+    if (!options.sandbox) {
+      logger.warn(chalk.yellow('⚠ --no-sandbox: target code runs in the fuzzer process'));
+      logger.warn(chalk.yellow('  A malicious package can access your filesystem and network'));
+    }
+    if (options.allowNetwork) {
+      logger.warn(chalk.yellow('⚠ --allow-network: target code can make outbound connections'));
+    }
+
+    if (!process.env.UOPFUZZ_CONTAINER && !options.dryRun) {
+      logger.info(chalk.yellow(
+        'Tip: Run inside the dev container for maximum isolation:\n' +
+        '  devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . node src/cli.js --target <pkg>'
+      ));
+    }
+
     const orchestratorOpts = {
       configPath: options.config || null,
       targetPackage: options.target || null,
@@ -48,7 +75,13 @@ program.action(async (options) => {
       dryRun: options.dryRun || false,
       maxIterations: parseInt(options.maxIterations),
       parallelWorkers: parseInt(options.parallel),
-      verbose: options.verbose || false
+      verbose: options.verbose || false,
+      // Security options
+      allowScripts: options.allowScripts || false,
+      allowSuspicious: options.allowSuspicious || false,
+      skipIntegrityCheck: options.skipIntegrityCheck || false,
+      sandbox: options.sandbox !== false,
+      blockNetwork: !options.allowNetwork,
     };
 
     const orchestrator = new Orchestrator(orchestratorOpts);

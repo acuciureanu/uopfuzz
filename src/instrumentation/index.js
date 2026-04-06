@@ -3,6 +3,7 @@ import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { executeDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
+import { executeInSandbox } from '../utils/sandbox.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let childProcessModule;
@@ -283,27 +284,34 @@ export class Instrumentation {
    * Executes the target twice (clean + polluted) and compares results.
    * This is the core mechanism for confirming real gadgets vs false positives.
    *
+   * When sandbox mode is enabled (default), executes in an isolated child
+   * process to prevent malicious target code from affecting the fuzzer.
+   *
    * @param {object} input - The fuzzer-generated input
    * @param {object} config - Target configuration
    * @param {object} pollutionDescriptor - { property, value }
    * @returns {object} Differential result with gadget confirmation
    */
   async executeDifferentialTracing(input, config, pollutionDescriptor) {
-    if (!this.targetModule || this.options.dryRun) {
-      return null;
+    if (this.options.dryRun) return null;
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+
+    // Sandboxed execution: run in child process
+    if (this.options.sandbox && config.package) {
+      return this._sandboxedDifferential(config.package, input, pollutionDescriptor, timeoutMs);
     }
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    // In-process execution (--no-sandbox)
+    if (!this.targetModule) return null;
 
-    // Build a callable thunk for the entry point (or sequence)
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return null;
 
     const args = sequence
       ? this.buildCallArgs(sequence.steps[0], input, config)
       : (input.type === 'template' ? [input.value] : [input.value]);
-
-    const timeoutMs = (this.options.timeout || 5) * 1000;
 
     try {
       return await executeDifferential(fn, args, pollutionDescriptor, timeoutMs);
@@ -313,8 +321,98 @@ export class Instrumentation {
     }
   }
 
+  /**
+   * Sandboxed differential execution via child process.
+   * The target code runs in a separate V8 instance with:
+   * - No network access (blocked at socket level)
+   * - No child_process.exec (blocked)
+   * - No sensitive env vars
+   * - Memory-limited to 512MB
+   * - Hard timeout from parent
+   */
+  async _sandboxedDifferential(packageName, input, descriptor, timeoutMs) {
+    try {
+      // Only serialize safe values for the pollution descriptor
+      const safeDescriptor = {
+        property: descriptor.property,
+        value: typeof descriptor.value === 'function'
+          ? '__UOPFUZZ_MARKER_7f3a__'  // Replace functions with sentinel
+          : descriptor.value,
+      };
+
+      const args = input.type === 'template' ? [input.value] : [input.value];
+
+      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+        timeoutMs,
+        blockNetwork: this.options.blockNetwork !== false,
+        pollution: safeDescriptor,
+        mode: 'differential',
+      });
+
+      if (result.error && !result.outputChanged && !result.prototypePolluted) {
+        logger.debug(`Sandboxed differential failed: ${result.error}`);
+        return null;
+      }
+
+      // Translate sandbox result to the format gadget-analysis expects
+      if (result.outputChanged || result.errorChanged || result.prototypePolluted) {
+        return {
+          clean: { output: result.clean?.output, error: result.clean?.error, sinkAccesses: [], taintLog: [] },
+          polluted: {
+            output: result.polluted?.output,
+            error: result.polluted?.error,
+            sinkAccesses: [],
+            taintLog: [],
+            pollutionWasRead: true,
+            prototypePolluted: result.prototypePolluted || false,
+            pollutedProperties: result.pollutedProperties || [],
+          },
+          diff: {
+            property: descriptor.property,
+            payload: descriptor.value,
+            outputChanged: result.outputChanged || false,
+            errorChanged: result.errorChanged || false,
+            newSinkAccesses: [],
+            pollutionWasRead: true,
+            prototypePolluted: result.prototypePolluted || false,
+            pollutedProperties: result.pollutedProperties || [],
+            isConfirmedGadget: true,
+            confidence: result.prototypePolluted ? 0.95 : (result.outputChanged ? 0.75 : 0.60),
+            details: {
+              cleanOutput: result.clean?.output?.substring?.(0, 500),
+              pollutedOutput: result.polluted?.output?.substring?.(0, 500),
+              cleanError: result.clean?.error,
+              pollutedError: result.polluted?.error,
+              payloadReachedOutput: result.polluted?.output?.includes?.(String(descriptor.value)) &&
+                !result.clean?.output?.includes?.(String(descriptor.value)),
+              sandboxed: true,
+            },
+          },
+        };
+      }
+
+      return null;
+    } catch (error) {
+      logger.debug(`Sandboxed differential error: ${error.message}`);
+      return null;
+    }
+  }
+
   async executeMergePPDifferential(input, config, descriptor) {
-    if (!this.targetModule || this.options.dryRun) return null;
+    if (this.options.dryRun) return null;
+
+    // Sandboxed merge-PP is handled via the standard sandboxed differential
+    // since the sandbox worker handles Object.prototype detection
+    if (this.options.sandbox && config.package) {
+      // For merge-PP, we pass the payload as the input value directly
+      const mergeInput = {
+        ...input,
+        value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
+      };
+      return this._sandboxedDifferential(config.package, mergeInput, descriptor, (this.options.timeout || 5) * 1000);
+    }
+
+    if (!this.targetModule) return null;
 
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
@@ -322,8 +420,6 @@ export class Instrumentation {
     const timeoutMs = (this.options.timeout || 5) * 1000;
 
     try {
-      // executeMergePPTest now internally tries multiple calling conventions:
-      // fn({}, payload), fn(true, {}, payload), and fn(obj, path, val)
       logger.debug(`MergePP testing entry point: ${input.entryPoint} (fn=${rawFn?.name || 'anonymous'})`);
       return await executeMergePPTest(rawFn, [{}], descriptor.property, descriptor.value, timeoutMs);
     } catch (error) {
@@ -333,7 +429,18 @@ export class Instrumentation {
   }
 
   async executeURLGadgetDifferential(input, config, descriptor) {
-    if (!this.targetModule || this.options.dryRun) return null;
+    if (this.options.dryRun) return null;
+
+    // URL gadget test in sandbox mode reuses sandboxed differential
+    if (this.options.sandbox && config.package) {
+      const urlInput = {
+        ...input,
+        value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
+      };
+      return this._sandboxedDifferential(config.package, urlInput, descriptor, (this.options.timeout || 5) * 1000);
+    }
+
+    if (!this.targetModule) return null;
 
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
