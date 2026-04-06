@@ -241,7 +241,6 @@ export class TargetIntegration {
       setupTime: new Date()
     });
 
-    logger.info(`Target ${name}@${version} auto-discovered and ready`);
     return { config, module: mergedModule };
   }
 
@@ -299,8 +298,10 @@ export class TargetIntegration {
     // Full jsdom for complete browser environment
     let jsdomErr;
     try {
-      const { JSDOM } = await import('jsdom');
-      const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+      const { JSDOM, VirtualConsole } = await import('jsdom');
+      const vc = new VirtualConsole();
+      vc.on('error', () => {});
+      const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', { url: 'http://localhost', virtualConsole: vc });
       global.window = dom.window;
       global.document = dom.window.document;
       try {
@@ -330,8 +331,14 @@ export class TargetIntegration {
     const loaderPath = path.join(tmpDir, `loader-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
     
     const loaderCode = `
-const { JSDOM } = require('jsdom');
-const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+const { JSDOM, VirtualConsole } = require('jsdom');
+// Suppress jsdom internal errors (ERR_INVALID_PROTOCOL, ECONNREFUSED, etc.)
+const virtualConsole = new VirtualConsole();
+virtualConsole.on('error', () => {});
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
+  url: 'http://localhost',
+  virtualConsole
+});
 global.window = dom.window;
 global.document = dom.window.document;
 try {
