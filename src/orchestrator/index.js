@@ -220,9 +220,12 @@ export class Orchestrator {
         const iterationTime = Date.now() - iterationStart;
         logger.debug(`Iteration ${iteration + 1}/${maxIterations} completed in ${iterationTime}ms`);
 
-        // Convergence detection
+        // Convergence detection — require minimum 20 iterations before early termination
+        // This ensures UOP discovery (runs every 5 iterations) gets at least 4 chances,
+        // and differential testing explores enough property×payload combinations.
         const saturation = this.instrumentation.getCoverageTracker().getSaturationRate();
-        if (saturation > 0.98) {
+        const MIN_ITERATIONS_BEFORE_CONVERGENCE = 20;
+        if (saturation > 0.98 && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
           consecutiveSaturatedIterations++;
           if (consecutiveSaturatedIterations >= 10) {
             logger.info(`Coverage saturated at ${(saturation * 100).toFixed(1)}% after ${iteration + 1} iterations`);
@@ -233,11 +236,11 @@ export class Orchestrator {
             };
             break;
           }
-        } else {
+        } else if (saturation <= 0.98) {
           consecutiveSaturatedIterations = 0;
         }
 
-        if (iteration % 50 === 0) {
+        if (iteration % 10 === 0) {
           const coverageStats = this.instrumentation.getCoverageStats();
           const confirmedCount = this.results.confirmedChains.length;
           const uopCount = this.inputGeneration.discoveredUOPProperties.size;
@@ -270,30 +273,50 @@ export class Orchestrator {
    *    run the differential oracle (clean vs polluted) and confirm gadgets.
    */
   async executeDifferentialPhase(inputs, iteration) {
-    // UOP discovery: pick a representative input and trace property accesses
-    // Do this every 5 iterations to discover new properties as coverage grows
+    // UOP discovery: probe multiple diverse inputs to find property accesses.
+    // Do this every 5 iterations, probing up to 3 different entry points.
     if (iteration % 5 === 0 && inputs.length > 0) {
-      const sampleInput = inputs[0];
-      try {
-        const uopProps = await this.instrumentation.discoverUOPCandidates(sampleInput, this.config);
-        const newCount = this.inputGeneration.integrateUOPDiscovery(uopProps);
-        if (newCount > 0) {
-          logger.info(`Discovered ${newCount} new UOP properties: ${uopProps.slice(0, 5).join(', ')}${uopProps.length > 5 ? '...' : ''}`);
+      // Pick diverse sample inputs — different entry points and types
+      const seenEntryPoints = new Set();
+      const samples = [];
+      for (const inp of inputs) {
+        const key = `${inp.entryPoint}:${inp.type}`;
+        if (!seenEntryPoints.has(key) && samples.length < 3) {
+          seenEntryPoints.add(key);
+          samples.push(inp);
         }
-      } catch (error) {
-        logger.debug(`UOP discovery failed: ${error.message}`);
+      }
+
+      for (const sampleInput of samples) {
+        try {
+          const uopProps = await this.instrumentation.discoverUOPCandidates(sampleInput, this.config);
+          const newCount = this.inputGeneration.integrateUOPDiscovery(uopProps);
+          if (newCount > 0) {
+            logger.info(`Discovered ${newCount} new UOP properties via ${sampleInput.entryPoint}: ${uopProps.slice(0, 5).join(', ')}${uopProps.length > 5 ? '...' : ''}`);
+          }
+        } catch (error) {
+          logger.debug(`UOP discovery failed for ${sampleInput.entryPoint}: ${error.message}`);
+        }
       }
     }
 
     // Differential testing: generate pollution descriptors and test them
     const descriptors = this.inputGeneration.generatePollutionDescriptors(
       this.config,
-      Math.min(5, 2 + Math.floor(iteration / 20)) // Ramp up over time
+      Math.min(10, 3 + Math.floor(iteration / 10)) // Ramp up faster, test more
     );
 
-    // Use a representative input for differential testing
-    const testInput = inputs.find(i => i.type === 'template') || inputs[0];
-    if (!testInput) return;
+    // Use multiple representative inputs for differential testing (different entry points)
+    const testInputs = [];
+    const seenEP = new Set();
+    for (const inp of inputs) {
+      if (!seenEP.has(inp.entryPoint) && testInputs.length < 3) {
+        seenEP.add(inp.entryPoint);
+        testInputs.push(inp);
+      }
+    }
+    if (testInputs.length === 0 && inputs.length > 0) testInputs.push(inputs[0]);
+    if (testInputs.length === 0) return;
 
     // Track confirmed property+payloadType combos to avoid re-testing
     if (!this._confirmedSignatures) this._confirmedSignatures = new Set();
@@ -303,33 +326,40 @@ export class Orchestrator {
       const sig = `${descriptor.property}:${descriptor.payloadType}`;
       if (this._confirmedSignatures.has(sig)) continue;
 
-      try {
-        const diffResult = await this.instrumentation.executeDifferentialTracing(
-          testInput, this.config, descriptor
-        );
-
-        if (!diffResult) continue;
-
-        const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
-          diffResult, testInput, this.config
-        );
-
-        if (confirmedChain) {
-          this._confirmedSignatures.add(sig);
-          this.results.confirmedChains.push(confirmedChain);
-          this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-          this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-          logger.warn(
-            `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
-            `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
-            `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+      // Try each test input until one confirms or all fail
+      let confirmed = false;
+      for (const testInput of testInputs) {
+        try {
+          const diffResult = await this.instrumentation.executeDifferentialTracing(
+            testInput, this.config, descriptor
           );
-        } else {
-          this.inputGeneration.updatePropertyFeedback(descriptor.property, false);
+
+          if (!diffResult) continue;
+
+          const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+            diffResult, testInput, this.config
+          );
+
+          if (confirmedChain) {
+            this._confirmedSignatures.add(sig);
+            this.results.confirmedChains.push(confirmedChain);
+            this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+            this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+            logger.warn(
+              `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
+              `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
+              `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+            );
+            confirmed = true;
+            break; // No need to try other inputs for this descriptor
+          }
+        } catch (error) {
+          logger.debug(`Differential test failed for ${descriptor.property} via ${testInput.entryPoint}: ${error.message}`);
         }
-      } catch (error) {
-        logger.debug(`Differential test failed for ${descriptor.property}: ${error.message}`);
+      }
+      if (!confirmed) {
+        this.inputGeneration.updatePropertyFeedback(descriptor.property, false);
       }
     }
   }

@@ -35,6 +35,12 @@ const PROBE_INPUTS = [
   // String-first with options (common pattern: fn(str, opts))
   { type: 'string', args: ['test', {}] },
   { type: 'string', args: ['test'] },
+  // HTTP-like objects (Express/Koa/Fastify middleware patterns)
+  { type: 'object', args: [{ url: '/', method: 'GET', headers: {} }] },
+  { type: 'object', args: [{ url: '/', method: 'GET', headers: {} }, { end: () => {}, write: () => {}, setHeader: () => {} }] },
+  // Key-value / merge patterns (lodash-like)
+  { type: 'object', args: [{}, { a: 1 }] },
+  { type: 'object', args: ['key', 'value'] },
   // No args
   { type: 'none', args: [] },
 ];
@@ -62,11 +68,24 @@ const SKIP_NAMES = new Set([
 /**
  * Discover target configuration automatically from a loaded module.
  */
-export async function discoverTarget(targetModule, packageName, version) {
+export async function discoverTarget(targetModule, packageName, version, subModules = {}) {
   logger.info(`Auto-discovering target: ${packageName}@${version}`);
 
   // Step 1: Deep-walk exports to find ALL callable functions
   const allExports = discoverExports(targetModule, packageName);
+
+  // Also walk sub-module exports (e.g., next/server, next/headers)
+  for (const [subPath, subMod] of Object.entries(subModules)) {
+    const prefix = subPath.replace(`${packageName}/`, '');
+    const subExports = discoverExports(subMod, prefix);
+    for (const exp of subExports) {
+      // Avoid duplicates by name
+      if (!allExports.some(e => e.name === exp.name)) {
+        allExports.push(exp);
+      }
+    }
+  }
+
   logger.info(`Found ${allExports.length} callable exports: ${allExports.map(e => e.name).slice(0, 15).join(', ')}${allExports.length > 15 ? '...' : ''}`);
 
   if (allExports.length === 0) {

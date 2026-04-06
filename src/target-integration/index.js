@@ -217,21 +217,81 @@ export class TargetIntegration {
       return { config, module: { name, version, isDryRun: true } };
     }
 
-    // Load the module
+    // Load the main module + sub-path modules for deeper discovery
     const targetModule = await import(name);
+    const subModules = await this.loadSubPathModules(name);
 
-    // Auto-discover everything
-    const config = await discoverTarget(targetModule, name, version);
+    // Auto-discover everything (main module + sub-modules)
+    const config = await discoverTarget(targetModule, name, version, subModules);
 
-    // Cache
+    // Cache — merge sub-module exports into targetModule for execution
+    const mergedModule = { ...targetModule };
+    for (const [subPath, subMod] of Object.entries(subModules)) {
+      const key = subPath.replace(`${name}/`, '').replace(/[/-]/g, '_');
+      if (!mergedModule[key]) mergedModule[key] = subMod;
+    }
+
     this.targetCache.set(name, {
       config,
-      module: targetModule,
+      module: mergedModule,
       setupTime: new Date()
     });
 
     logger.info(`Target ${name}@${version} auto-discovered and ready`);
-    return { config, module: targetModule };
+    return { config, module: mergedModule };
+  }
+
+  /**
+   * Try importing common sub-paths of a package.
+   * Many packages (Next.js, Express, etc.) export useful functions from sub-paths
+   * that aren't accessible from the main entry point.
+   */
+  async loadSubPathModules(packageName) {
+    // Common sub-path patterns used by popular packages
+    const commonSubPaths = [
+      'server', 'client', 'utils', 'helpers', 'lib', 'core',
+      'router', 'middleware', 'config', 'types',
+      'dist', 'build', 'src',
+      'head', 'link', 'image', 'script', 'dynamic',  // Next.js-style
+      'navigation', 'headers', 'cookies',              // Next.js app router
+      'parser', 'compiler', 'renderer', 'transformer', // Build tools
+      'merge', 'clone', 'defaults', 'extend',          // Utility libraries
+    ];
+
+    const subModules = {};
+
+    // Also try reading package.json exports field for declared sub-paths
+    try {
+      const pkgPath = `${packageName}/package.json`;
+      const pkg = await import(pkgPath, { with: { type: 'json' } }).catch(() => null);
+      if (pkg?.default?.exports && typeof pkg.default.exports === 'object') {
+        for (const key of Object.keys(pkg.default.exports)) {
+          if (key !== '.' && key !== './package.json' && key.startsWith('./')) {
+            const subPath = `${packageName}/${key.slice(2)}`;
+            commonSubPaths.push(key.slice(2));
+          }
+        }
+      }
+    } catch { /* package.json not importable as JSON, that's fine */ }
+
+    for (const sub of commonSubPaths) {
+      const fullPath = `${packageName}/${sub}`;
+      try {
+        const mod = await import(fullPath);
+        if (mod && (typeof mod === 'object' || typeof mod === 'function')) {
+          subModules[fullPath] = mod;
+          logger.debug(`Loaded sub-module: ${fullPath}`);
+        }
+      } catch {
+        // Expected — most sub-paths won't exist
+      }
+    }
+
+    if (Object.keys(subModules).length > 0) {
+      logger.info(`Loaded ${Object.keys(subModules).length} sub-modules: ${Object.keys(subModules).map(k => k.replace(`${packageName}/`, '')).join(', ')}`);
+    }
+
+    return subModules;
   }
 
   parsePackageSpec(spec) {
