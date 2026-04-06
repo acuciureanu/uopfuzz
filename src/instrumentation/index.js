@@ -2,10 +2,16 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
+import { executeDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let childProcessModule;
 try { childProcessModule = require('child_process'); } catch { childProcessModule = null; }
+
+// Cached console references — avoid saving/restoring per call (hot path)
+const _origConsoleError = console.error;
+const _origConsoleWarn = console.warn;
+const _noopFn = () => {};
 
 /**
  * Instrumentation Engine - Real V8 Coverage + Proxy Taint Tracking
@@ -45,6 +51,11 @@ export class Instrumentation {
     this.originalConsole = {};
     this.instrumentedFunctions = new Set();
 
+    // The loaded target module (set by orchestrator after setupTarget)
+    this.targetModule = null;
+    // Track entry points that consistently fail to avoid retrying
+    this._entryPointFailures = new Map();
+
     // Layer 1: AFL-style edge coverage (computed from trace events)
     this.coverageTracker = new CoverageTracker();
 
@@ -61,6 +72,14 @@ export class Instrumentation {
       totalFunctions: 0,
       coveredFunctions: 0
     };
+  }
+
+  /**
+   * Set the loaded target module for real execution.
+   * Called by the orchestrator after setupTarget() completes.
+   */
+  setTargetModule(targetModule) {
+    this.targetModule = targetModule;
   }
 
   /**
@@ -259,6 +278,136 @@ export class Instrumentation {
   }
 
   /**
+   * Run the differential oracle on an input with a pollution descriptor.
+   *
+   * Executes the target twice (clean + polluted) and compares results.
+   * This is the core mechanism for confirming real gadgets vs false positives.
+   *
+   * @param {object} input - The fuzzer-generated input
+   * @param {object} config - Target configuration
+   * @param {object} pollutionDescriptor - { property, value }
+   * @returns {object} Differential result with gadget confirmation
+   */
+  async executeDifferentialTracing(input, config, pollutionDescriptor) {
+    if (!this.targetModule || this.options.dryRun) {
+      return null;
+    }
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+
+    // Build a callable thunk for the entry point (or sequence)
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+
+    try {
+      return await executeDifferential(fn, args, pollutionDescriptor, timeoutMs);
+    } catch (error) {
+      logger.debug(`Differential execution failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  async executeMergePPDifferential(input, config, descriptor) {
+    if (!this.targetModule || this.options.dryRun) return null;
+
+    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+    if (!rawFn) return null;
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+
+    try {
+      // executeMergePPTest now internally tries multiple calling conventions:
+      // fn({}, payload), fn(true, {}, payload), and fn(obj, path, val)
+      logger.debug(`MergePP testing entry point: ${input.entryPoint} (fn=${rawFn?.name || 'anonymous'})`);
+      return await executeMergePPTest(rawFn, [{}], descriptor.property, descriptor.value, timeoutMs);
+    } catch (error) {
+      logger.debug(`Merge PP test failed for ${input.entryPoint}: ${error.message}`);
+      return null;
+    }
+  }
+
+  async executeURLGadgetDifferential(input, config, descriptor) {
+    if (!this.targetModule || this.options.dryRun) return null;
+
+    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+    if (!rawFn) return null;
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+
+    try {
+      return await executeURLGadgetTest(rawFn, descriptor.property, descriptor.value, timeoutMs);
+    } catch (error) {
+      logger.debug(`URL gadget test failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Build a callable function from an entry point or call sequence.
+   * For sequences, returns a thunk that executes all steps.
+   */
+  buildCallableThunk(input, config, sequence) {
+    if (!sequence) {
+      const fn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+      return fn || null;
+    }
+
+    // For multi-step sequences, return a function that executes the full chain
+    const self = this;
+    return async function sequenceThunk(...firstArgs) {
+      let lastResult = null;
+      for (let i = 0; i < sequence.steps.length; i++) {
+        const step = sequence.steps[i];
+        let fn;
+        if (step.call === '__result__') {
+          if (step.method && lastResult && typeof lastResult[step.method] === 'function') {
+            fn = lastResult[step.method].bind(lastResult);
+          } else if (typeof lastResult === 'function') {
+            fn = lastResult;
+          } else {
+            return lastResult;
+          }
+        } else {
+          fn = self.getEntryPointFunction(self.targetModule, step.call);
+          if (!fn) return null;
+        }
+        const args = i === 0 ? firstArgs : self.buildCallArgs(step, input, config);
+        lastResult = await Promise.resolve(fn(...args));
+      }
+      return lastResult;
+    };
+  }
+
+  /**
+   * Discover UOP properties from a clean execution of the target.
+   * Returns property names the library tries to read but finds undefined.
+   */
+  async discoverUOPCandidates(input, config) {
+    if (!this.targetModule || this.options.dryRun) return [];
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return [];
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await discoverUOPProperties(fn, args, (this.options.timeout || 5) * 1000);
+    } catch (error) {
+      logger.debug(`UOP discovery failed: ${error.message}`);
+      return [];
+    }
+  }
+
+  /**
    * Feed V8 block coverage data into the AFL-style bitmap.
    *
    * Maps V8's (scriptId, startOffset, endOffset) tuples to bitmap
@@ -389,7 +538,7 @@ export class Instrumentation {
               callStack: new Error().stack
             });
 
-            logger.warn(`Potential sink access detected: ${sink}`);
+            logger.debug(`Sink access detected: ${sink}`);
             return '[SIMULATED_SINK_RESULT]';
           };
 
@@ -422,31 +571,137 @@ export class Instrumentation {
   }
 
   async executeInput(input, config, trace) {
-    const targetIntegration = await import('../target-integration/index.js');
-    const targetModule = targetIntegration.getTargetModule?.(config.name);
-
-    if (!targetModule || this.options.dryRun) {
+    if (!this.targetModule || this.options.dryRun) {
       await this.simulateExecution(input, config, trace);
       return;
     }
 
+    // Skip entry points that consistently fail (> 5 consecutive errors)
+    const epKey = input.entryPoint;
+    if ((this._entryPointFailures.get(epKey) || 0) > 5) {
+      trace.errors.push({ message: `Skipped ${epKey} (too many failures)`, timestamp: Date.now() });
+      return;
+    }
+
+    // Check if config defines call sequences for this entry point
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+
+    try {
+      if (sequence) {
+        await this.executeCallSequence(input, config, trace, sequence);
+      } else {
+        await this.executeSingleCall(input, config, trace);
+      }
+      // Reset failure count on success
+      this._entryPointFailures.set(epKey, 0);
+    } catch (error) {
+      const count = (this._entryPointFailures.get(epKey) || 0) + 1;
+      this._entryPointFailures.set(epKey, count);
+      if (count === 5) {
+        logger.debug(`Disabling entry point ${epKey} after 5 consecutive failures`);
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Execute a multi-step call sequence (e.g., compile -> render).
+   *
+   * Many template engine gadgets require: const fn = lib.compile(template, options);
+   * then fn(locals) to trigger the sink. Single-call fuzzing misses these entirely.
+   */
+  async executeCallSequence(input, config, trace, sequence) {
+    let lastResult = null;
+
+    for (const step of sequence.steps) {
+      let fn;
+
+      if (step.call === '__result__') {
+        // Call the result of the previous step (e.g., compiled template function)
+        // If step.method is set, call lastResult[method]() instead
+        if (step.method && lastResult && typeof lastResult[step.method] === 'function') {
+          fn = lastResult[step.method].bind(lastResult);
+        } else if (typeof lastResult === 'function') {
+          fn = lastResult;
+        } else {
+          trace.errors.push({ message: 'Previous step did not return callable', timestamp: Date.now() });
+          return;
+        }
+      } else {
+        fn = this.getEntryPointFunction(this.targetModule, step.call);
+        if (!fn) {
+          trace.errors.push({ message: `Entry point ${step.call} not found`, timestamp: Date.now() });
+          return;
+        }
+      }
+
+      // Build arguments from step definition
+      const args = this.buildCallArgs(step, input, config);
+
+      trace.functionCalls.push({
+        function: step.call,
+        arguments: args.map(a => typeof a === 'string' ? a.substring(0, 200) : '[object]'),
+        timestamp: Date.now()
+      });
+
+      lastResult = await this.safeExecute(fn, args);
+
+      trace.functionCalls[trace.functionCalls.length - 1].result =
+        typeof lastResult === 'string' ? lastResult.substring(0, 500) : typeof lastResult;
+    }
+  }
+
+  /**
+   * Execute a single entry point call (fallback when no sequence defined).
+   */
+  async executeSingleCall(input, config, trace) {
     const entryPointName = input.entryPoint;
-    const entryPoint = this.getEntryPointFunction(targetModule, entryPointName);
+    const entryPoint = this.getEntryPointFunction(this.targetModule, entryPointName);
 
     if (!entryPoint) {
       throw new Error(`Entry point ${entryPointName} not found in target module`);
     }
 
+    // Build arguments based on input type
+    const args = input.type === 'template'
+      ? [input.value]
+      : [input.value];
+
     trace.functionCalls.push({
       function: entryPointName,
-      arguments: input.value,
+      arguments: args.map(a => typeof a === 'string' ? a.substring(0, 200) : '[object]'),
       timestamp: Date.now()
     });
 
-    const result = await this.safeExecute(entryPoint, input.value);
+    const result = await this.safeExecute(entryPoint, args);
 
     trace.functionCalls[trace.functionCalls.length - 1].result =
-      typeof result === 'string' ? result : '[object]';
+      typeof result === 'string' ? result.substring(0, 500) : typeof result;
+  }
+
+  /**
+   * Build call arguments from a sequence step definition and current input.
+   */
+  buildCallArgs(step, input, config) {
+    const args = [];
+    for (const argDef of (step.args || ['input'])) {
+      switch (argDef) {
+        case 'input':
+        case 'template':
+          args.push(input.value);
+          break;
+        case 'options':
+          // Pass an empty options object - pollution comes from Object.prototype
+          args.push(input.options || {});
+          break;
+        case 'locals':
+          args.push(input.locals || { name: 'test', title: 'Test' });
+          break;
+        default:
+          args.push(argDef);
+      }
+    }
+    return args;
   }
 
   getEntryPointFunction(targetModule, entryPointName) {
@@ -475,19 +730,27 @@ export class Instrumentation {
     return null;
   }
 
-  async safeExecute(fn, input) {
+  async safeExecute(fn, args) {
+    let timer;
+    // Suppress console.error/warn — frameworks spam stderr on every call
+    console.error = _noopFn;
+    console.warn = _noopFn;
     try {
-      const timeout = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Execution timeout')), 5000)
-      );
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Execution timeout')), 5000);
+      });
 
-      const execution = Promise.resolve(fn(input));
+      const execution = Promise.resolve(fn(...args));
 
       return await Promise.race([execution, timeout]);
 
     } catch (error) {
       logger.debug(`Safe execution failed: ${error.message}`);
       return `[ERROR: ${error.message}]`;
+    } finally {
+      clearTimeout(timer);
+      console.error = _origConsoleError;
+      console.warn = _origConsoleWarn;
     }
   }
 

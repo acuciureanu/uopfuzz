@@ -97,6 +97,202 @@ export class GadgetAnalysis {
     }
   }
 
+  /**
+   * Analyze a differential oracle result to create a confirmed gadget chain.
+   *
+   * Unlike analyzeTraces (which uses timestamp correlation and produces
+   * unconfirmed candidates), this method uses causal evidence from the
+   * differential oracle: the pollution actually changed behavior.
+   *
+   * @param {object} diffResult - Result from executeDifferential()
+   * @param {object} input - The fuzzer input that triggered this
+   * @param {object} config - Target configuration
+   * @returns {object|null} A confirmed gadget chain, or null
+   */
+  analyzeDifferentialResult(diffResult, input, config) {
+    if (!diffResult?.diff?.isConfirmedGadget) return null;
+
+    const diff = diffResult.diff;
+    const sinkName = diff.newSinkAccesses.length > 0
+      ? diff.newSinkAccesses[0].sink
+      : (diff.details.payloadReachedOutput ? 'output_injection' : 'behavioral_change');
+
+    const sinkMeta = this.sinkSeverity[sinkName] || {
+      baseScore: diff.details.payloadReachedOutput ? 8.0 : (diff.prototypePolluted ? 7.5 : 5.0),
+      impact: diff.prototypePolluted ? 'Prototype Pollution' : (diff.details.payloadReachedOutput ? 'Injection' : 'Behavioral'),
+      cvssVector: diff.prototypePolluted
+        ? 'AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:H'
+        : 'AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N'
+    };
+
+    const chain = {
+      id: `confirmed_${diff.property}_${sinkName}_${Date.now()}`,
+      type: 'differential_confirmed',
+      riskLevel: Math.min(sinkMeta.baseScore + (diff.pollutionWasRead ? 0.5 : 0), 10),
+      confidence: diff.confidence,
+      confirmed: true,
+      description: this.buildDifferentialDescription(diff, sinkName),
+      source: {
+        type: 'Object.prototype',
+        property: diff.property,
+        payload: String(diff.payload).substring(0, 200)
+      },
+      sink: sinkName !== 'behavioral_change' ? {
+        name: sinkName,
+        arguments: diff.newSinkAccesses[0]?.arguments || [],
+        confirmed: true
+      } : 'behavioral_change',
+      input: {
+        entryPoint: input.entryPoint,
+        type: input.type,
+        polluted: true
+      },
+      differential: {
+        outputChanged: diff.outputChanged,
+        errorChanged: diff.errorChanged,
+        pollutionWasRead: diff.pollutionWasRead,
+        prototypePolluted: diff.prototypePolluted || false,
+        pollutedProperties: diff.pollutedProperties || [],
+        payloadReachedOutput: diff.details.payloadReachedOutput || false,
+        cleanOutput: diff.details.cleanOutput,
+        pollutedOutput: diff.details.pollutedOutput,
+        cleanError: diff.details.cleanError,
+        pollutedError: diff.details.pollutedError,
+        exploitURL: diff.details.exploitURL || null,
+        payloadType: diff.details.payloadType || null
+      },
+      metadata: {
+        target: config.name,
+        version: config.version,
+        discoveredAt: new Date(),
+        cvssVector: sinkMeta.cvssVector,
+        impactType: sinkMeta.impact,
+        verificationMethod: 'differential_oracle'
+      },
+      poc: this.buildPOC({
+        source: { property: diff.property, payload: String(diff.payload).substring(0, 200) },
+        differential: {
+          exploitURL: diff.details.exploitURL || null,
+          payloadType: diff.details.payloadType || null
+        },
+        input: { entryPoint: input.entryPoint }
+      }, config)
+    };
+
+    // Store in known chains for deduplication
+    const sig = `${diff.property}_${sinkName}`;
+    if (!this.knownChains.has(sig)) {
+      this.knownChains.set(sig, chain);
+    }
+
+    return chain;
+  }
+
+  buildDifferentialDescription(diff, sinkName) {
+    const parts = [];
+
+    if (diff.prototypePolluted) {
+      const props = diff.pollutedProperties?.length > 0
+        ? diff.pollutedProperties.join(', ')
+        : diff.property;
+      if (diff.details.exploitURL) {
+        parts.push(`CONFIRMED URL GADGET: Object.prototype.${props} polluted via URL query string → ${diff.details.payloadType}`);
+      } else {
+        parts.push(`CONFIRMED PROTOTYPE POLLUTION: Object.prototype.${props} was modified`);
+      }
+    } else {
+      parts.push(`CONFIRMED: Object.prototype.${diff.property} pollution`);
+    }
+
+    if (diff.newSinkAccesses.length > 0) {
+      parts.push(`triggers ${sinkName} sink`);
+    } else if (diff.details.payloadReachedOutput) {
+      parts.push(`payload reaches output (injection)`);
+    } else if (diff.outputChanged) {
+      parts.push(`changes execution output`);
+    } else if (diff.errorChanged) {
+      parts.push(`changes error behavior`);
+    }
+
+    if (diff.pollutionWasRead) {
+      parts.push(`(property read via prototype chain)`);
+    }
+
+    return parts.join(' — ');
+  }
+
+  buildPOC(chain, config) {
+    const target = config?.name || 'unknown';
+    const version = config?.version || '';
+    const ep = chain.input?.entryPoint || 'unknown';
+    const prop = chain.source?.property || 'unknown';
+    const val = chain.source?.payload || '';
+    const exploitURL = chain.differential?.exploitURL;
+    const payloadType = chain.differential?.payloadType || '';
+
+    if (exploitURL) {
+      const isConstructor = payloadType.includes('constructor');
+      const jsonPayload = isConstructor
+        ? `{ constructor: { prototype: { ${prop}: ${JSON.stringify(val)} } } }`
+        : `{ __proto__: { ${prop}: ${JSON.stringify(val)} } }`;
+
+      return {
+        type: 'url_gadget',
+        summary: `Prototype pollution via URL query parameter in ${target}@${version}`,
+        attackerInput: {
+          url: exploitURL,
+          description: 'Attacker-controlled URL query string'
+        },
+        vulnerablePattern: {
+          library: `${target}@${version}`,
+          function: ep,
+          description: `Attacker sends URL with malicious query string → ${target} parses it → ${target}.${ep}() merges attacker data into Object.prototype`
+        },
+        exploit: {
+          language: 'javascript',
+          code: `// POC: ${target}@${version} prototype pollution via ${ep}()
+// Attacker sends: ${exploitURL}
+
+// Simulating what the server does:
+const _ = require('${target}');
+
+// Attacker-controlled data from URL query string
+const maliciousPayload = ${jsonPayload};
+
+// Vulnerable: attacker data merged into config (or any object)
+const config = {};
+_.${ep}(config, maliciousPayload);
+
+// RESULT: Object.prototype is now polluted
+console.log('Object.prototype.${prop} =', Object.prototype.${prop});
+// Expected output: ${JSON.stringify(val)}
+
+${isConstructor ? `// Note: Uses 'constructor.prototype' pattern to bypass __proto__ guards` : ''}`
+        }
+      };
+    }
+
+    return {
+      type: 'prototype_pollution',
+      summary: `Prototype pollution in ${target}@${version}`,
+      vulnerablePattern: {
+        library: `${target}@${version}`,
+        function: ep
+      },
+      exploit: {
+        language: 'javascript',
+        code: `// POC: ${target}@${version} prototype pollution via ${ep}()
+const _ = require('${target}');
+
+const payload = { ${prop}: ${JSON.stringify(val)} };
+_.${ep}({}, payload);
+
+console.log('Object.prototype.${prop} =', Object.prototype.${prop});
+// Expected output: ${JSON.stringify(val)}`
+      }
+    };
+  }
+
   async analyzeTrace(trace, config) {
     const chains = [];
 
@@ -154,17 +350,16 @@ export class GadgetAnalysis {
       const sortedSinks = [...trace.sinkAccesses].sort((a, b) => a.timestamp - b.timestamp);
 
       for (const pollution of trace.prototypeChanges) {
-        const relevantAccesses = trace.propertyAccesses.filter(
-          access => access.timestamp > pollution.timestamp &&
-                   this.isRelevantPropertyAccess(access, pollution, config)
-        );
+        // Avoid .filter() — iterate once, skip non-qualifying accesses inline
+        for (const access of trace.propertyAccesses) {
+          if (access.timestamp <= pollution.timestamp) continue;
+          if (!this.isRelevantPropertyAccess(access, pollution, config)) continue;
 
-        for (const access of relevantAccesses) {
           // Use pre-sorted sinks: find first sink after access.timestamp
           for (const sink of sortedSinks) {
             if (sink.timestamp <= access.timestamp) continue;
 
-            const chain = this.createChain({
+            chains.push(this.createChain({
               type: 'multi-step',
               pollution,
               propertyAccess: access,
@@ -172,9 +367,7 @@ export class GadgetAnalysis {
               trace,
               config,
               steps: [pollution, access, sink]
-            });
-
-            chains.push(chain);
+            }));
           }
         }
       }

@@ -1,8 +1,13 @@
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
+import { createRequire } from 'module';
 import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
+import { discoverTarget } from './discovery.js';
+
+const require = createRequire(import.meta.url);
 
 export class TargetIntegration {
   constructor(options) {
@@ -187,6 +192,404 @@ export class TargetIntegration {
       throw new Error(`Target ${targetName} not found in cache. Call setupTarget() first.`);
     }
     return cached.config;
+  }
+
+  /**
+   * Set up a target from just a package name and version — no YAML config needed.
+   * Auto-discovers entry points, call sequences, and pollution candidates.
+   *
+   * @param {string} packageSpec - e.g., "pug@3.0.2" or "squirrelly@8.0.8"
+   * @returns {{ config: object, module: object }} The auto-generated config and loaded module
+   */
+  async setupTargetFromPackage(packageSpec) {
+    const { name, version } = this.parsePackageSpec(packageSpec);
+
+    logger.info(`Setting up target from package: ${name}@${version}`);
+
+    // Install the package
+    await this.installPackage(name, version);
+
+    if (this.options.dryRun) {
+      const config = {
+        name, package: name, version,
+        description: `Dry-run target: ${name}@${version}`,
+        entryPoints: [{ name: 'compile', inputType: 'template' }],
+        sinks: ['eval', 'Function', 'child_process.exec'],
+        pollutionPoints: ['debug', 'template', 'cache'],
+        _autoDiscovered: true
+      };
+      return { config, module: { name, version, isDryRun: true } };
+    }
+
+    // Load the main module — with DOM shim fallback for browser-only packages
+    const targetModule = await this.importWithDOMFallback(name);
+    const subModules = await this.loadSubPathModules(name);
+
+    // Auto-discover everything (main module + sub-modules)
+    const config = await discoverTarget(targetModule, name, version, subModules);
+
+    // Cache — merge sub-module exports into targetModule for execution
+    const mergedModule = { ...targetModule };
+    for (const [subPath, subMod] of Object.entries(subModules)) {
+      const key = subPath.replace(`${name}/`, '').replace(/[/-]/g, '_');
+      if (!mergedModule[key]) mergedModule[key] = subMod;
+    }
+
+    this.targetCache.set(name, {
+      config,
+      module: mergedModule,
+      setupTime: new Date()
+    });
+
+    return { config, module: mergedModule };
+  }
+
+  /**
+   * Import a module, falling back to a minimal DOM shim for browser-only packages
+   * (jQuery, Backbone, etc.) that require window/document at load time.
+   */
+  async importWithDOMFallback(name) {
+    // Known browser-only packages that export a factory requiring window/document.
+    // These may import() successfully but return a useless factory without DOM globals.
+    // Go straight to jsdom for these to get a fully-initialized module.
+    const browserOnlyPackages = ['jquery', 'jquery-ui', 'backbone', 'underscore'];
+    const isLikelyBrowserOnly = browserOnlyPackages.some(pkg => name === pkg || name.startsWith(pkg + '@'));
+
+    if (isLikelyBrowserOnly) {
+      logger.info(`${name} is a known browser-only package — loading with jsdom`);
+      return await this._loadWithJsdom(name);
+    }
+
+    try {
+      const mod = await import(name);
+      // Heuristic: if the default export is a function with zero enumerable properties,
+      // it's likely a factory that needs a DOM environment (e.g., jQuery returns function(window))
+      if (mod.default && typeof mod.default === 'function' && Object.keys(mod.default).length === 0) {
+        const modKeys = Object.keys(mod).filter(k => k !== 'default' && k !== '__esModule');
+        if (modKeys.length === 0) {
+          logger.info(`${name} exports a bare factory function — retrying with jsdom`);
+          try {
+            return await this._loadWithJsdom(name);
+          } catch {
+            return mod; // jsdom failed, return what we have
+          }
+        }
+      }
+      return mod;
+    } catch (err) {
+      const msg = err.message || '';
+      const needsDom = /window|document|DOM|browser|navigator/i.test(msg);
+      if (!needsDom) throw err;
+
+      // Needs DOM shim
+      logger.info(`${name} requires a DOM environment — loading with jsdom`);
+      return await this._loadWithJsdom(name);
+    }
+  }
+
+  /**
+   * Load a module with full jsdom environment.
+   * Uses CJS require with jsdom globals for proper jQuery-style initialization.
+   */
+  async _loadWithJsdom(name) {
+    // Try minimal shim first
+    this._installDOMShim();
+
+    // Full jsdom for complete browser environment
+    let jsdomErr;
+    try {
+      const { JSDOM, VirtualConsole } = await import('jsdom');
+      const vc = new VirtualConsole();
+      vc.on('error', () => {});
+      const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', { url: 'http://localhost', virtualConsole: vc });
+      global.window = dom.window;
+      global.document = dom.window.document;
+      try {
+        Object.defineProperty(global, 'navigator', {
+          value: dom.window.navigator,
+          writable: true,
+          configurable: true
+        });
+      } catch { /* ignore */ }
+      logger.info(`Using jsdom for ${name}`);
+      // Use CJS loader for fresh cache and proper DOM initialization
+      return await this._importWithFreshCache(name);
+    } catch (err_jsdom) {
+      jsdomErr = err_jsdom;
+    }
+    throw new Error(
+      `${name} requires a browser DOM. Install jsdom to enable browser package support: npm install jsdom\nJSDOM error: ${jsdomErr?.message}`
+    );
+  }
+
+  /**
+   * Import a module with fresh ESM cache by loading via CommonJS.
+   * This completely bypasses ESM module caching issues.
+   */
+  async _importWithFreshCache(name) {
+    const tmpDir = path.join(process.cwd(), '.uopfuzz-temp');
+    const loaderPath = path.join(tmpDir, `loader-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
+    
+    const loaderCode = `
+const { JSDOM, VirtualConsole } = require('jsdom');
+// Suppress jsdom internal errors (ERR_INVALID_PROTOCOL, ECONNREFUSED, etc.)
+const virtualConsole = new VirtualConsole();
+virtualConsole.on('error', () => {});
+const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', {
+  url: 'http://localhost',
+  virtualConsole
+});
+global.window = dom.window;
+global.document = dom.window.document;
+try {
+  Object.defineProperty(global, 'navigator', {
+    value: dom.window.navigator,
+    writable: true,
+    configurable: true
+  });
+} catch {}
+
+// Try factory entry point first (for jquery and similar)
+try {
+  const factory = require('${name}/factory');
+  module.exports = factory(dom.window);
+} catch {
+  // Fall back to regular require
+  module.exports = require('${name}');
+}
+`;
+    
+    try {
+      await fs.mkdir(tmpDir, { recursive: true });
+      await fs.writeFile(loaderPath, loaderCode, 'utf8');
+      const cjsModule = require(loaderPath);
+      
+      // Convert to ESM-like format with default and named exports
+      if (cjsModule && typeof cjsModule === 'object') {
+        return cjsModule;
+      }
+      // If it's a function (like jQuery), wrap it
+      return { default: cjsModule, ...cjsModule };
+    } finally {
+      try { await fs.unlink(loaderPath); } catch { /* ignore */ }
+    }
+  }
+
+  /**
+   * Install a minimal global DOM shim for packages that check for window/document.
+   * Installs only what's needed — avoids breaking Node.js builtins.
+   */
+  _installDOMShim() {
+    if (global.window) return; // Already shimmed
+
+    const noop = () => {};
+    const noopEl = { style: {}, classList: { add: noop, remove: noop }, addEventListener: noop };
+
+    // Use defineProperty for read-only globals — many Node.js globals (navigator,
+    // location) have a getter but no setter, so direct assignment throws TypeError.
+    const defineGlobal = (name, value) => {
+      const desc = Object.getOwnPropertyDescriptor(global, name);
+      if (desc && !desc.configurable) {
+        if (desc.set) {
+          try { global[name] = value; } catch { /* ignore */ }
+        }
+        return;
+      }
+      try {
+        global[name] = value;
+      } catch {
+        try {
+          Object.defineProperty(global, name, { value, writable: true, configurable: true });
+        } catch { /* can't override, leave as-is */ }
+      }
+    };
+
+    defineGlobal('window', global);
+    defineGlobal('document', {
+      createElement: () => ({ ...noopEl }),
+      createElementNS: () => ({ ...noopEl }),
+      createTextNode: () => ({}),
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      getElementsByTagName: () => [],
+      addEventListener: noop,
+      removeEventListener: noop,
+      body: { ...noopEl, appendChild: noop, removeChild: noop },
+      head: { ...noopEl, appendChild: noop },
+      documentElement: { ...noopEl },
+      location: { href: 'http://localhost/', origin: 'http://localhost' },
+      readyState: 'complete',
+    });
+    defineGlobal('navigator', { userAgent: 'Node.js/UoPFuzz', platform: 'node' });
+    defineGlobal('location', { href: 'http://localhost/', origin: 'http://localhost' });
+    defineGlobal('XMLHttpRequest', class XMLHttpRequest { open() {} send() {} addEventListener() {} });
+    defineGlobal('Event', class Event { constructor(type) { this.type = type; } });
+    defineGlobal('CustomEvent', class CustomEvent extends global.Event {});
+    logger.debug('Minimal DOM shim installed for browser-only package');
+  }
+
+  /**
+   * Load sub-path modules from a package using multiple strategies:
+   * 1. Read package.json exports map for declared sub-paths
+   * 2. Scan the installed package's dist directory for utility files
+   * 3. Try common sub-path patterns
+   * Uses both ESM import() and CJS require() as fallbacks.
+   */
+  async loadSubPathModules(packageName) {
+    const subModules = {};
+    const tried = new Set();
+
+    // Strategy 1: Read package.json exports map via filesystem
+    const subPathsFromExports = this.getExportsSubPaths(packageName);
+    for (const sub of subPathsFromExports) {
+      await this.tryLoadSubModule(packageName, sub, subModules, tried);
+    }
+
+    // Strategy 2: Scan for utility files in the installed package
+    const utilityFiles = this.scanForUtilityFiles(packageName);
+    for (const relPath of utilityFiles) {
+      await this.tryLoadSubModule(packageName, relPath, subModules, tried);
+    }
+
+    // Strategy 3: Try common sub-path patterns
+    const commonSubPaths = [
+      'server', 'client', 'utils', 'helpers', 'lib', 'core',
+      'router', 'middleware', 'config',
+      'head', 'link', 'image', 'script', 'dynamic',
+      'navigation', 'headers', 'cookies',
+      'parser', 'compiler', 'renderer', 'transformer',
+      'merge', 'clone', 'defaults', 'extend',
+    ];
+    for (const sub of commonSubPaths) {
+      await this.tryLoadSubModule(packageName, sub, subModules, tried);
+    }
+
+    if (Object.keys(subModules).length > 0) {
+      logger.info(`Loaded ${Object.keys(subModules).length} sub-modules: ${Object.keys(subModules).map(k => k.replace(`${packageName}/`, '')).join(', ')}`);
+    } else {
+      logger.debug(`No sub-modules loadable for ${packageName}`);
+    }
+
+    return subModules;
+  }
+
+  /**
+   * Read the package.json exports field and extract importable sub-paths.
+   */
+  getExportsSubPaths(packageName) {
+    const subPaths = [];
+    try {
+      const pkgJsonPath = require.resolve(`${packageName}/package.json`);
+      const pkg = JSON.parse(fsSync.readFileSync(pkgJsonPath, 'utf8'));
+
+      if (pkg.exports && typeof pkg.exports === 'object') {
+        const extractPaths = (obj, prefix = '') => {
+          for (const [key, value] of Object.entries(obj)) {
+            if (key.startsWith('./') && key !== '.' && key !== './package.json') {
+              // Remove ./ prefix and any wildcard
+              const clean = key.slice(2).replace(/\/\*$/, '');
+              if (clean && !clean.includes('*')) {
+                subPaths.push(clean);
+              }
+            }
+          }
+        };
+        extractPaths(pkg.exports);
+      }
+
+      logger.debug(`Found ${subPaths.length} sub-paths from exports map: ${subPaths.slice(0, 10).join(', ')}`);
+    } catch (err) {
+      logger.debug(`Could not read exports map for ${packageName}: ${err.message}`);
+    }
+    return subPaths;
+  }
+
+  /**
+   * Scan the installed package directory for utility/shared files that
+   * are likely to contain pure functions (merge, parse, config utils, etc.).
+   */
+  scanForUtilityFiles(packageName) {
+    const files = [];
+    try {
+      const pkgJsonPath = require.resolve(`${packageName}/package.json`);
+      const pkgDir = path.dirname(pkgJsonPath);
+
+      // Directories likely to contain reusable utilities
+      const scanDirs = [
+        'dist/shared', 'dist/lib', 'dist/utils', 'dist/shared/lib',
+        'lib', 'lib/utils', 'lib/shared',
+        'utils', 'shared', 'helpers',
+        'dist/compiled', 'dist/server/lib',
+      ];
+
+      const jsExtRe = /\.(js|mjs|cjs)$/;
+      const interestingPatterns = /\b(util|helper|merge|config|parse|route|url|path|header|cookie|query|param|option|default|extend|assign|clone|deep|share|common)\b/i;
+
+      for (const dir of scanDirs) {
+        const fullDir = path.join(pkgDir, dir);
+        try {
+          if (!fsSync.existsSync(fullDir) || !fsSync.statSync(fullDir).isDirectory()) continue;
+
+          const entries = fsSync.readdirSync(fullDir, { withFileTypes: true });
+          for (const entry of entries) {
+            if (entry.isFile() && jsExtRe.test(entry.name) && interestingPatterns.test(entry.name)) {
+              const relPath = path.join(dir, entry.name).replace(/\\/g, '/').replace(jsExtRe, '');
+              files.push(relPath);
+            }
+          }
+        } catch { /* directory not readable */ }
+      }
+
+      logger.debug(`Found ${files.length} utility files to probe: ${files.slice(0, 10).join(', ')}`);
+    } catch (err) {
+      logger.debug(`Could not scan package directory for ${packageName}: ${err.message}`);
+    }
+    return files;
+  }
+
+  /**
+   * Try loading a sub-module using both ESM import() and CJS require().
+   */
+  async tryLoadSubModule(packageName, subPath, subModules, tried) {
+    const fullPath = `${packageName}/${subPath}`;
+    if (tried.has(fullPath)) return;
+    tried.add(fullPath);
+
+    // Try ESM import first
+    try {
+      const mod = await import(fullPath);
+      if (mod && (typeof mod === 'object' || typeof mod === 'function')) {
+        const exportCount = Object.keys(mod).filter(k => k !== '__esModule' && k !== 'default').length;
+        if (exportCount > 0 || mod.default) {
+          subModules[fullPath] = mod;
+          logger.debug(`Loaded (ESM): ${fullPath} (${exportCount} exports)`);
+          return;
+        }
+      }
+    } catch { /* ESM import failed */ }
+
+    // Try CJS require as fallback
+    try {
+      const mod = require(fullPath);
+      if (mod && (typeof mod === 'object' || typeof mod === 'function')) {
+        const exportCount = typeof mod === 'function' ? 1 : Object.keys(mod).filter(k => k !== '__esModule').length;
+        if (exportCount > 0) {
+          subModules[fullPath] = mod;
+          logger.debug(`Loaded (CJS): ${fullPath} (${exportCount} exports)`);
+          return;
+        }
+      }
+    } catch { /* CJS require failed */ }
+  }
+
+  parsePackageSpec(spec) {
+    // Handle "pug@3.0.2", "pug@^3.0.0", "pug" (latest)
+    const atIdx = spec.lastIndexOf('@');
+    if (atIdx > 0) {
+      return { name: spec.substring(0, atIdx), version: spec.substring(atIdx + 1) };
+    }
+    return { name: spec, version: 'latest' };
   }
 
   async cleanup() {
