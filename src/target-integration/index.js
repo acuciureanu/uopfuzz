@@ -292,8 +292,20 @@ export class TargetIntegration {
     const noop = () => {};
     const noopEl = { style: {}, classList: { add: noop, remove: noop }, addEventListener: noop };
 
-    global.window = global;
-    global.document = {
+    // Use defineProperty for read-only globals — many Node.js globals (navigator,
+    // location) have a getter but no setter, so direct assignment throws TypeError.
+    const defineGlobal = (name, value) => {
+      try {
+        global[name] = value;
+      } catch {
+        try {
+          Object.defineProperty(global, name, { value, writable: true, configurable: true });
+        } catch { /* can't override, leave as-is */ }
+      }
+    };
+
+    defineGlobal('window', global);
+    defineGlobal('document', {
       createElement: () => ({ ...noopEl }),
       createElementNS: () => ({ ...noopEl }),
       createTextNode: () => ({}),
@@ -308,12 +320,12 @@ export class TargetIntegration {
       documentElement: { ...noopEl },
       location: { href: 'http://localhost/', origin: 'http://localhost' },
       readyState: 'complete',
-    };
-    global.navigator = { userAgent: 'Node.js/UoPFuzz', platform: 'node' };
-    global.location = global.document.location;
-    global.XMLHttpRequest = class XMLHttpRequest { open() {} send() {} addEventListener() {} };
-    global.Event = class Event { constructor(type) { this.type = type; } };
-    global.CustomEvent = class CustomEvent extends global.Event {};
+    });
+    defineGlobal('navigator', { userAgent: 'Node.js/UoPFuzz', platform: 'node' });
+    defineGlobal('location', { href: 'http://localhost/', origin: 'http://localhost' });
+    defineGlobal('XMLHttpRequest', class XMLHttpRequest { open() {} send() {} addEventListener() {} });
+    defineGlobal('Event', class Event { constructor(type) { this.type = type; } });
+    defineGlobal('CustomEvent', class CustomEvent extends global.Event {});
     logger.debug('Minimal DOM shim installed for browser-only package');
   }
 
