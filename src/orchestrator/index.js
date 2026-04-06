@@ -308,51 +308,57 @@ export class Orchestrator {
       Math.min(10, 3 + Math.floor(iteration / 10))
     );
 
-    // Use multiple representative inputs for differential testing (different entry points)
+    // Build test inputs for differential testing.
+    // CRITICAL: don't rely on random input generation to include dangerous EPs.
+    // Instead, look directly at config.entryPoints to find merge/extend functions
+    // and create deterministic test inputs for them.
     const testInputs = [];
     const seenEP = new Set();
 
-    // Always include merge/extend/set entry points if they exist anywhere in the generated
-    // inputs or seed corpus. Prototype pollution gadgets are most likely in these functions.
-    // Priority order: highest-risk merge functions first, then set/assign, then general.
-    const highPriorityEPs = ['extend', 'merge', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge'];
-    const medPriorityEPs = ['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'clone', 'cloneDeep'];
-
-    // Helper: check if entry point name ends with a dangerous method (handles dotted names like "jquery.extend")
+    const highPriorityEPs = new Set(['extend', 'merge', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge']);
+    const medPriorityEPs = new Set(['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'clone', 'cloneDeep']);
     const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
 
-    // Search inputs and seed corpus for dangerous EPs, prioritizing high-risk ones
-    const allSources = [
-      ...inputs.map(inp => ({ input: inp })),
-      ...(this.inputGeneration.seedCorpus || []).map(s => ({ input: s.input })).filter(s => s.input),
-    ];
-
-    // Pass 1: High-priority EPs (extend, merge, defaults)
-    for (const { input: inp } of allSources) {
-      if (testInputs.length >= 3) break;
-      if (!inp || seenEP.has(inp.entryPoint)) continue;
-      if (highPriorityEPs.includes(getBaseName(inp.entryPoint))) {
-        testInputs.push(inp);
-        seenEP.add(inp.entryPoint);
+    // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
+    // This is deterministic — not dependent on random input generation.
+    if (this.config.entryPoints) {
+      for (const ep of this.config.entryPoints) {
+        if (testInputs.length >= 5) break;
+        const base = getBaseName(ep.name);
+        if (!highPriorityEPs.has(base)) continue;
+        if (seenEP.has(ep.name)) continue;
+        seenEP.add(ep.name);
+        testInputs.push({
+          entryPoint: ep.name,
+          type: 'object',
+          value: {},
+          metadata: { pollution: false, generation: 'differential_probe', energy: 1.0 }
+        });
       }
     }
 
-    // Pass 2: Medium-priority EPs (set, assign — only top-level, not nested like attrHooks.type.set)
-    for (const { input: inp } of allSources) {
-      if (testInputs.length >= 3) break;
-      if (!inp || seenEP.has(inp.entryPoint)) continue;
-      const base = getBaseName(inp.entryPoint);
-      // Only match top-level or 1-deep dotted names to avoid noise like "cssHooks.width.set"
-      const depth = inp.entryPoint.split('.').length;
-      if (medPriorityEPs.includes(base) && depth <= 2) {
-        testInputs.push(inp);
-        seenEP.add(inp.entryPoint);
+    // Pass 2: Medium-priority from config (only shallow names to avoid noise)
+    if (this.config.entryPoints) {
+      for (const ep of this.config.entryPoints) {
+        if (testInputs.length >= 5) break;
+        const base = getBaseName(ep.name);
+        const depth = ep.name.split('.').length;
+        if (!medPriorityEPs.has(base) || depth > 2) continue;
+        if (seenEP.has(ep.name)) continue;
+        seenEP.add(ep.name);
+        testInputs.push({
+          entryPoint: ep.name,
+          type: 'object',
+          value: {},
+          metadata: { pollution: false, generation: 'differential_probe', energy: 1.0 }
+        });
       }
     }
 
-    // Fill remaining slots with diverse entry points
+    // Pass 3: Fill with diverse entry points from generated inputs
     for (const inp of inputs) {
-      if (!seenEP.has(inp.entryPoint) && testInputs.length < 3) {
+      if (testInputs.length >= 5) break;
+      if (!seenEP.has(inp.entryPoint)) {
         seenEP.add(inp.entryPoint);
         testInputs.push(inp);
       }

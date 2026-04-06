@@ -117,15 +117,29 @@ export class InputGeneration {
   async generateBaseInputs(config, count) {
     const inputs = [];
 
-    // Always include merge first — it's the most likely source of prototype pollution
-    const mergeEP = config.entryPoints?.find(ep => ep.name === 'merge');
-    if (mergeEP) {
-      inputs.push({
-        entryPoint: 'merge',
-        type: 'object',
-        value: this.generateObjectInput(),
-        metadata: { pollution: false, generation: 'base', energy: 1.0 }
-      });
+    // Always include all dangerous merge/extend entry points first.
+    // These are the most likely sources of prototype pollution, and the
+    // differential oracle MUST test them every iteration — not leave
+    // it to random chance whether they appear in the input batch.
+    const dangerousNames = new Set([
+      'merge', 'extend', 'defaults', 'defaultsDeep', 'assign',
+      'deepExtend', 'deepMerge', 'mixin', 'set', 'clone', 'cloneDeep',
+    ]);
+    const getBase = (n) => n.includes('.') ? n.split('.').pop() : n;
+
+    if (config.entryPoints) {
+      for (const ep of config.entryPoints) {
+        if (inputs.length >= count) break;
+        if (!dangerousNames.has(getBase(ep.name))) continue;
+        // Only include top-level or 1-deep (e.g., "jquery.extend", not "cssHooks.width.set")
+        if (ep.name.split('.').length > 2) continue;
+        inputs.push({
+          entryPoint: ep.name,
+          type: 'object',
+          value: this.generateObjectInput(),
+          metadata: { pollution: false, generation: 'base', energy: 1.0 }
+        });
+      }
     }
 
     for (let i = inputs.length; i < count; i++) {
