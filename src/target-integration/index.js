@@ -221,8 +221,8 @@ export class TargetIntegration {
       return { config, module: { name, version, isDryRun: true } };
     }
 
-    // Load the main module + sub-path modules for deeper discovery
-    const targetModule = await import(name);
+    // Load the main module — with DOM shim fallback for browser-only packages
+    const targetModule = await this.importWithDOMFallback(name);
     const subModules = await this.loadSubPathModules(name);
 
     // Auto-discover everything (main module + sub-modules)
@@ -243,6 +243,78 @@ export class TargetIntegration {
 
     logger.info(`Target ${name}@${version} auto-discovered and ready`);
     return { config, module: mergedModule };
+  }
+
+  /**
+   * Import a module, falling back to a minimal DOM shim for browser-only packages
+   * (jQuery, Backbone, etc.) that require window/document at load time.
+   */
+  async importWithDOMFallback(name) {
+    // First attempt — most packages work fine
+    try {
+      return await import(name);
+    } catch (err) {
+      const msg = err.message || '';
+      const needsDom = /window|document|DOM|browser|navigator/i.test(msg);
+      if (!needsDom) throw err;
+
+      logger.info(`${name} requires a DOM environment — installing minimal window/document shim`);
+      this._installDOMShim();
+      try {
+        return await import(name);
+      } catch (err2) {
+        // Shim wasn't enough — try jsdom if available
+        try {
+          const { JSDOM } = await import('jsdom');
+          const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>');
+          global.window = dom.window;
+          global.document = dom.window.document;
+          global.navigator = dom.window.navigator;
+          logger.info(`Using jsdom for ${name}`);
+          return await import(name);
+        } catch {
+          // jsdom not installed — re-throw original error with helpful message
+          throw new Error(
+            `${name} requires a browser DOM. Install jsdom to enable browser package support: npm install jsdom\nOriginal error: ${err2.message}`
+          );
+        }
+      }
+    }
+  }
+
+  /**
+   * Install a minimal global DOM shim for packages that check for window/document.
+   * Installs only what's needed — avoids breaking Node.js builtins.
+   */
+  _installDOMShim() {
+    if (global.window) return; // Already shimmed
+
+    const noop = () => {};
+    const noopEl = { style: {}, classList: { add: noop, remove: noop }, addEventListener: noop };
+
+    global.window = global;
+    global.document = {
+      createElement: () => ({ ...noopEl }),
+      createElementNS: () => ({ ...noopEl }),
+      createTextNode: () => ({}),
+      getElementById: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      getElementsByTagName: () => [],
+      addEventListener: noop,
+      removeEventListener: noop,
+      body: { ...noopEl, appendChild: noop, removeChild: noop },
+      head: { ...noopEl, appendChild: noop },
+      documentElement: { ...noopEl },
+      location: { href: 'http://localhost/', origin: 'http://localhost' },
+      readyState: 'complete',
+    };
+    global.navigator = { userAgent: 'Node.js/UoPFuzz', platform: 'node' };
+    global.location = global.document.location;
+    global.XMLHttpRequest = class XMLHttpRequest { open() {} send() {} addEventListener() {} };
+    global.Event = class Event { constructor(type) { this.type = type; } };
+    global.CustomEvent = class CustomEvent extends global.Event {};
+    logger.debug('Minimal DOM shim installed for browser-only package');
   }
 
   /**
