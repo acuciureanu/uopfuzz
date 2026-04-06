@@ -1,252 +1,271 @@
 import { logger } from '../utils/logger.js';
-import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
+import { createTaintProxy } from '../utils/taint-proxy.js';
 
 /**
  * Automatic Target Discovery
  *
  * Given just a package name and version, this module:
- * 1. Inspects the module's exports to find callable functions
- * 2. Probes each function to determine its signature (what args it accepts)
- * 3. Detects compile-then-render patterns (function returns function)
- * 4. Discovers UOP properties via taint-tracked probe execution
+ * 1. Deep-walks the module's exports to find all callable functions
+ *    (top-level, default, nested objects, prototype methods, returned objects)
+ * 2. Probes each function with diverse input shapes to determine signatures
+ * 3. Detects multi-step patterns (compile->render, create->method, etc.)
+ * 4. Discovers UOP properties via taint-tracked probing across all entry points
  * 5. Generates a complete target config equivalent to a YAML file
- *
- * This eliminates the need for hand-written target configuration —
- * the fuzzer can target any npm package with zero prior knowledge.
  */
 
-// Dangerous sinks we always monitor
 const DEFAULT_SINKS = [
   'eval', 'Function', 'child_process.exec',
   'setTimeout', 'setInterval',
   'vm.runInThisContext', 'vm.runInNewContext'
 ];
 
-// Template strings to probe template engines with
-const PROBE_TEMPLATES = [
-  'Hello {{name}}',
-  '<h1><%= title %></h1>',
-  '#{variable}',
-  'p Hello World',
-  '{{> partial}}',
-  '<div>${data}</div>',
-  'Hello World',
+// Diverse probe inputs: templates, objects, config-like objects, HTTP-like mocks
+const PROBE_INPUTS = [
+  // Template strings (template engines)
+  { type: 'template', args: ['Hello {{name}}'] },
+  { type: 'template', args: ['<h1><%= title %></h1>'] },
+  { type: 'template', args: ['p Hello World'] },
+  { type: 'template', args: ['Hello World'] },
+  // Template + options
+  { type: 'template', args: ['Hello World', {}] },
+  // Config-like objects (frameworks, libraries)
+  { type: 'object', args: [{ dev: true }] },
+  { type: 'object', args: [{ dir: '.', dev: false }] },
+  { type: 'object', args: [{}] },
+  // String-first with options (common pattern: fn(str, opts))
+  { type: 'string', args: ['test', {}] },
+  { type: 'string', args: ['test'] },
+  // No args
+  { type: 'none', args: [] },
 ];
 
-// Object inputs to probe with
-const PROBE_OBJECTS = [
-  { name: 'test', value: 'data' },
-  { template: '{{value}}' },
-  {},
-];
+// Method names that indicate interesting fuzzing targets
+const INTERESTING_METHODS = new Set([
+  'compile', 'render', 'renderString', 'renderFile', 'renderToString',
+  'renderToStaticMarkup', 'parse', 'transform', 'process', 'evaluate',
+  'template', 'execute', 'run', 'build', 'generate', 'create',
+  'prepare', 'handle', 'getRequestHandler', 'use', 'configure',
+  'set', 'get', 'middleware', 'handler', 'resolve', 'load',
+  'read', 'write', 'format', 'stringify', 'serialize', 'deserialize',
+  'encode', 'decode', 'convert', 'merge', 'assign', 'extend', 'mixin',
+  'clone', 'defaults', 'options', 'config', 'init', 'setup',
+]);
+
+// Skip these — they're noise, not attack surface
+const SKIP_NAMES = new Set([
+  'constructor', 'prototype', '__esModule', 'default',
+  'toString', 'valueOf', 'toJSON', 'inspect',
+  'Symbol(Symbol.toPrimitive)', 'Symbol(Symbol.toStringTag)',
+  'then', 'catch', 'finally',
+]);
 
 /**
  * Discover target configuration automatically from a loaded module.
- *
- * @param {object} targetModule - The loaded npm package module
- * @param {string} packageName - Package name (e.g., "pug")
- * @param {string} version - Package version (e.g., "3.0.2")
- * @returns {object} A complete target config (same shape as YAML configs)
  */
 export async function discoverTarget(targetModule, packageName, version) {
   logger.info(`Auto-discovering target: ${packageName}@${version}`);
 
-  // Step 1: Find all callable exports
-  const exports = discoverExports(targetModule, packageName);
-  logger.info(`Found ${exports.length} callable exports: ${exports.map(e => e.name).join(', ')}`);
+  // Step 1: Deep-walk exports to find ALL callable functions
+  const allExports = discoverExports(targetModule, packageName);
+  logger.info(`Found ${allExports.length} callable exports: ${allExports.map(e => e.name).slice(0, 15).join(', ')}${allExports.length > 15 ? '...' : ''}`);
 
-  if (exports.length === 0) {
+  if (allExports.length === 0) {
     throw new Error(`No callable exports found in ${packageName}. Cannot auto-discover target.`);
   }
 
-  // Step 2: Probe each export to determine input types and find call sequences
+  // Step 2: Probe each export to determine input types and return behavior
+  // Limit to top 20 most interesting exports to avoid probing hundreds of methods
+  const toProbe = prioritizeExports(allExports).slice(0, 20);
   const entryPoints = [];
   const sequences = [];
 
-  for (const exp of exports) {
+  for (const exp of toProbe) {
     const probeResult = await probeFunction(exp.fn, exp.name);
-    if (probeResult) {
-      entryPoints.push({
-        name: exp.name,
-        inputType: probeResult.inputType,
-        description: `Auto-discovered: accepts ${probeResult.inputType}`
+    if (!probeResult) continue;
+
+    entryPoints.push({
+      name: exp.name,
+      inputType: probeResult.inputType,
+      description: `Auto-discovered: accepts ${probeResult.inputType}`
+    });
+
+    // Detect multi-step patterns
+    if (probeResult.returnsFunction) {
+      sequences.push({
+        entryPoint: exp.name,
+        steps: [
+          { call: exp.name, args: [probeResult.inputType === 'template' ? 'template' : 'input', 'options'] },
+          { call: '__result__', args: ['locals'] }
+        ]
       });
-
-      // If it returns a function, this is a compile-then-render pattern
-      if (probeResult.returnsFunction) {
+      logger.info(`  ${exp.name}() -> function (compile->render pattern)`);
+    } else if (probeResult.returnedMethods.length > 0) {
+      // Object with callable methods — create sequences for each
+      for (const method of probeResult.returnedMethods.slice(0, 5)) {
         sequences.push({
           entryPoint: exp.name,
           steps: [
-            { call: exp.name, args: [probeResult.inputType === 'template' ? 'template' : 'input', 'options'] },
-            { call: '__result__', args: ['locals'] }
+            { call: exp.name, args: probeResult.acceptedArgs },
+            { call: '__result__', method, args: ['input', 'options'] }
           ]
         });
-        logger.info(`Detected compile->render sequence for ${exp.name}()`);
       }
-      // If it returns an object with a .render method, it's Hogan-style
-      else if (probeResult.returnsRenderable) {
-        sequences.push({
-          entryPoint: exp.name,
-          steps: [
-            { call: exp.name, args: [probeResult.inputType === 'template' ? 'template' : 'input', 'options'] },
-            { call: '__result__', method: 'render', args: ['locals'] }
-          ]
-        });
-        logger.info(`Detected compile->result.render() sequence for ${exp.name}()`);
-      }
+      logger.info(`  ${exp.name}() -> object with methods: ${probeResult.returnedMethods.join(', ')}`);
     }
   }
 
-  // Step 3: Discover UOP properties via taint-tracked probe
-  let discoveredProperties = [];
-  for (const ep of entryPoints.slice(0, 3)) {
-    const exp = exports.find(e => e.name === ep.name);
-    if (exp) {
-      const props = await discoverPropertiesFromProbe(exp.fn, ep.inputType);
-      discoveredProperties.push(...props);
-    }
-  }
-  discoveredProperties = [...new Set(discoveredProperties)];
+  // Step 3: Discover UOP properties via taint-tracked probing
+  // Probe across multiple entry points with multiple input shapes
+  const discoveredProperties = await discoverAllUOPProperties(allExports.slice(0, 10));
   if (discoveredProperties.length > 0) {
-    logger.info(`Discovered ${discoveredProperties.length} pollution candidate properties: ${discoveredProperties.slice(0, 10).join(', ')}${discoveredProperties.length > 10 ? '...' : ''}`);
+    logger.info(`Discovered ${discoveredProperties.length} pollution candidates: ${discoveredProperties.slice(0, 10).join(', ')}${discoveredProperties.length > 10 ? '...' : ''}`);
   }
 
-  // Step 4: Build the config
+  // Step 4: Build config
   const config = {
     name: packageName,
     package: packageName,
     version,
     description: `Auto-discovered target: ${packageName}@${version}`,
-    entryPoints,
+    entryPoints: entryPoints.length > 0 ? entryPoints : [{ name: allExports[0].name, inputType: 'object' }],
     sequences: sequences.length > 0 ? sequences : undefined,
     sinks: DEFAULT_SINKS,
     pollutionPoints: discoveredProperties.length > 0
       ? discoveredProperties
       : getDefaultPollutionPoints(),
     knownPatterns: [],
-    testConfig: {
-      timeout: 30,
-      maxDepth: 3,
-      enableAsyncTesting: true
-    },
+    testConfig: { timeout: 30, maxDepth: 3, enableAsyncTesting: true },
     _autoDiscovered: true
   };
 
-  logger.info(`Auto-discovery complete: ${entryPoints.length} entry points, ${sequences.length} sequences, ${config.pollutionPoints.length} pollution points`);
+  logger.info(`Auto-discovery complete: ${entryPoints.length} entry points, ${sequences.length} call sequences, ${config.pollutionPoints.length} pollution candidates`);
   return config;
 }
 
 /**
- * Find all callable exports from a module, including nested exports.
+ * Deep-walk module exports to find all callable functions.
+ * Recurses into objects, prototypes, and default exports up to 3 levels.
  */
 function discoverExports(targetModule, packageName) {
   const exports = [];
   const seen = new Set();
 
-  function addExport(name, fn) {
-    if (seen.has(name) || typeof fn !== 'function') return;
-    seen.add(name);
-    exports.push({ name, fn });
-  }
+  function walk(obj, prefix, depth) {
+    if (!obj || depth > 3) return;
+    if (typeof obj !== 'object' && typeof obj !== 'function') return;
 
-  // Check top-level exports
-  for (const [key, value] of Object.entries(targetModule)) {
-    if (key === '__esModule' || key === 'default') continue;
-    addExport(key, value);
-  }
-
-  // Check default export (common in ESM packages)
-  if (targetModule.default) {
-    if (typeof targetModule.default === 'function') {
-      // The default export IS the function (e.g., `export default function compile()`)
-      addExport(packageName, targetModule.default);
-
-      // Also check properties on the default function (e.g., pug.compile, pug.render)
-      for (const [key, value] of Object.entries(targetModule.default)) {
-        addExport(key, value);
+    const entries = [];
+    try {
+      // Own enumerable properties
+      for (const key of Object.keys(obj)) {
+        entries.push([key, obj[key]]);
       }
-    } else if (typeof targetModule.default === 'object') {
-      for (const [key, value] of Object.entries(targetModule.default)) {
-        addExport(key, value);
+      // Also check prototype methods for class instances
+      const proto = Object.getPrototypeOf(obj);
+      if (proto && proto !== Object.prototype && proto !== Function.prototype) {
+        for (const key of Object.getOwnPropertyNames(proto)) {
+          if (key !== 'constructor' && typeof proto[key] === 'function') {
+            entries.push([key, proto[key].bind(obj)]);
+          }
+        }
+      }
+    } catch {
+      return; // Some objects throw on enumeration
+    }
+
+    for (const [key, value] of entries) {
+      if (SKIP_NAMES.has(key) || key.startsWith('_')) continue;
+      const name = prefix ? `${prefix}.${key}` : key;
+
+      if (typeof value === 'function' && !seen.has(name)) {
+        seen.add(name);
+        exports.push({ name, fn: value });
+      } else if (typeof value === 'object' && value !== null && !seen.has(name)) {
+        seen.add(name);
+        walk(value, name, depth + 1);
       }
     }
   }
 
-  // Prioritize common entry point names
-  const priority = ['compile', 'render', 'renderString', 'renderFile', 'parse', 'transform', 'process', 'template', 'evaluate'];
-  exports.sort((a, b) => {
-    const aIdx = priority.indexOf(a.name);
-    const bIdx = priority.indexOf(b.name);
-    if (aIdx >= 0 && bIdx >= 0) return aIdx - bIdx;
-    if (aIdx >= 0) return -1;
-    if (bIdx >= 0) return 1;
-    return 0;
-  });
+  // Walk top-level exports
+  walk(targetModule, '', 0);
+
+  // Walk default export (very common in ESM)
+  if (targetModule.default) {
+    if (typeof targetModule.default === 'function') {
+      if (!seen.has(packageName)) {
+        seen.add(packageName);
+        exports.push({ name: packageName, fn: targetModule.default });
+      }
+      walk(targetModule.default, '', 1);
+    } else {
+      walk(targetModule.default, '', 1);
+    }
+  }
 
   return exports;
 }
 
 /**
- * Probe a function to determine what kind of input it accepts
- * and what it returns.
+ * Prioritize exports: put likely-interesting names first.
+ */
+function prioritizeExports(exports) {
+  return [...exports].sort((a, b) => {
+    const baseName = (name) => name.includes('.') ? name.split('.').pop() : name;
+    const aInteresting = INTERESTING_METHODS.has(baseName(a.name));
+    const bInteresting = INTERESTING_METHODS.has(baseName(b.name));
+    if (aInteresting && !bInteresting) return -1;
+    if (!aInteresting && bInteresting) return 1;
+    // Prefer shorter names (top-level over deeply nested)
+    return a.name.length - b.name.length;
+  });
+}
+
+/**
+ * Probe a function with diverse inputs to determine:
+ * - What input types it accepts
+ * - Whether it returns a function (compile pattern)
+ * - Whether it returns an object with interesting methods
  */
 async function probeFunction(fn, name) {
-  // Try string/template inputs first (most template engines accept strings)
-  for (const template of PROBE_TEMPLATES) {
-    const result = await tryCall(fn, [template]);
-    if (result.success) {
-      return {
-        inputType: 'template',
-        returnsFunction: typeof result.value === 'function',
-        returnsRenderable: result.value && typeof result.value === 'object' && typeof result.value.render === 'function',
-        acceptedInput: template
-      };
-    }
-  }
+  for (const probe of PROBE_INPUTS) {
+    const result = await tryCall(fn, probe.args);
+    if (!result.success) continue;
 
-  // Try with string + options object
-  for (const template of PROBE_TEMPLATES) {
-    const result = await tryCall(fn, [template, {}]);
-    if (result.success) {
-      return {
-        inputType: 'template',
-        returnsFunction: typeof result.value === 'function',
-        returnsRenderable: result.value && typeof result.value === 'object' && typeof result.value.render === 'function',
-        acceptedInput: template
-      };
+    const returnedMethods = [];
+    if (result.value && typeof result.value === 'object') {
+      // Discover methods on the returned object
+      try {
+        const proto = Object.getPrototypeOf(result.value);
+        const keys = new Set([
+          ...Object.keys(result.value),
+          ...(proto && proto !== Object.prototype ? Object.getOwnPropertyNames(proto) : [])
+        ]);
+        for (const key of keys) {
+          if (typeof result.value[key] === 'function' && !SKIP_NAMES.has(key) && !key.startsWith('_')) {
+            returnedMethods.push(key);
+          }
+        }
+      } catch { /* ignore */ }
     }
-  }
 
-  // Try object inputs
-  for (const obj of PROBE_OBJECTS) {
-    const result = await tryCall(fn, [obj]);
-    if (result.success) {
-      return {
-        inputType: 'object',
-        returnsFunction: typeof result.value === 'function',
-        returnsRenderable: result.value && typeof result.value === 'object' && typeof result.value.render === 'function',
-        acceptedInput: obj
-      };
-    }
-  }
-
-  // Try no-arg call
-  const noArgResult = await tryCall(fn, []);
-  if (noArgResult.success) {
     return {
-      inputType: 'object',
-      returnsFunction: typeof noArgResult.value === 'function',
-      returnsRenderable: noArgResult.value && typeof noArgResult.value === 'object' && typeof noArgResult.value.render === 'function',
-      acceptedInput: undefined
+      inputType: probe.type === 'none' ? 'object' : probe.type,
+      returnsFunction: typeof result.value === 'function',
+      returnsRenderable: result.value && typeof result.value === 'object' && typeof result.value.render === 'function',
+      returnedMethods,
+      acceptedArgs: probe.args.map(a => typeof a === 'string' ? 'input' : 'options'),
+      acceptedInput: probe.args[0] ?? null
     };
   }
 
-  // Function exists but we couldn't figure out how to call it
-  // Include it anyway with template type as default
+  // Couldn't probe successfully — still include with defaults
   return {
     inputType: 'template',
     returnsFunction: false,
     returnsRenderable: false,
+    returnedMethods: [],
+    acceptedArgs: ['input'],
     acceptedInput: null
   };
 }
@@ -254,7 +273,7 @@ async function probeFunction(fn, name) {
 /**
  * Try calling a function with given args, with timeout protection.
  */
-async function tryCall(fn, args, timeoutMs = 3000) {
+async function tryCall(fn, args, timeoutMs = 2000) {
   let timer;
   try {
     const timeout = new Promise((_, reject) => {
@@ -271,71 +290,91 @@ async function tryCall(fn, args, timeoutMs = 3000) {
 }
 
 /**
- * Discover UOP properties by running a function with taint-tracked input.
+ * Discover UOP properties across multiple entry points.
+ * Probes each function with taint-tracked options objects to find
+ * what properties the library reads as undefined.
  */
-async function discoverPropertiesFromProbe(fn, inputType) {
+async function discoverAllUOPProperties(exports) {
+  const allProperties = new Set();
+
+  for (const exp of exports) {
+    for (const probe of PROBE_INPUTS.slice(0, 5)) {
+      const props = await discoverPropertiesFromProbe(exp.fn, probe);
+      for (const p of props) allProperties.add(p);
+    }
+  }
+
+  return [...allProperties];
+}
+
+/**
+ * Run a single taint-tracked probe to discover UOP properties.
+ */
+async function discoverPropertiesFromProbe(fn, probe) {
   const taintLog = [];
   const properties = new Set();
 
-  // Build a probe input and wrap it in taint proxy
-  let probeInput;
-  if (inputType === 'template') {
-    probeInput = 'p Hello World';
-  } else {
-    probeInput = { name: 'test' };
-  }
+  // Build args with taint-tracked objects
+  const args = probe.args.map((arg, i) => {
+    if (arg && typeof arg === 'object') {
+      try { return createTaintProxy({ ...arg }, taintLog, `$arg${i}`); }
+      catch { return arg; }
+    }
+    return arg;
+  });
 
-  // Try calling with a taint-proxied options object
-  const optionsObj = {};
-  let trackedOptions;
-  try {
-    trackedOptions = createTaintProxy(optionsObj, taintLog, '$options');
-  } catch {
-    trackedOptions = optionsObj;
+  // If no object args, add a tracked options object as second arg
+  if (!args.some(a => a && typeof a === 'object')) {
+    try {
+      args.push(createTaintProxy({}, taintLog, '$options'));
+    } catch {
+      args.push({});
+    }
   }
 
   let timer;
   try {
     const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('probe timeout')), 3000);
+      timer = setTimeout(() => reject(new Error('probe timeout')), 2000);
     });
-    const execution = Promise.resolve(fn(probeInput, trackedOptions));
+    const execution = Promise.resolve(fn(...args));
     const result = await Promise.race([execution, timeout]);
 
-    // If result is a function, call it too to discover more properties
+    // If result is callable, probe it too
     if (typeof result === 'function') {
-      const localsLog = [];
-      const locals = {};
-      let trackedLocals;
-      try { trackedLocals = createTaintProxy(locals, localsLog, '$locals'); } catch { trackedLocals = locals; }
-      try { await Promise.resolve(result(trackedLocals)); } catch { /* expected */ }
-      for (const event of localsLog) {
+      const innerLog = [];
+      const innerOpts = {};
+      try {
+        const tracked = createTaintProxy(innerOpts, innerLog, '$resultArg');
+        await tryCall(result, [tracked], 1500);
+      } catch { /* expected */ }
+      for (const event of innerLog) {
         if (event.type === 'get' && event.isUOPCandidate && typeof event.property === 'string') {
           addProperty(properties, event.property);
         }
       }
     }
 
-    // If result has .render(), call it
+    // If result has .render(), probe it too
     if (result && typeof result === 'object' && typeof result.render === 'function') {
-      const localsLog = [];
-      const locals = {};
-      let trackedLocals;
-      try { trackedLocals = createTaintProxy(locals, localsLog, '$locals'); } catch { trackedLocals = locals; }
-      try { await Promise.resolve(result.render(trackedLocals)); } catch { /* expected */ }
-      for (const event of localsLog) {
+      const innerLog = [];
+      try {
+        const tracked = createTaintProxy({}, innerLog, '$renderArg');
+        await tryCall(result.render.bind(result), [tracked], 1500);
+      } catch { /* expected */ }
+      for (const event of innerLog) {
         if (event.type === 'get' && event.isUOPCandidate && typeof event.property === 'string') {
           addProperty(properties, event.property);
         }
       }
     }
   } catch {
-    // Probe failure is expected for some functions
+    // Probe failure is expected
   } finally {
     clearTimeout(timer);
   }
 
-  // Extract UOP candidates from options taint log
+  // Extract UOP candidates from taint log
   for (const event of taintLog) {
     if (event.type === 'get' && event.isUOPCandidate && typeof event.property === 'string') {
       addProperty(properties, event.property);
@@ -346,13 +385,10 @@ async function discoverPropertiesFromProbe(fn, inputType) {
 }
 
 function addProperty(set, prop) {
-  // Filter out noise
-  if (prop.startsWith('__') || prop === 'constructor' || prop === 'prototype' ||
-      prop === 'then' || prop === 'toJSON' || prop === 'valueOf' ||
-      prop === 'toString' || prop.length <= 1 || prop === 'default' ||
-      prop === 'Symbol(Symbol.toPrimitive)' || prop === 'Symbol(Symbol.toStringTag)') {
-    return;
-  }
+  if (typeof prop !== 'string') return;
+  if (prop.startsWith('__') || prop.startsWith('Symbol(') || prop.length <= 1) return;
+  if (SKIP_NAMES.has(prop) || prop === 'nodeType' || prop === 'tagName' ||
+      prop === 'jquery' || prop === 'length' || prop === 'splice') return;
   set.add(prop);
 }
 
