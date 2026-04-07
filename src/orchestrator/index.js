@@ -428,7 +428,7 @@ export class Orchestrator {
       const isUrlSinkProperty = urlSinkProperties.has(descriptor.property);
       for (const testInput of testInputs) {
         if (consecutiveNullFails >= 3) break; // 3 un-callable EPs = descriptor won't confirm
-        const epIsUrlSink = this.config.entryPoints?.find(ep => ep.name === testInput.entryPoint)?._isUrlSink;
+        const epIsUrlSink = urlSinkEPs.has(getBaseName(testInput.entryPoint));
         if (epIsUrlSink && !isUrlSinkProperty) continue; // URL sinks won't fire for non-URL props
         let diffResult = null, mergeResult = null, urlResult = null;
         try {

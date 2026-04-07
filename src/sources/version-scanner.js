@@ -97,11 +97,23 @@ function parseVersion(v) {
 }
 
 /**
+ * Check if a version string contains a pre-release tag (alpha, beta, rc, dev, etc.)
+ * @param {string} v
+ * @returns {boolean}
+ */
+function isPreRelease(v) {
+  return /[-.](?:alpha|beta|rc|dev|pre|canary|next|nightly|snapshot)\b/i.test(v);
+}
+
+/**
  * Compare two version strings.
  * Returns:
  *   > 0  if a is NEWER than b
  *   < 0  if a is OLDER than b
  *     0  if equal
+ *
+ * Pre-release versions (alpha, beta, rc, etc.) sort below their
+ * corresponding release version: 4.0.0-beta.2 < 4.0.0.
  *
  * @param {string} a
  * @param {string} b
@@ -115,6 +127,11 @@ export function compareVersions(a, b) {
     const diff = (pa[i] || 0) - (pb[i] || 0);
     if (diff !== 0) return diff;
   }
+  // Numeric parts are equal — pre-release sorts lower than stable
+  const aPre = isPreRelease(a);
+  const bPre = isPreRelease(b);
+  if (aPre && !bPre) return -1; // a is pre-release, b is stable → a < b
+  if (!aPre && bPre) return 1;  // a is stable, b is pre-release → a > b
   return 0;
 }
 
