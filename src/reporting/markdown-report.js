@@ -119,7 +119,14 @@ export function generateSingleReport(results, config) {
         md += `| CVSS vector | \`${chain.metadata.cvssVector}\` |\n`;
       }
       md += `| Confidence | ${((chain.confidence || 0) * 100).toFixed(0)}% |\n`;
-      md += `| Type | ${isURL ? 'URL gadget' : 'Direct prototype pollution'} |\n`;
+      md += `| Type | ${isURL ? 'URL gadget' : (chain.multiProperty ? 'Multi-property gadget' : 'Direct prototype pollution')} |\n`;
+      if (chain.exploitVerified) {
+        md += `| Exploit verified | YES — code execution confirmed |\n`;
+        md += `| Exploit payload | \`${escMd(chain.exploitPayloadType)}\` |\n`;
+      }
+      if (chain.coPolluteProperties?.length > 0) {
+        md += `| Co-polluted properties | ${chain.coPolluteProperties.map(p => `\`${p}\``).join(' + ')} |\n`;
+      }
       md += '\n';
 
       if (isURL && poc.attackerInput?.url) {
@@ -143,6 +150,20 @@ export function generateSingleReport(results, config) {
         md += '\n\n';
       }
     }
+  }
+
+  // ── Candidate Properties (Tier 5 — read but no behavior change) ──────────────
+  const candidateProps = results.candidateProperties || [];
+  if (candidateProps.length > 0) {
+    md += `## Candidate Properties (Manual Review Recommended)\n\n`;
+    md += `These properties were read via \`Object.prototype\` during polluted execution, but no observable behavior change was detected. `;
+    md += `They may still be exploitable in specific contexts (e.g., conjunctive pollution, async flows).\n\n`;
+    md += `| Property | Entry Point | Confidence |\n|----------|-------------|------------|\n`;
+    for (const c of candidateProps.slice(0, 30)) {
+      md += `| \`${escMd(c.property)}\` | \`${escMd(c.entryPoint)}\` | ${((c.confidence || 0) * 100).toFixed(0)}% |\n`;
+    }
+    if (candidateProps.length > 30) md += `\n*… and ${candidateProps.length - 30} more*\n`;
+    md += '\n';
   }
 
   // ── Attack Surface ───────────────────────────────────────────────────────────

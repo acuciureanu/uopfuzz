@@ -2,7 +2,7 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
-import { executeDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
+import { executeDifferential, executeMultiPropertyDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
 import { executeInSandbox } from '../utils/sandbox.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -411,6 +411,55 @@ export class Instrumentation {
       return null;
     } catch (error) {
       logger.debug(`Sandboxed differential error: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Verify a confirmed gadget actually achieves code execution.
+   * Uses canary-based payloads to prove the polluted property reaches a code execution sink.
+   */
+  async verifyGadgetExploit(input, config, property) {
+    if (this.options.dryRun || !this.targetModule) return null;
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await verifyExploit(fn, args, property, DIFF_CALL_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(`Exploit verification failed for ${property}: ${error.message}`);
+      return { verified: false, executionProof: null, payloadType: null };
+    }
+  }
+
+  /**
+   * Multi-property co-pollution differential test.
+   * Pollutes multiple Object.prototype properties simultaneously to catch
+   * conjunctive gadgets that require >1 property to be set.
+   */
+  async executeMultiPropertyDifferentialTracing(input, config, descriptors) {
+    if (this.options.dryRun) return null;
+    // Multi-property only works in-process (not sandboxed) for now
+    if (!this.targetModule) return null;
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await executeMultiPropertyDifferential(fn, args, descriptors, DIFF_CALL_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(`Multi-property differential failed: ${error.message}`);
       return null;
     }
   }

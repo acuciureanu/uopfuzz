@@ -447,6 +447,25 @@ export class Orchestrator {
 
             if (confirmedChain) {
               this._confirmedSignatures.add(sig);
+
+              // Attempt exploit verification for high-confidence gadgets
+              if (confirmedChain.confidence >= 0.75) {
+                try {
+                  const verification = await this.instrumentation.verifyGadgetExploit(
+                    testInput, this.config, descriptor.property
+                  );
+                  if (verification?.verified) {
+                    confirmedChain.exploitVerified = true;
+                    confirmedChain.exploitProof = verification.executionProof;
+                    confirmedChain.exploitPayloadType = verification.payloadType;
+                    confirmedChain.confidence = Math.min(1.0, confirmedChain.confidence + 0.10);
+                    logger.warn(`  EXPLOIT VERIFIED: ${verification.executionProof}`);
+                  }
+                } catch (err) {
+                  logger.debug(`Exploit verification error: ${err.message}`);
+                }
+              }
+
               this.results.confirmedChains.push(confirmedChain);
               this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
               this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
@@ -454,10 +473,25 @@ export class Orchestrator {
               logger.warn(
                 `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
                 `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
-                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)` +
+                `${confirmedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
               );
               confirmed = true;
               break; // No need to try more entry points or modes for this descriptor
+            } else if (diffResult.diff?.isCandidate) {
+              // Property was read via Object.prototype but no observable behavior change.
+              // Store as candidate for manual review.
+              if (!this.results.candidateProperties) this.results.candidateProperties = [];
+              const candidateSig = `${descriptor.property}:${testInput.entryPoint}`;
+              if (!this.results.candidateProperties.some(c => c.sig === candidateSig)) {
+                this.results.candidateProperties.push({
+                  sig: candidateSig,
+                  property: descriptor.property,
+                  entryPoint: testInput.entryPoint,
+                  confidence: diffResult.diff.confidence,
+                });
+                logger.debug(`CANDIDATE: Object.prototype.${descriptor.property} read via ${testInput.entryPoint} (no behavior change)`);
+              }
             }
           }
 
@@ -529,6 +563,69 @@ export class Orchestrator {
       }
       if (!confirmed) {
         this.inputGeneration.updatePropertyFeedback(descriptor.property, false);
+      }
+    }
+
+    // ── Pass 2: Multi-property co-pollution ────────────────────────────────────
+    // Catch conjunctive gadgets that require 2+ properties polluted simultaneously
+    // (e.g., `if (opts.debug) eval(opts.template)` — neither alone triggers the sink).
+    const candidateProps = this.results.candidateProperties || [];
+    const confirmedProps = [...this._confirmedSignatures].map(sig => sig.split(':')[0]);
+    // Combine candidates (Tier 5 reads without behavior change) with confirmed properties
+    // — a confirmed prop may gate a candidate, or two candidates may gate each other.
+    const allCandidateNames = [...new Set([
+      ...candidateProps.map(c => c.property),
+      ...confirmedProps,
+    ])];
+
+    if (allCandidateNames.length >= 2 && allCandidateNames.length <= 30) {
+      const payloads = this.inputGeneration.getPayloads();
+      // Use first high-priority entry point for co-pollution testing
+      const coTestInput = testInputs[0];
+      if (coTestInput) {
+        const maxPairs = Math.min(50, allCandidateNames.length * (allCandidateNames.length - 1) / 2);
+        let pairsChecked = 0;
+
+        logger.info(`Multi-property phase: testing up to ${maxPairs} property pairs`);
+        for (let i = 0; i < allCandidateNames.length && pairsChecked < maxPairs; i++) {
+          for (let j = i + 1; j < allCandidateNames.length && pairsChecked < maxPairs; j++) {
+            pairsChecked++;
+            // Use boolean_true for the "gate" property and sentinel for the "payload" property
+            const pairDescriptors = [
+              { property: allCandidateNames[i], value: true },
+              { property: allCandidateNames[j], value: payloads[0]?.value || '__UOPFUZZ_MARKER_7f3a__' },
+            ];
+
+            try {
+              const multiResult = await this.instrumentation.executeMultiPropertyDifferentialTracing(
+                coTestInput, this.config, pairDescriptors
+              );
+
+              if (multiResult?.diff?.isConfirmedGadget) {
+                const firedProps = multiResult.diff.details?.firedProperties || [];
+                const combinedName = pairDescriptors.map(d => d.property).join('+');
+                const sig = `multi:${combinedName}`;
+                if (!this._confirmedSignatures.has(sig)) {
+                  this._confirmedSignatures.add(sig);
+                  const chain = this.gadgetAnalysis.analyzeDifferentialResult(
+                    multiResult, coTestInput, this.config
+                  );
+                  if (chain) {
+                    chain.multiProperty = true;
+                    chain.coPolluteProperties = pairDescriptors.map(d => d.property);
+                    this.results.confirmedChains.push(chain);
+                    logger.warn(
+                      `CONFIRMED MULTI-PROPERTY GADGET: ${combinedName} ` +
+                      `(fired: ${firedProps.join(', ')}, confidence: ${(chain.confidence * 100).toFixed(0)}%)`
+                    );
+                  }
+                }
+              }
+            } catch (error) {
+              logger.debug(`Multi-property test ${allCandidateNames[i]}+${allCandidateNames[j]} failed: ${error.message}`);
+            }
+          }
+        }
       }
     }
   }
