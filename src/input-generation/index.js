@@ -775,15 +775,26 @@ export class InputGeneration {
     const properties = this.getPollutionProperties(config);
     const payloads = this.getPayloads();
 
-    for (let i = 0; i < count; i++) {
-      // Select property: prefer discovered UOP properties (they're real)
-      const property = properties[i % properties.length];
+    // Track which property×payloadType combos have been tested across iterations.
+    // This avoids re-testing the same combo while ensuring we eventually cover all
+    // properties — not just the first `count` in the list.
+    if (!this._descriptorOffset) this._descriptorOffset = 0;
 
-      // Select payload: cycle through different types
-      const payload = payloads[i % payloads.length];
+    for (let i = 0; i < count; i++) {
+      const propIdx = (this._descriptorOffset + i) % properties.length;
+      const property = properties[propIdx];
+
+      // Cycle payload independently so the same property gets different payloads
+      // across iterations (sentinel first, then RCE, then boolean, etc.)
+      const payloadIdx = Math.floor((this._descriptorOffset + i) / properties.length) % payloads.length;
+      const payload = payloads[payloadIdx];
 
       descriptors.push({ property, value: payload.value, payloadType: payload.type });
     }
+
+    // Advance offset so the next call starts where this one left off.
+    // This guarantees every property is tested within ceil(properties.length / count) iterations.
+    this._descriptorOffset = (this._descriptorOffset + count) % properties.length;
 
     return descriptors;
   }
