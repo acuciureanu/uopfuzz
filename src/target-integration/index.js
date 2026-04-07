@@ -88,7 +88,7 @@ export class TargetIntegration {
       logger.info(`Installing package: ${packageId}`);
 
       if (this.options.dryRun) {
-        logger.info(`🏃‍♂️ Dry run - would install ${packageId}`);
+        logger.info(`Dry run - would install ${packageId}`);
         this.installedPackages.add(packageId);
         return;
       }

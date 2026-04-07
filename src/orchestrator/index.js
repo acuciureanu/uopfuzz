@@ -52,24 +52,24 @@ export class Orchestrator {
     try {
       this.results.startTime = new Date();
 
-      logger.info('📋 Loading configuration...');
+      logger.info('Loading configuration...');
       await this.loadConfiguration();
 
-      logger.info('🔧 Initializing components...');
+      logger.info('Initializing components...');
       await this.initializeComponents();
 
-      logger.info('🎯 Setting up target environment...');
+      logger.info('Setting up target environment...');
       await this.setupTarget();
 
-      logger.info('🚀 Starting fuzzing workflow...');
+      logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
 
-      logger.info('📊 Analyzing results...');
+      logger.info('Analyzing results...');
       await this.analyzeResults();
 
       this.results.endTime = new Date();
 
-      logger.info('💾 Saving results...');
+      logger.info('Saving results...');
       await this.saveResults();
 
       return this.results;
@@ -153,10 +153,10 @@ export class Orchestrator {
     logger.info(`Starting ${maxIterations} fuzzing iterations with ${this.options.timeout}s timeout`);
 
     if (parallelWorkers > 1) {
-      logger.info(`🚀 Using ${parallelWorkers} parallel workers for fuzzing`);
+      logger.info(`Using ${parallelWorkers} parallel workers for fuzzing`);
       await this.executeParallelFuzzing(maxIterations, parallelWorkers);
     } else {
-      logger.info(`🔄 Using sequential execution (single worker)`);
+      logger.info('Using sequential execution (single worker)');
       await this.executeSequentialFuzzing(maxIterations);
     }
   }
@@ -514,13 +514,13 @@ export class Orchestrator {
 
             case 'completed':
               workerResults.results = message.results;
-              logger.info(`✅ Worker ${message.workerId} completed with ${message.results.iterationsCompleted} iterations`);
+              logger.info(`Worker ${message.workerId} completed with ${message.results.iterationsCompleted} iterations`);
               resolve(workerResults);
               break;
 
             case 'error':
               workerResults.error = message.error;
-              logger.error(`❌ Worker ${message.workerId} failed: ${message.error.message}`);
+              logger.error(`Worker ${message.workerId} failed: ${message.error.message}`);
               reject(new Error(`Worker ${message.workerId} failed: ${message.error.message}`));
               break;
           }
@@ -528,7 +528,7 @@ export class Orchestrator {
 
         worker.on('error', (error) => {
           workerResults.error = error;
-          logger.error(`❌ Worker ${workerId} error: ${error.message}`);
+          logger.error(`Worker ${workerId} error: ${error.message}`);
           reject(error);
         });
 
@@ -592,7 +592,7 @@ export class Orchestrator {
     this.results.potentialChains = allPotentialChains;
     this.results.errors.push(...allErrors);
 
-    logger.info(`🎯 Parallel execution completed: ${totalIterationsCompleted} total iterations, ${allPotentialChains.length} potential chains found`);
+    logger.info(`Parallel execution completed: ${totalIterationsCompleted} total iterations, ${allPotentialChains.length} potential chains found`);
   }
 
   async analyzeResults() {
