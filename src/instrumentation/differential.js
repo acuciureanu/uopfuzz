@@ -114,9 +114,26 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
 
   const snapshot = snapshotPrototype();
 
+  // Active getter trap: records when Object.prototype[prop] is read on ANY object,
+  // not just on the taint-proxied input args. This catches gadgets where the
+  // library reads from Object.prototype on internally-created objects (e.g., plain
+  // option objects, merge targets, DOM-adjacent data structures).
+  let trapFired = false;
+  let trapVal = val;
+
   let timer;
   try {
-    Object.prototype[prop] = val;
+    try {
+      Object.defineProperty(Object.prototype, prop, {
+        get() { trapFired = true; return trapVal; },
+        set(v) { trapFired = true; trapVal = v; },
+        configurable: true,
+        enumerable: false,
+      });
+    } catch {
+      // Property is non-configurable; fall back to simple assignment
+      Object.prototype[prop] = val;
+    }
 
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
@@ -128,11 +145,10 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
   } finally {
     clearTimeout(timer);
 
-    // Restore our pre-set pollution first
+    // Restore: remove our descriptor, then reinstate original if it existed
+    try { delete Object.prototype[prop]; } catch { /* sealed */ }
     if (hadProperty) {
-      Object.prototype[prop] = originalValue;
-    } else {
-      delete Object.prototype[prop];
+      try { Object.prototype[prop] = originalValue; } catch { /* sealed */ }
     }
 
     // Detect any NEW properties the target added to Object.prototype
@@ -141,35 +157,19 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
       result.prototypePolluted = true;
       result.pollutedProperties = detection.newProps;
     }
-
-    // Also detect if the target changed the value of our pre-set property
-    // (means it wrote to Object.prototype[prop] itself)
-    const currentVal = Object.prototype[prop];
-    if (hadProperty) {
-      if (currentVal !== originalValue) {
-        result.prototypePolluted = true;
-        if (!result.pollutedProperties.includes(prop)) {
-          result.pollutedProperties.push(prop);
-        }
-        Object.prototype[prop] = originalValue;
-      }
-    } else {
-      if (Object.prototype.hasOwnProperty.call(Object.prototype, prop)) {
-        result.prototypePolluted = true;
-        if (!result.pollutedProperties.includes(prop)) {
-          result.pollutedProperties.push(prop);
-        }
-        delete Object.prototype[prop];
-      }
-    }
   }
 
   if (taintLog.length > 0) {
     result.taintAnalysis = analyzeTaintLog(taintLog);
-    result.pollutionWasRead = taintLog.some(
-      e => e.type === 'get' && e.property === prop && (e.isPrototypeChainLookup || e.isUOPCandidate)
-    );
   }
+
+  // Combine active trap signal with taint-proxy signal.
+  // The active trap is the authoritative source: if it fired, the property was
+  // definitely read via Object.prototype during execution.
+  const taintSignal = taintLog.some(
+    e => e.type === 'get' && e.property === prop && (e.isPrototypeChainLookup || e.isUOPCandidate)
+  );
+  result.pollutionWasRead = trapFired || taintSignal;
 
   return result;
 }
@@ -246,9 +246,13 @@ function diffResults(cleanResult, pollutedResult, pollutionDescriptor) {
     diff.isConfirmedGadget = true;
     diff.confidence = Math.max(diff.confidence, 0.60);
   }
-  // Tier 5: Property was read via prototype chain (gadget read)
+  // Tier 5: Active trap fired — property was definitively read via Object.prototype.
+  // Since executePolluted now uses a getter trap (not just passive taint proxy),
+  // pollutionWasRead = true means the property lookup actually reached Object.prototype
+  // during real execution. That is sufficient to confirm the gadget.
   else if (pollutedResult.pollutionWasRead) {
-    diff.confidence = Math.max(diff.confidence, 0.40);
+    diff.isConfirmedGadget = true;
+    diff.confidence = Math.max(diff.confidence, 0.50);
   }
 
   return diff;

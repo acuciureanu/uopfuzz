@@ -35,10 +35,10 @@ describe('Orchestrator Integration', () => {
     // Verify files were created
     const files = await fs.readdir(outputDir);
     const jsonFiles = files.filter(f => f.endsWith('.json'));
-    const txtFiles = files.filter(f => f.endsWith('.txt'));
+    const mdFiles = files.filter(f => f.endsWith('.md'));
     
     assert(jsonFiles.length > 0, 'Should create JSON results file');
-    assert(txtFiles.length > 0, 'Should create text report file');
+    assert(mdFiles.length > 0, 'Should create Markdown report file');
     
     // Cleanup
     await fs.rm(outputDir, { recursive: true, force: true });
@@ -108,10 +108,10 @@ describe('Orchestrator Integration', () => {
     // Verify files were created
     const files = await fs.readdir(outputDir);
     const jsonFiles = files.filter(f => f.endsWith('.json'));
-    const txtFiles = files.filter(f => f.endsWith('.txt'));
+    const mdFiles = files.filter(f => f.endsWith('.md'));
     
     assert(jsonFiles.length > 0, 'Should create JSON results file');
-    assert(txtFiles.length > 0, 'Should create text report file');
+    assert(mdFiles.length > 0, 'Should create Markdown report file');
     
     // Cleanup
     await fs.rm(outputDir, { recursive: true, force: true });

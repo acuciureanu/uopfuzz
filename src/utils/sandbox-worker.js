@@ -125,6 +125,9 @@ async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, po
     case 'discover_uop':
       return await discoverUOP(fn, realArgs, timeoutMs);
 
+    case 'merge_pp':
+      return await mergePPTest(fn, realArgs, pollution, timeoutMs);
+
     default:
       return { error: `Unknown mode: ${mode}`, output: null };
   }
@@ -173,18 +176,33 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
 
   let pollutedOutput, pollutedError;
   const pollutedProperties = [];
+  let trapFired = false;
 
   try {
-    Object.prototype[prop] = val;
+    // Use an active getter trap instead of simple assignment so we can detect
+    // reads of the polluted property on ANY object (not just proxied input args).
+    // This catches gadgets where the library reads Object.prototype[prop] on
+    // internally-created objects (e.g., plain option objects, merge targets).
+    let trapVal = val;
+    try {
+      Object.defineProperty(Object.prototype, prop, {
+        get() { trapFired = true; return trapVal; },
+        set(v) { trapFired = true; trapVal = v; },
+        configurable: true,
+        enumerable: false,
+      });
+    } catch {
+      // Property may be non-configurable; fall back to simple assignment
+      Object.prototype[prop] = val;
+    }
     pollutedOutput = safeSerialize(await withTimeout(fn(...args), timeoutMs));
   } catch (err) {
     pollutedError = err.message;
   } finally {
-    // Restore
+    // Restore: delete our descriptor first, then reinstate original if it existed
+    try { delete Object.prototype[prop]; } catch { /* sealed */ }
     if (hadProp) {
-      Object.prototype[prop] = origVal;
-    } else {
-      delete Object.prototype[prop];
+      try { Object.prototype[prop] = origVal; } catch { /* sealed */ }
     }
 
     // Detect new properties added to Object.prototype
@@ -203,6 +221,7 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
     errorChanged: cleanError !== pollutedError,
     prototypePolluted: pollutedProperties.length > 0,
     pollutedProperties,
+    pollutionWasRead: trapFired,
   };
 }
 
@@ -233,6 +252,67 @@ async function discoverUOP(fn, args, timeoutMs) {
     uopProperties: [...uopCandidates],
     error: null,
   };
+}
+
+/**
+ * Test whether the function causes prototype pollution when given crafted merge payloads.
+ * Tries multiple calling conventions (fn(payload), fn({}, payload), fn(true, {}, payload))
+ * to cover the most common merge/extend/assign patterns.
+ */
+async function mergePPTest(fn, baseArgs, pollution, timeoutMs) {
+  const prop = pollution.property;
+  const val = pollution.value;
+
+  // Craft both __proto__ and constructor.prototype payloads
+  let protoPayload, ctorPayload;
+  try {
+    protoPayload = JSON.parse(`{"__proto__":{"${prop}":${JSON.stringify(val)}}}`);
+  } catch {
+    protoPayload = null;
+  }
+  ctorPayload = { constructor: { prototype: { [prop]: val } } };
+
+  // Calling conventions: cover jQuery.extend, lodash.merge, deepmerge, etc.
+  const targetObj = baseArgs[0] && typeof baseArgs[0] === 'object' ? baseArgs[0] : {};
+  const argVariants = [
+    ...(protoPayload ? [
+      [protoPayload],                            // fn(payload)
+      [{}, protoPayload],                        // fn({}, payload)
+      [true, {}, protoPayload],                  // fn(true, {}, payload)  — jQuery deep extend
+      [targetObj, protoPayload],                 // fn(target, payload)
+    ] : []),
+    [ctorPayload],
+    [{}, ctorPayload],
+    [true, {}, ctorPayload],
+    // Path-based patterns: fn({}, '__proto__.prop', val)
+    [{}, `__proto__.${prop}`, val],
+    [{}, `constructor.prototype.${prop}`, val],
+  ];
+
+  for (const callArgs of argVariants) {
+    const snapshot = new Map();
+    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
+      snapshot.set(key, true);
+    }
+
+    try {
+      await withTimeout(Promise.resolve(fn(...callArgs)), timeoutMs);
+    } catch { /* expected */ }
+
+    const pollutedProperties = [];
+    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
+      if (!snapshot.has(key)) {
+        pollutedProperties.push(key);
+        try { delete Object.prototype[key]; } catch { /* sealed */ }
+      }
+    }
+
+    if (pollutedProperties.length > 0) {
+      return { pollutionDetected: true, pollutedProperties };
+    }
+  }
+
+  return { pollutionDetected: false };
 }
 
 function withTimeout(promise, ms) {

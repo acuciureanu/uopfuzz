@@ -7,6 +7,7 @@ import { TargetIntegration } from '../target-integration/index.js';
 import { InputGeneration } from '../input-generation/index.js';
 import { Instrumentation } from '../instrumentation/index.js';
 import { GadgetAnalysis } from '../gadget-analysis/index.js';
+import { generateSingleReport } from '../reporting/markdown-report.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -189,17 +190,21 @@ export class Orchestrator {
     for (let iteration = 0; iteration < maxIterations; iteration++) {
       try {
         const iterationStart = Date.now();
+        logger.info(`Iteration ${iteration + 1}/${maxIterations} starting...`);
 
         // === Phase A: Coverage exploration ===
         const inputs = await this.inputGeneration.generateInputs(this.config, iteration);
         this.results.inputsGenerated += inputs.length;
+        logger.debug(`Generated ${inputs.length} inputs for iteration ${iteration + 1}`);
 
+        let timeoutTimer;
         const traces = await Promise.race([
           this.instrumentation.executeWithTracing(inputs, this.config),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Iteration timeout')), timeout)
-          )
+          new Promise((_, reject) => {
+            timeoutTimer = setTimeout(() => reject(new Error('Iteration timeout')), timeout);
+          })
         ]);
+        clearTimeout(timeoutTimer);
 
         // Feed coverage results back to input generator
         for (const trace of traces) {
@@ -222,14 +227,17 @@ export class Orchestrator {
         const iterationTime = Date.now() - iterationStart;
         logger.debug(`Iteration ${iteration + 1}/${maxIterations} completed in ${iterationTime}ms`);
 
-        // Convergence detection — require minimum 20 iterations before early termination
-        // This ensures UOP discovery (runs every 5 iterations) gets at least 4 chances,
-        // and differential testing explores enough property×payload combinations.
+        // Convergence detection — scale thresholds with maxIterations so short
+        // runs (e.g. mass scan --max-iterations 15) still exit early.
+        // MIN before triggering: 30% of maxIterations, clamped [3, 20]
+        // Consecutive window: 10% of maxIterations, clamped [2, 10]
+        // Saturation threshold: 95% (relaxed from 98% to handle oscillating libs)
         const saturation = this.instrumentation.getCoverageTracker().getSaturationRate();
-        const MIN_ITERATIONS_BEFORE_CONVERGENCE = 20;
-        if (saturation > 0.98 && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
+        const MIN_ITERATIONS_BEFORE_CONVERGENCE = Math.min(20, Math.max(3, Math.floor(maxIterations * 0.3)));
+        const CONVERGENCE_WINDOW = Math.min(10, Math.max(2, Math.floor(maxIterations * 0.1)));
+        if (saturation > 0.95 && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
           consecutiveSaturatedIterations++;
-          if (consecutiveSaturatedIterations >= 10) {
+          if (consecutiveSaturatedIterations >= CONVERGENCE_WINDOW) {
             logger.info(`Coverage saturated at ${(saturation * 100).toFixed(1)}% after ${iteration + 1} iterations`);
             this.results.convergenceInfo = {
               convergedAt: iteration + 1,
@@ -238,7 +246,7 @@ export class Orchestrator {
             };
             break;
           }
-        } else if (saturation <= 0.98) {
+        } else if (saturation <= 0.95) {
           consecutiveSaturatedIterations = 0;
         }
 
@@ -256,6 +264,7 @@ export class Orchestrator {
 
       } catch (error) {
         logger.warn(`Iteration ${iteration + 1} failed: ${error.message}`);
+        logger.warn(`Stack: ${error.stack?.split('\n').slice(0,3).join(' | ')}`);
         this.results.errors.push({
           iteration: iteration + 1,
           error: error.message
@@ -315,8 +324,13 @@ export class Orchestrator {
     const testInputs = [];
     const seenEP = new Set();
 
-    const highPriorityEPs = new Set(['extend', 'merge', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge']);
-    const medPriorityEPs = new Set(['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'clone', 'cloneDeep']);
+    // clone/init included: $.fn.clone({}) accesses .cloneNode on args (real gadget surface);
+    // $.fn.init({}) accesses .nodeType and .window.
+    const highPriorityEPs = new Set(['extend', 'merge', 'clone', 'init', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge']);
+    const medPriorityEPs = new Set(['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'cloneDeep', 'mixin']);
+    // URL sinks: libraries read url/method/headers/data from option objects passed to these;
+    // pre-polluting Object.prototype with those properties is a high-impact gadget class.
+    const urlSinkEPs = new Set(['ajax', 'post', 'getJSON', 'getScript', 'fetch', 'request', 'send']);
     const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
 
     // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
@@ -337,10 +351,29 @@ export class Orchestrator {
       }
     }
 
+    // Pass 1b: URL sink entry points — tested with an empty options object so the
+    // active getter trap can fire when the function reads url/method/headers/data
+    // from the (pre-polluted) Object.prototype.
+    if (this.config.entryPoints) {
+      for (const ep of this.config.entryPoints) {
+        if (testInputs.length >= 8) break;
+        const base = getBaseName(ep.name);
+        if (!urlSinkEPs.has(base)) continue;
+        if (seenEP.has(ep.name)) continue;
+        seenEP.add(ep.name);
+        testInputs.push({
+          entryPoint: ep.name,
+          type: 'object',
+          value: {},
+          metadata: { pollution: false, generation: 'url_sink_probe', energy: 1.0 }
+        });
+      }
+    }
+
     // Pass 2: Medium-priority from config (only shallow names to avoid noise)
     if (this.config.entryPoints) {
       for (const ep of this.config.entryPoints) {
-        if (testInputs.length >= 5) break;
+        if (testInputs.length >= 8) break;
         const base = getBaseName(ep.name);
         const depth = ep.name.split('.').length;
         if (!medPriorityEPs.has(base) || depth > 2) continue;
@@ -357,7 +390,7 @@ export class Orchestrator {
 
     // Pass 3: Fill with diverse entry points from generated inputs
     for (const inp of inputs) {
-      if (testInputs.length >= 5) break;
+      if (testInputs.length >= 8) break;
       if (!seenEP.has(inp.entryPoint)) {
         seenEP.add(inp.entryPoint);
         testInputs.push(inp);
@@ -369,22 +402,46 @@ export class Orchestrator {
     // Track confirmed property+payloadType combos to avoid re-testing
     if (!this._confirmedSignatures) this._confirmedSignatures = new Set();
 
+    logger.info(`Differential phase: ${descriptors.length} descriptors × ${testInputs.length} EPs × 3 modes`);
+    let descriptorIdx = 0;
+
+    // Properties accessed by URL-sink functions (ajax, fetch, etc.).
+    // URL sinks only fire getter traps for these — skip them for other properties.
+    const urlSinkProperties = new Set([
+      'url', 'method', 'type', 'data', 'contentType', 'headers', 'async',
+      'crossDomain', 'dataType', 'timeout', 'username', 'password', 'processData',
+    ]);
+
     for (const descriptor of descriptors) {
+      descriptorIdx++;
       // Skip combos already confirmed — no need to re-verify
       const sig = `${descriptor.property}:${descriptor.payloadType}`;
       if (this._confirmedSignatures.has(sig)) continue;
 
-      // Try each test input until one confirms or all fail
+      // Try each test input until one confirms or all fail.
+      // Bail out early if multiple consecutive EPs fail — avoids wasting time
+      // on descriptors that won't confirm for any entry point.
       let confirmed = false;
+      let consecutiveNullFails = 0; // only count EPs where the fn truly couldn't be called
+      // URL sink EPs (ajax, getJSON etc.) are expensive — skip them unless the property
+      // being tested is one they actually read from options objects.
+      const isUrlSinkProperty = urlSinkProperties.has(descriptor.property);
       for (const testInput of testInputs) {
+        if (consecutiveNullFails >= 3) break; // 3 un-callable EPs = descriptor won't confirm
+        const epIsUrlSink = this.config.entryPoints?.find(ep => ep.name === testInput.entryPoint)?._isUrlSink;
+        if (epIsUrlSink && !isUrlSinkProperty) continue; // URL sinks won't fire for non-URL props
+        let diffResult = null, mergeResult = null, urlResult = null;
         try {
           // Mode 1: Standard differential (pre-pollute Object.prototype)
-          const diffResult = await this.instrumentation.executeDifferentialTracing(
+          diffResult = await this.instrumentation.executeDifferentialTracing(
             testInput, this.config, descriptor
           );
 
+          if (!diffResult) {
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: NULL result (fn not found or threw)`);
+          }
           if (diffResult) {
-            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: confirmed=${diffResult.diff?.isConfirmedGadget} read=${diffResult.diff?.pollutionWasRead} outChanged=${diffResult.diff?.outputChanged} errChanged=${diffResult.diff?.errorChanged}`);            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
               diffResult, testInput, this.config
             );
 
@@ -399,11 +456,13 @@ export class Orchestrator {
                 `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
                 `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
               );
+              confirmed = true;
+              break; // No need to try more entry points or modes for this descriptor
             }
           }
 
           // Mode 2: Merge-PP test (crafted input causes Object.prototype mutation)
-          const mergeResult = await this.instrumentation.executeMergePPDifferential(
+          mergeResult = await this.instrumentation.executeMergePPDifferential(
             testInput, this.config, descriptor
           );
 
@@ -423,12 +482,13 @@ export class Orchestrator {
                 `-> ${mergeChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
                 `(confidence: ${(mergeChain.confidence * 100).toFixed(0)}%)`
               );
+              confirmed = true;
+              break; // No need to try more entry points or modes for this descriptor
             }
           }
 
           // Mode 3: URL gadget test (URL query string → parser → target function)
-          // This is the most important mode — always try it even if Mode 1 or 2 found something
-          const urlResult = await this.instrumentation.executeURLGadgetDifferential(
+          urlResult = await this.instrumentation.executeURLGadgetDifferential(
             testInput, this.config, descriptor
           );
 
@@ -458,6 +518,13 @@ export class Orchestrator {
           }
         } catch (error) {
           logger.debug(`Differential test failed for ${descriptor.property} via ${testInput.entryPoint}: ${error.message}`);
+        }
+        if (!confirmed) {
+          // Only count as a null-fail when the function truly couldn't be invoked.
+          // A non-null result that didn't confirm is informative — keep trying other EPs.
+          const allModesNull = !diffResult && !mergeResult && !urlResult;
+          if (allModesNull) consecutiveNullFails++;
+          else consecutiveNullFails = 0;
         }
       }
       if (!confirmed) {
@@ -620,12 +687,13 @@ export class Orchestrator {
     const outputDir = path.resolve(this.options.outputDir);
     await fs.mkdir(outputDir, { recursive: true });
 
-    const resultsFile = path.join(outputDir, `results-${Date.now()}.json`);
-    const reportFile = path.join(outputDir, `report-${Date.now()}.txt`);
+    const ts = Date.now();
+    const resultsFile = path.join(outputDir, `results-${ts}.json`);
+    const reportFile = path.join(outputDir, `report-${ts}.md`);
 
     await fs.writeFile(resultsFile, JSON.stringify(this.results, null, 2));
 
-    const report = this.generateReport();
+    const report = generateSingleReport(this.results, this.config);
     await fs.writeFile(reportFile, report);
 
     logger.info(`Results saved to ${outputDir}`);

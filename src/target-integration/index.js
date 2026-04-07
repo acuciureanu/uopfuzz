@@ -1,7 +1,9 @@
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
 import { createRequire } from 'module';
 import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
@@ -106,11 +108,11 @@ export class TargetIntegration {
       // If a package legitimately needs postinstall (e.g., native addons),
       // use --allow-scripts to opt in explicitly.
       const ignoreScripts = this.options.allowScripts ? '' : '--ignore-scripts';
-      const installCommand = `npm install ${packageId} --no-save --silent ${ignoreScripts}`.trim();
+      // --no-package-lock avoids write conflicts during concurrent installs
+      const installCommand = `npm install ${packageId} --no-save --silent --no-package-lock ${ignoreScripts}`.trim();
 
       logger.debug(`Running: ${installCommand}`);
-      execSync(installCommand, {
-        stdio: this.options.verbose ? 'inherit' : 'pipe',
+      await execAsync(installCommand, {
         timeout: 30000 // 30 second timeout for package installation
       });
 

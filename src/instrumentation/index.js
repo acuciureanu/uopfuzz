@@ -9,6 +9,18 @@ const require = createRequire(import.meta.url);
 let childProcessModule;
 try { childProcessModule = require('child_process'); } catch { childProcessModule = null; }
 
+// Packages that require a browser DOM environment (jsdom) to load.
+// The sandbox child process has no jsdom, so require('jquery') throws.
+// For these we skip sandbox and run differential tests in-process using
+// the already-loaded jsdom target module.
+const BROWSER_ONLY_PACKAGES = new Set(['jquery', 'jquery-ui', 'backbone', 'underscore']);
+
+// Per-call timeout for differential tests. Must be short: in-process library
+// calls complete in <10ms; anything longer is an infinite loop or hung I/O.
+// 1500ms is generous. The CLI --timeout flag controls the *iteration* timeout.
+const DIFF_CALL_TIMEOUT_MS = 1500;
+const DIFF_URL_SINK_TIMEOUT_MS = 500;
+
 // Cached console references — avoid saving/restoring per call (hot path)
 const _origConsoleError = console.error;
 const _origConsoleWarn = console.warn;
@@ -295,10 +307,15 @@ export class Instrumentation {
   async executeDifferentialTracing(input, config, pollutionDescriptor) {
     if (this.options.dryRun) return null;
 
-    const timeoutMs = (this.options.timeout || 5) * 1000;
+    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
-    // Sandboxed execution: run in child process
-    if (this.options.sandbox && config.package) {
+    // Sandboxed execution: run in child process.
+    // Skip sandbox for browser-only packages — they require jsdom which
+    // the sandbox child process doesn't have.
+    const pkgBase = config.package?.split('@')[0];
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    if (canSandbox) {
       return this._sandboxedDifferential(config.package, input, pollutionDescriptor, timeoutMs);
     }
 
@@ -401,15 +418,17 @@ export class Instrumentation {
   async executeMergePPDifferential(input, config, descriptor) {
     if (this.options.dryRun) return null;
 
-    // Sandboxed merge-PP is handled via the standard sandboxed differential
-    // since the sandbox worker handles Object.prototype detection
-    if (this.options.sandbox && config.package) {
-      // For merge-PP, we pass the payload as the input value directly
+    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const pkgBase = config.package?.split('@')[0];
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+
+    if (canSandbox) {
       const mergeInput = {
         ...input,
         value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
       };
-      return this._sandboxedDifferential(config.package, mergeInput, descriptor, (this.options.timeout || 5) * 1000);
+      const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
+      return this._sandboxedDifferential(config.package, mergeInput, descriptor, timeoutMs);
     }
 
     if (!this.targetModule) return null;
@@ -417,7 +436,7 @@ export class Instrumentation {
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
 
-    const timeoutMs = (this.options.timeout || 5) * 1000;
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
     try {
       logger.debug(`MergePP testing entry point: ${input.entryPoint} (fn=${rawFn?.name || 'anonymous'})`);
@@ -431,13 +450,16 @@ export class Instrumentation {
   async executeURLGadgetDifferential(input, config, descriptor) {
     if (this.options.dryRun) return null;
 
-    // URL gadget test in sandbox mode reuses sandboxed differential
-    if (this.options.sandbox && config.package) {
+    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const pkgBase = config.package?.split('@')[0];
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+
+    if (canSandbox) {
       const urlInput = {
         ...input,
         value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
       };
-      return this._sandboxedDifferential(config.package, urlInput, descriptor, (this.options.timeout || 5) * 1000);
+      return this._sandboxedDifferential(config.package, urlInput, descriptor, isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS);
     }
 
     if (!this.targetModule) return null;
@@ -445,7 +467,7 @@ export class Instrumentation {
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
 
-    const timeoutMs = (this.options.timeout || 5) * 1000;
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
     try {
       return await executeURLGadgetTest(rawFn, descriptor.property, descriptor.value, timeoutMs);

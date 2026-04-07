@@ -63,6 +63,13 @@ const INTERESTING_METHODS = new Set([
   'clone', 'defaults', 'options', 'config', 'init', 'setup',
 ]);
 
+// HTTP/AJAX methods — important for URL read-gadgets but MUST NOT be probed
+// during auto-discovery (they fire real XHRs in jsdom and hang/timeout).
+// Instead, they are injected directly into config.entryPoints after discovery.
+const AJAX_LIKE_METHODS = new Set([
+  'ajax', 'post', 'getJSON', 'getScript', 'fetch', 'request', 'send',
+]);
+
 // Skip these — they're noise, not attack surface
 const SKIP_NAMES = new Set([
   'constructor', 'prototype', '__esModule', 'default',
@@ -118,7 +125,11 @@ export async function discoverTarget(targetModule, packageName, version, subModu
 
   // Step 2: Probe each export to determine input types and return behavior
   // Limit to top 20 most interesting exports to avoid probing hundreds of methods
-  const toProbe = prioritizeExports(allExports).slice(0, 20);
+  // IMPORTANT: skip AJAX-like methods — probing them fires real XHRs that hang.
+  const toProbe = prioritizeExports(allExports).filter(exp => {
+    const base = exp.name.includes('.') ? exp.name.split('.').pop() : exp.name;
+    return !AJAX_LIKE_METHODS.has(base);
+  }).slice(0, 20);
   const entryPoints = [];
   const sequences = [];
 
@@ -164,7 +175,22 @@ export async function discoverTarget(targetModule, packageName, version, subModu
     logger.info(`Discovered ${discoveredProperties.length} pollution candidates: ${discoveredProperties.slice(0, 10).join(', ')}${discoveredProperties.length > 10 ? '...' : ''}`);
   }
 
-  // Step 4: Build config
+  // Step 4: Inject AJAX/HTTP entry points directly (no probing — they cause side effects)
+  const epNames = new Set(entryPoints.map(ep => ep.name));
+  for (const exp of allExports) {
+    const base = exp.name.includes('.') ? exp.name.split('.').pop() : exp.name;
+    if (AJAX_LIKE_METHODS.has(base) && !epNames.has(exp.name)) {
+      entryPoints.push({
+        name: exp.name,
+        inputType: 'object',
+        description: `Auto-discovered HTTP/AJAX method (not probed)`,
+        _isUrlSink: true,
+      });
+      epNames.add(exp.name);
+    }
+  }
+
+  // Step 5: Build config
   const config = {
     name: packageName,
     package: packageName,
