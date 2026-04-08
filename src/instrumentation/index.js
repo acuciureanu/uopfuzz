@@ -2,11 +2,24 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
-import { executeDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
+import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
+import { executeInSandbox } from '../utils/sandbox.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let childProcessModule;
 try { childProcessModule = require('child_process'); } catch { childProcessModule = null; }
+
+// Packages that require a browser DOM environment (jsdom) to load.
+// The sandbox child process has no jsdom, so require('jquery') throws.
+// For these we skip sandbox and run differential tests in-process using
+// the already-loaded jsdom target module.
+const BROWSER_ONLY_PACKAGES = new Set(['jquery', 'jquery-ui', 'backbone', 'underscore']);
+
+// Per-call timeout for differential tests. Must be short: in-process library
+// calls complete in <10ms; anything longer is an infinite loop or hung I/O.
+// 1500ms is generous. The CLI --timeout flag controls the *iteration* timeout.
+const DIFF_CALL_TIMEOUT_MS = 1500;
+const DIFF_URL_SINK_TIMEOUT_MS = 500;
 
 // Cached console references — avoid saving/restoring per call (hot path)
 const _origConsoleError = console.error;
@@ -283,27 +296,39 @@ export class Instrumentation {
    * Executes the target twice (clean + polluted) and compares results.
    * This is the core mechanism for confirming real gadgets vs false positives.
    *
+   * When sandbox mode is enabled (default), executes in an isolated child
+   * process to prevent malicious target code from affecting the fuzzer.
+   *
    * @param {object} input - The fuzzer-generated input
    * @param {object} config - Target configuration
    * @param {object} pollutionDescriptor - { property, value }
    * @returns {object} Differential result with gadget confirmation
    */
   async executeDifferentialTracing(input, config, pollutionDescriptor) {
-    if (!this.targetModule || this.options.dryRun) {
-      return null;
+    if (this.options.dryRun) return null;
+
+    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
+
+    // Sandboxed execution: run in child process.
+    // Skip sandbox for browser-only packages — they require jsdom which
+    // the sandbox child process doesn't have.
+    const pkgBase = config.package?.split('@')[0];
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    if (canSandbox) {
+      return this._sandboxedDifferential(config.package, input, pollutionDescriptor, timeoutMs);
     }
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    // In-process execution (--no-sandbox)
+    if (!this.targetModule) return null;
 
-    // Build a callable thunk for the entry point (or sequence)
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return null;
 
     const args = sequence
       ? this.buildCallArgs(sequence.steps[0], input, config)
       : (input.type === 'template' ? [input.value] : [input.value]);
-
-    const timeoutMs = (this.options.timeout || 5) * 1000;
 
     try {
       return await executeDifferential(fn, args, pollutionDescriptor, timeoutMs);
@@ -313,17 +338,181 @@ export class Instrumentation {
     }
   }
 
+  /**
+   * Sandboxed differential execution via child process.
+   * The target code runs in a separate V8 instance with:
+   * - No network access (blocked at socket level)
+   * - No child_process.exec (blocked)
+   * - No sensitive env vars
+   * - Memory-limited to 512MB
+   * - Hard timeout from parent
+   */
+  async _sandboxedDifferential(packageName, input, descriptor, timeoutMs) {
+    try {
+      // Only serialize safe values for the pollution descriptor
+      const safeDescriptor = {
+        property: descriptor.property,
+        value: typeof descriptor.value === 'function'
+          ? '__UOPFUZZ_MARKER_7f3a__'  // Replace functions with sentinel
+          : descriptor.value,
+      };
+
+      const args = input.type === 'template' ? [input.value] : [input.value];
+
+      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+        timeoutMs,
+        blockNetwork: this.options.blockNetwork !== false,
+        pollution: safeDescriptor,
+        mode: 'differential',
+      });
+
+      if (result.error && !result.outputChanged && !result.prototypePolluted) {
+        logger.debug(`Sandboxed differential failed: ${result.error}`);
+        return null;
+      }
+
+      // Translate sandbox result to the format gadget-analysis expects
+      if (result.outputChanged || result.errorChanged || result.prototypePolluted) {
+        return {
+          clean: { output: result.clean?.output, error: result.clean?.error, sinkAccesses: [], taintLog: [] },
+          polluted: {
+            output: result.polluted?.output,
+            error: result.polluted?.error,
+            sinkAccesses: [],
+            taintLog: [],
+            pollutionWasRead: true,
+            prototypePolluted: result.prototypePolluted || false,
+            pollutedProperties: result.pollutedProperties || [],
+          },
+          diff: {
+            property: descriptor.property,
+            payload: descriptor.value,
+            outputChanged: result.outputChanged || false,
+            errorChanged: result.errorChanged || false,
+            newSinkAccesses: [],
+            pollutionWasRead: true,
+            prototypePolluted: result.prototypePolluted || false,
+            pollutedProperties: result.pollutedProperties || [],
+            isConfirmedGadget: true,
+            confidence: result.prototypePolluted ? 0.95 : (result.outputChanged ? 0.75 : 0.60),
+            details: {
+              cleanOutput: result.clean?.output?.substring?.(0, 500),
+              pollutedOutput: result.polluted?.output?.substring?.(0, 500),
+              cleanError: result.clean?.error,
+              pollutedError: result.polluted?.error,
+              payloadReachedOutput: result.polluted?.output?.includes?.(String(descriptor.value)) &&
+                !result.clean?.output?.includes?.(String(descriptor.value)),
+              sandboxed: true,
+            },
+          },
+        };
+      }
+
+      return null;
+    } catch (error) {
+      logger.debug(`Sandboxed differential error: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Forced branch execution: co-pollute boolean gate properties (debug, client,
+   * strict, etc.) alongside the payload property to force guarded code paths open.
+   * Inspired by Dasty (KTH, WWW 2024) — found 67 additional exploitable packages.
+   */
+  async executeForcedBranchDifferentialTracing(input, config, pollutionDescriptor) {
+    if (this.options.dryRun) return null;
+    if (!this.targetModule) return null;
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await executeForcedBranchDifferential(fn, args, pollutionDescriptor, DIFF_CALL_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(`Forced branch differential failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Verify a confirmed gadget actually achieves code execution.
+   * Uses canary-based payloads to prove the polluted property reaches a code execution sink.
+   */
+  async verifyGadgetExploit(input, config, property) {
+    if (this.options.dryRun || !this.targetModule) return null;
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await verifyExploit(fn, args, property, DIFF_CALL_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(`Exploit verification failed for ${property}: ${error.message}`);
+      return { verified: false, executionProof: null, payloadType: null };
+    }
+  }
+
+  /**
+   * Multi-property co-pollution differential test.
+   * Pollutes multiple Object.prototype properties simultaneously to catch
+   * conjunctive gadgets that require >1 property to be set.
+   */
+  async executeMultiPropertyDifferentialTracing(input, config, descriptors) {
+    if (this.options.dryRun) return null;
+    // Multi-property only works in-process (not sandboxed) for now
+    if (!this.targetModule) return null;
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await executeMultiPropertyDifferential(fn, args, descriptors, DIFF_CALL_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(`Multi-property differential failed: ${error.message}`);
+      return null;
+    }
+  }
+
   async executeMergePPDifferential(input, config, descriptor) {
-    if (!this.targetModule || this.options.dryRun) return null;
+    if (this.options.dryRun) return null;
+
+    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const pkgBase = config.package?.split('@')[0];
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+
+    if (canSandbox) {
+      const mergeInput = {
+        ...input,
+        value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
+      };
+      const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
+      return this._sandboxedDifferential(config.package, mergeInput, descriptor, timeoutMs);
+    }
+
+    if (!this.targetModule) return null;
 
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
 
-    const timeoutMs = (this.options.timeout || 5) * 1000;
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
     try {
-      // executeMergePPTest now internally tries multiple calling conventions:
-      // fn({}, payload), fn(true, {}, payload), and fn(obj, path, val)
       logger.debug(`MergePP testing entry point: ${input.entryPoint} (fn=${rawFn?.name || 'anonymous'})`);
       return await executeMergePPTest(rawFn, [{}], descriptor.property, descriptor.value, timeoutMs);
     } catch (error) {
@@ -333,12 +522,26 @@ export class Instrumentation {
   }
 
   async executeURLGadgetDifferential(input, config, descriptor) {
-    if (!this.targetModule || this.options.dryRun) return null;
+    if (this.options.dryRun) return null;
+
+    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const pkgBase = config.package?.split('@')[0];
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+
+    if (canSandbox) {
+      const urlInput = {
+        ...input,
+        value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
+      };
+      return this._sandboxedDifferential(config.package, urlInput, descriptor, isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS);
+    }
+
+    if (!this.targetModule) return null;
 
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
 
-    const timeoutMs = (this.options.timeout || 5) * 1000;
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
     try {
       return await executeURLGadgetTest(rawFn, descriptor.property, descriptor.value, timeoutMs);

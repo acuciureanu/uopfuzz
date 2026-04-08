@@ -1,0 +1,47 @@
+{
+  "name": "UoPFuzz Sandbox",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "features": {
+    "ghcr.io/devcontainers/features/node:1": {
+      "version": "20"
+    }
+  },
+
+  // SECURITY: Run as non-root user inside the container
+  "remoteUser": "node",
+
+  // SECURITY: Drop ALL capabilities, add back only what's needed
+  "runArgs": [
+    "--cap-drop=ALL",
+    "--security-opt=no-new-privileges:true",
+    "--read-only",
+    "--tmpfs=/tmp:rw,noexec,nosuid,size=512m",
+    "--tmpfs=/home/node/.npm:rw,noexec,nosuid,size=256m",
+    "--memory=2g",
+    "--cpus=2",
+    "--pids-limit=256",
+    "--network=none"
+  ],
+
+  // Mount the project source as writable, everything else read-only
+  "mounts": [
+    "source=${localWorkspaceFolder},target=/workspace,type=bind,consistency=cached",
+    "source=uopfuzz-node-modules,target=/workspace/node_modules,type=volume",
+    "source=uopfuzz-results,target=/workspace/results,type=volume"
+  ],
+
+  "workspaceFolder": "/workspace",
+
+  // Install dependencies on container creation
+  "postCreateCommand": "npm install",
+
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash"
+      }
+    }
+  }
+}

@@ -3,6 +3,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { Orchestrator } from './orchestrator/index.js';
+import { MassRunner, VersionRunner } from './orchestrator/mass-runner.js';
 import { logger } from './utils/logger.js';
 
 const program = new Command();
@@ -10,7 +11,8 @@ const program = new Command();
 program
   .name('uopfuzz')
   .description('UoPFuzz - Prototype pollution gadget hunting framework')
-  .version('1.0.0');
+  .version('1.0.0')
+  .enablePositionalOptions();
 
 program
   .option('-c, --config <path>', 'Target configuration file (YAML)')
@@ -20,7 +22,14 @@ program
   .option('-v, --verbose', 'Enable verbose logging')
   .option('--dry-run', 'Simulate execution without running actual tests')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations', '1000')
-  .option('--parallel <num>', 'Number of parallel workers', '1');
+  .option('--parallel <num>', 'Number of parallel workers', '1')
+  // Supply chain security options
+  .option('--allow-scripts', 'Allow npm lifecycle scripts during install (DANGEROUS)')
+  .option('--allow-suspicious', 'Allow packages with suspicious install scripts (DANGEROUS)')
+  .option('--skip-integrity-check', 'Skip package integrity verification')
+  .option('--sandbox', 'Run target code in isolated child process (recommended)', true)
+  .option('--no-sandbox', 'Disable child process isolation (faster, less safe)')
+  .option('--allow-network', 'Allow network access during target execution');
 
 program.action(async (options) => {
   try {
@@ -40,6 +49,26 @@ program.action(async (options) => {
       process.exit(1);
     }
 
+    // Security warnings
+    if (options.allowScripts) {
+      logger.warn(chalk.red('⚠ --allow-scripts: npm lifecycle scripts will run during install'));
+      logger.warn(chalk.red('  Malicious packages can execute arbitrary code via postinstall'));
+    }
+    if (!options.sandbox) {
+      logger.warn(chalk.yellow('⚠ --no-sandbox: target code runs in the fuzzer process'));
+      logger.warn(chalk.yellow('  A malicious package can access your filesystem and network'));
+    }
+    if (options.allowNetwork) {
+      logger.warn(chalk.yellow('⚠ --allow-network: target code can make outbound connections'));
+    }
+
+    if (!process.env.UOPFUZZ_CONTAINER && !options.dryRun) {
+      logger.info(chalk.yellow(
+        'Tip: Run inside the dev container for maximum isolation:\n' +
+        '  devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . node src/cli.js --target <pkg>'
+      ));
+    }
+
     const orchestratorOpts = {
       configPath: options.config || null,
       targetPackage: options.target || null,
@@ -48,7 +77,13 @@ program.action(async (options) => {
       dryRun: options.dryRun || false,
       maxIterations: parseInt(options.maxIterations),
       parallelWorkers: parseInt(options.parallel),
-      verbose: options.verbose || false
+      verbose: options.verbose || false,
+      // Security options
+      allowScripts: options.allowScripts || false,
+      allowSuspicious: options.allowSuspicious || false,
+      skipIntegrityCheck: options.skipIntegrityCheck || false,
+      sandbox: options.sandbox !== false,
+      blockNetwork: !options.allowNetwork,
     };
 
     const orchestrator = new Orchestrator(orchestratorOpts);
@@ -78,5 +113,145 @@ program.action(async (options) => {
     process.exit(1);
   }
 });
+
+// ─── mass subcommand ──────────────────────────────────────────────────────────
+
+program
+  .command('mass')
+  .description('Mass-test the top cdnjs JavaScript libraries for prototype-pollution gadgets')
+  .option('--search <query>', 'Free-text cdnjs search filter', '')
+  .option('--top <n>', 'Number of libraries to test (ranked by GitHub stars)', '50')
+  .option('--limit <n>', 'How many libraries to fetch from cdnjs before ranking', '200')
+  .option('--resume', 'Skip libraries that already have results in the output directory')
+  .option('--concurrency <n>', 'Libraries to scan in parallel (use with caution: shares node_modules)', '1')
+  .option('-o, --output <dir>', 'Output directory for results', './results')
+  .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '30')
+  .option('--max-iterations <num>', 'Maximum fuzzing iterations per library', '100')
+  .option('--dry-run', 'Simulate without running actual tests')
+  .option('-v, --verbose', 'Enable verbose logging')
+  .option('--allow-scripts', 'Allow npm lifecycle scripts (DANGEROUS)')
+  .option('--allow-suspicious', 'Allow packages with suspicious install scripts (DANGEROUS)')
+  .option('--skip-integrity-check', 'Skip package integrity verification')
+  .option('--sandbox', 'Run in isolated child process (default: on)', true)
+  .option('--no-sandbox', 'Disable child process isolation')
+  .option('--allow-network', 'Allow network access during target execution')
+  .action(async (options) => {
+    try {
+      if (options.verbose) logger.level = 'debug';
+      logger.info(chalk.blue.bold('UoPFuzz — Mass cdnjs Scan'));
+
+      const orchestratorOptions = {
+        outputDir: options.output,
+        timeout: parseInt(options.timeout),
+        dryRun: options.dryRun || false,
+        maxIterations: parseInt(options.maxIterations),
+        parallelWorkers: 1,
+        verbose: options.verbose || false,
+        allowScripts: options.allowScripts || false,
+        allowSuspicious: options.allowSuspicious || false,
+        skipIntegrityCheck: options.skipIntegrityCheck || false,
+        sandbox: options.sandbox !== false,
+        blockNetwork: !options.allowNetwork,
+      };
+
+      const runner = new MassRunner({
+        search: options.search,
+        topN: parseInt(options.top),
+        limit: parseInt(options.limit),
+        resume: options.resume || false,
+        concurrency: parseInt(options.concurrency),
+        options: orchestratorOptions,
+      });
+
+      const summary = await runner.run();
+
+      logger.info(chalk.green.bold('Mass scan completed'));
+      logger.info(`Tested: ${summary.total} | Vulnerable: ${summary.vulnerable} | Failed: ${summary.failed}`);
+      logger.info(`Report: ${summary.reportFile}`);
+
+    } catch (error) {
+      logger.error(chalk.red.bold('Fatal error:'), error.message);
+      if (options.verbose) logger.error(error.stack);
+      process.exit(1);
+    }
+  });
+
+// ─── versions subcommand ──────────────────────────────────────────────────────
+
+program
+  .command('versions')
+  .description('Scan a single library across multiple versions to track vulnerability introduction/fix')
+  .requiredOption('--library <name>', 'cdnjs library name (e.g. lodash.js)')
+  .option('--npm-package <name>', 'npm package name override (auto-resolved if omitted)')
+  .option('--last <n>', 'Test only the last N versions (newest first)')
+  .option('--first <n>', 'Test only the first N versions (oldest first — useful for known-vulnerable older releases)')
+  .option('--all', 'Test all available versions (default if no range flags given)')
+  .option('--range <from>..<to>', 'Test versions in range from..to (inclusive, semver)')
+  .option('-o, --output <dir>', 'Output directory for results', './results')
+  .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '30')
+  .option('--max-iterations <num>', 'Maximum fuzzing iterations per version', '100')
+  .option('--dry-run', 'Simulate without running actual tests')
+  .option('-v, --verbose', 'Enable verbose logging')
+  .option('--allow-scripts', 'Allow npm lifecycle scripts (DANGEROUS)')
+  .option('--allow-suspicious', 'Allow packages with suspicious install scripts (DANGEROUS)')
+  .option('--skip-integrity-check', 'Skip package integrity verification')
+  .option('--sandbox', 'Run in isolated child process (default: on)', true)
+  .option('--no-sandbox', 'Disable child process isolation')
+  .option('--allow-network', 'Allow network access during target execution')
+  .action(async (options) => {
+    try {
+      if (options.verbose) logger.level = 'debug';
+      logger.info(chalk.blue.bold(`UoPFuzz — Version Sweep: ${options.library}`));
+
+      // Build version selection strategy
+      let strategy;
+      if (options.last) {
+        strategy = { mode: 'last', count: parseInt(options.last) };
+      } else if (options.first) {
+        strategy = { mode: 'first', count: parseInt(options.first) };
+      } else if (options.range) {
+        const parts = options.range.split('..');
+        if (parts.length !== 2) {
+          logger.error('--range must be in the form <from>..<to>  e.g.  4.0.0..4.17.0');
+          process.exit(1);
+        }
+        strategy = { mode: 'range', from: parts[0].trim(), to: parts[1].trim() };
+      } else {
+        strategy = { mode: 'all' };
+      }
+
+      const orchestratorOptions = {
+        outputDir: options.output,
+        timeout: parseInt(options.timeout),
+        dryRun: options.dryRun || false,
+        maxIterations: parseInt(options.maxIterations),
+        parallelWorkers: 1,
+        verbose: options.verbose || false,
+        allowScripts: options.allowScripts || false,
+        allowSuspicious: options.allowSuspicious || false,
+        skipIntegrityCheck: options.skipIntegrityCheck || false,
+        sandbox: options.sandbox !== false,
+        blockNetwork: !options.allowNetwork,
+      };
+
+      const runner = new VersionRunner({
+        cdnjsName: options.library,
+        npmPackage: options.npmPackage || null,
+        strategy,
+        options: orchestratorOptions,
+      });
+
+      const summary = await runner.run();
+
+      logger.info(chalk.green.bold('Version sweep completed'));
+      logger.info(`${summary.library}: ${summary.versionsTotal} versions tested | Vulnerable: ${summary.vulnerable} | Failed: ${summary.failed}`);
+      logger.info(`Report: ${summary.reportFile}`);
+
+    } catch (error) {
+      logger.error(chalk.red.bold('Fatal error:'), error.message);
+      if (options.verbose) logger.error(error.stack);
+      process.exit(1);
+    }
+  });
 
 program.parse();

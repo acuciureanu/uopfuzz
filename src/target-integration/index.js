@@ -1,11 +1,14 @@
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
-import { execSync } from 'child_process';
+import { exec } from 'child_process';
+import { promisify } from 'util';
+const execAsync = promisify(exec);
 import { createRequire } from 'module';
 import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
 import { discoverTarget } from './discovery.js';
+import { verifyPackageIntegrity } from '../utils/package-safety.js';
 
 const require = createRequire(import.meta.url);
 
@@ -77,7 +80,7 @@ export class TargetIntegration {
 
   async installPackage(packageName, version) {
     const packageId = `${packageName}@${version}`;
-    
+
     if (this.installedPackages.has(packageId)) {
       logger.debug(`Package ${packageId} already installed`);
       return;
@@ -85,23 +88,40 @@ export class TargetIntegration {
 
     try {
       logger.info(`Installing package: ${packageId}`);
-      
+
       if (this.options.dryRun) {
-        logger.info(`🏃‍♂️ Dry run - would install ${packageId}`);
+        logger.info(`Dry run - would install ${packageId}`);
         this.installedPackages.add(packageId);
         return;
       }
 
-      // Use npm to install the specific package version
-      const installCommand = `npm install ${packageId} --no-save --silent`;
-      execSync(installCommand, { 
-        stdio: this.options.verbose ? 'inherit' : 'pipe',
+      // SECURITY: Validate package name to prevent command injection
+      if (!/^(@[a-z0-9\-~][a-z0-9\-._~]*\/)?[a-z0-9\-~][a-z0-9\-._~]*$/.test(packageName)) {
+        throw new Error(`Invalid package name: ${packageName}`);
+      }
+      if (version !== 'latest' && !/^[\w.^~<>=\-|* ]+$/.test(version)) {
+        throw new Error(`Invalid version specifier: ${version}`);
+      }
+
+      // SECURITY: --ignore-scripts prevents postinstall/preinstall attacks.
+      // Malicious packages commonly use lifecycle scripts for RCE.
+      // If a package legitimately needs postinstall (e.g., native addons),
+      // use --allow-scripts to opt in explicitly.
+      const ignoreScripts = this.options.allowScripts ? '' : '--ignore-scripts';
+      // --no-package-lock avoids write conflicts during concurrent installs
+      const installCommand = `npm install ${packageId} --no-save --silent --no-package-lock ${ignoreScripts}`.trim();
+
+      logger.debug(`Running: ${installCommand}`);
+      await execAsync(installCommand, {
         timeout: 30000 // 30 second timeout for package installation
       });
-      
+
+      // SECURITY: Verify package integrity after install
+      await verifyPackageIntegrity(packageName, version, this.options);
+
       this.installedPackages.add(packageId);
       logger.debug(`Successfully installed ${packageId}`);
-      
+
     } catch (error) {
       throw new Error(`Failed to install ${packageId}: ${error.message}`);
     }
@@ -112,24 +132,28 @@ export class TargetIntegration {
       // Attempt to require the target module
       const modulePath = config.package;
       logger.debug(`Loading module: ${modulePath}`);
-      
+
       if (this.options.dryRun) {
-        return { 
+        return {
           name: config.name,
           version: config.version,
           isDryRun: true,
-          entryPoints: config.entryPoints 
+          entryPoints: config.entryPoints
         };
       }
 
+      // Clear CJS cache so a freshly-installed version is loaded (not a stale
+      // cached one from a previous VersionRunner iteration).
+      this._clearRequireCache(modulePath);
+
       // Dynamic import of the target package
       const targetModule = await import(modulePath);
-      
+
       // Validate that required entry points exist
       this.validateEntryPoints(targetModule, config.entryPoints);
-      
+
       return targetModule;
-      
+
     } catch (error) {
       throw new Error(`Failed to load target module ${config.package}: ${error.message}`);
     }
@@ -249,6 +273,11 @@ export class TargetIntegration {
    * (jQuery, Backbone, etc.) that require window/document at load time.
    */
   async importWithDOMFallback(name) {
+    // Clear CJS cache first — critical for VersionRunner which loads multiple
+    // versions of the same package sequentially. Without this, require() returns
+    // the first version's cached module instead of the newly-installed one.
+    this._clearRequireCache(name);
+
     // Known browser-only packages that export a factory requiring window/document.
     // These may import() successfully but return a useless factory without DOM globals.
     // Go straight to jsdom for these to get a fully-initialized module.
@@ -323,14 +352,29 @@ export class TargetIntegration {
   }
 
   /**
-   * Import a module with fresh ESM cache by loading via CommonJS.
-   * This completely bypasses ESM module caching issues.
+   * Import a module with fresh cache by loading via CommonJS.
+   * Clears the CJS require cache for the package first, so that
+   * a different version installed into node_modules is actually loaded.
+   * This is critical for VersionRunner which installs multiple versions
+   * of the same package sequentially.
    */
   async _importWithFreshCache(name) {
+    // Clear CJS cache entries for this package so require() picks up the
+    // newly-installed version instead of returning the cached old one.
+    this._clearRequireCache(name);
+
     const tmpDir = path.join(process.cwd(), '.uopfuzz-temp');
     const loaderPath = path.join(tmpDir, `loader-${Date.now()}-${Math.random().toString(36).slice(2)}.cjs`);
-    
+
     const loaderCode = `
+// Clear require cache for '${name}' inside the loader too — the parent
+// process may have already cached a different version.
+for (const key of Object.keys(require.cache)) {
+  if (key.includes('/node_modules/${name}/') || key.includes('\\\\node_modules\\\\${name}\\\\')) {
+    delete require.cache[key];
+  }
+}
+
 const { JSDOM, VirtualConsole } = require('jsdom');
 // Suppress jsdom internal errors (ERR_INVALID_PROTOCOL, ECONNREFUSED, etc.)
 const virtualConsole = new VirtualConsole();
@@ -590,6 +634,41 @@ try {
       return { name: spec.substring(0, atIdx), version: spec.substring(atIdx + 1) };
     }
     return { name: spec, version: 'latest' };
+  }
+
+  /**
+   * Clear the CJS require cache for a package and all its sub-modules.
+   *
+   * This is essential for VersionRunner: after `npm install pkg@v2` overwrites
+   * `pkg@v1` in node_modules, `require('pkg')` still returns the cached v1
+   * module unless we purge the cache entries first.
+   *
+   * Note: ESM import() cache cannot be cleared programmatically. For ESM-only
+   * packages, the sandbox child process (which starts with a fresh cache) is
+   * the correct path. For CJS packages loaded via _importWithFreshCache, this
+   * method ensures the loader picks up the new version.
+   *
+   * @param {string} packageName - Package name (e.g., 'jquery')
+   */
+  _clearRequireCache(packageName) {
+    // Build a pattern that matches node_modules/packageName/ entries
+    // Handle both forward and backward slashes (Windows compat)
+    const patterns = [
+      `/node_modules/${packageName}/`,
+      `\\node_modules\\${packageName}\\`,
+    ];
+
+    let cleared = 0;
+    for (const key of Object.keys(require.cache)) {
+      if (patterns.some(p => key.includes(p))) {
+        delete require.cache[key];
+        cleared++;
+      }
+    }
+
+    if (cleared > 0) {
+      logger.debug(`Cleared ${cleared} CJS cache entries for ${packageName}`);
+    }
   }
 
   async cleanup() {

@@ -7,6 +7,7 @@ import { TargetIntegration } from '../target-integration/index.js';
 import { InputGeneration } from '../input-generation/index.js';
 import { Instrumentation } from '../instrumentation/index.js';
 import { GadgetAnalysis } from '../gadget-analysis/index.js';
+import { generateSingleReport } from '../reporting/markdown-report.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -52,24 +53,24 @@ export class Orchestrator {
     try {
       this.results.startTime = new Date();
 
-      logger.info('📋 Loading configuration...');
+      logger.info('Loading configuration...');
       await this.loadConfiguration();
 
-      logger.info('🔧 Initializing components...');
+      logger.info('Initializing components...');
       await this.initializeComponents();
 
-      logger.info('🎯 Setting up target environment...');
+      logger.info('Setting up target environment...');
       await this.setupTarget();
 
-      logger.info('🚀 Starting fuzzing workflow...');
+      logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
 
-      logger.info('📊 Analyzing results...');
+      logger.info('Analyzing results...');
       await this.analyzeResults();
 
       this.results.endTime = new Date();
 
-      logger.info('💾 Saving results...');
+      logger.info('Saving results...');
       await this.saveResults();
 
       return this.results;
@@ -153,10 +154,10 @@ export class Orchestrator {
     logger.info(`Starting ${maxIterations} fuzzing iterations with ${this.options.timeout}s timeout`);
 
     if (parallelWorkers > 1) {
-      logger.info(`🚀 Using ${parallelWorkers} parallel workers for fuzzing`);
+      logger.info(`Using ${parallelWorkers} parallel workers for fuzzing`);
       await this.executeParallelFuzzing(maxIterations, parallelWorkers);
     } else {
-      logger.info(`🔄 Using sequential execution (single worker)`);
+      logger.info('Using sequential execution (single worker)');
       await this.executeSequentialFuzzing(maxIterations);
     }
   }
@@ -189,17 +190,21 @@ export class Orchestrator {
     for (let iteration = 0; iteration < maxIterations; iteration++) {
       try {
         const iterationStart = Date.now();
+        logger.info(`Iteration ${iteration + 1}/${maxIterations} starting...`);
 
         // === Phase A: Coverage exploration ===
         const inputs = await this.inputGeneration.generateInputs(this.config, iteration);
         this.results.inputsGenerated += inputs.length;
+        logger.debug(`Generated ${inputs.length} inputs for iteration ${iteration + 1}`);
 
+        let timeoutTimer;
         const traces = await Promise.race([
           this.instrumentation.executeWithTracing(inputs, this.config),
-          new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Iteration timeout')), timeout)
-          )
+          new Promise((_, reject) => {
+            timeoutTimer = setTimeout(() => reject(new Error('Iteration timeout')), timeout);
+          })
         ]);
+        clearTimeout(timeoutTimer);
 
         // Feed coverage results back to input generator
         for (const trace of traces) {
@@ -222,23 +227,47 @@ export class Orchestrator {
         const iterationTime = Date.now() - iterationStart;
         logger.debug(`Iteration ${iteration + 1}/${maxIterations} completed in ${iterationTime}ms`);
 
-        // Convergence detection — require minimum 20 iterations before early termination
-        // This ensures UOP discovery (runs every 5 iterations) gets at least 4 chances,
-        // and differential testing explores enough property×payload combinations.
+        // Convergence detection — DUAL metric: both coverage AND gadget discovery rate.
+        // Synthetic coverage alone is unreliable (exits too early, missing gadgets).
+        // We require BOTH:
+        //   1. Coverage saturation (>95%) — no new code paths being discovered
+        //   2. No new gadgets in last N iterations — gadget search is exhausted
+        // This prevents premature exit when coverage saturates but gadgets remain undiscovered.
         const saturation = this.instrumentation.getCoverageTracker().getSaturationRate();
-        const MIN_ITERATIONS_BEFORE_CONVERGENCE = 20;
-        if (saturation > 0.98 && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
+        const MIN_ITERATIONS_BEFORE_CONVERGENCE = Math.min(20, Math.max(5, Math.floor(maxIterations * 0.3)));
+        const CONVERGENCE_WINDOW = Math.min(10, Math.max(3, Math.floor(maxIterations * 0.1)));
+
+        // Track gadget discovery rate
+        const currentGadgetCount = (this.results.confirmedChains || []).length;
+        if (!this._lastGadgetCount) this._lastGadgetCount = 0;
+        if (!this._iterationsSinceLastGadget) this._iterationsSinceLastGadget = 0;
+
+        if (currentGadgetCount > this._lastGadgetCount) {
+          this._lastGadgetCount = currentGadgetCount;
+          this._iterationsSinceLastGadget = 0;
+          consecutiveSaturatedIterations = 0; // Reset — new gadget found
+        } else {
+          this._iterationsSinceLastGadget++;
+        }
+
+        // Both conditions must be true to converge
+        const coverageSaturated = saturation > 0.95;
+        const gadgetSearchExhausted = this._iterationsSinceLastGadget >= CONVERGENCE_WINDOW * 2;
+
+        if (coverageSaturated && gadgetSearchExhausted && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
           consecutiveSaturatedIterations++;
-          if (consecutiveSaturatedIterations >= 10) {
-            logger.info(`Coverage saturated at ${(saturation * 100).toFixed(1)}% after ${iteration + 1} iterations`);
+          if (consecutiveSaturatedIterations >= CONVERGENCE_WINDOW) {
+            logger.info(`Converged: coverage ${(saturation * 100).toFixed(1)}%, no new gadgets in ${this._iterationsSinceLastGadget} iterations`);
             this.results.convergenceInfo = {
               convergedAt: iteration + 1,
               saturationRate: saturation,
-              reason: 'coverage_saturation'
+              gadgetCount: currentGadgetCount,
+              iterationsSinceLastGadget: this._iterationsSinceLastGadget,
+              reason: 'coverage_and_gadget_saturation'
             };
             break;
           }
-        } else if (saturation <= 0.98) {
+        } else if (!coverageSaturated || !gadgetSearchExhausted) {
           consecutiveSaturatedIterations = 0;
         }
 
@@ -256,6 +285,7 @@ export class Orchestrator {
 
       } catch (error) {
         logger.warn(`Iteration ${iteration + 1} failed: ${error.message}`);
+        logger.warn(`Stack: ${error.stack?.split('\n').slice(0,3).join(' | ')}`);
         this.results.errors.push({
           iteration: iteration + 1,
           error: error.message
@@ -315,8 +345,13 @@ export class Orchestrator {
     const testInputs = [];
     const seenEP = new Set();
 
-    const highPriorityEPs = new Set(['extend', 'merge', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge']);
-    const medPriorityEPs = new Set(['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'clone', 'cloneDeep']);
+    // clone/init included: $.fn.clone({}) accesses .cloneNode on args (real gadget surface);
+    // $.fn.init({}) accesses .nodeType and .window.
+    const highPriorityEPs = new Set(['extend', 'merge', 'clone', 'init', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge']);
+    const medPriorityEPs = new Set(['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'cloneDeep', 'mixin']);
+    // URL sinks: libraries read url/method/headers/data from option objects passed to these;
+    // pre-polluting Object.prototype with those properties is a high-impact gadget class.
+    const urlSinkEPs = new Set(['ajax', 'post', 'getJSON', 'getScript', 'fetch', 'request', 'send']);
     const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
 
     // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
@@ -337,10 +372,29 @@ export class Orchestrator {
       }
     }
 
+    // Pass 1b: URL sink entry points — tested with an empty options object so the
+    // active getter trap can fire when the function reads url/method/headers/data
+    // from the (pre-polluted) Object.prototype.
+    if (this.config.entryPoints) {
+      for (const ep of this.config.entryPoints) {
+        if (testInputs.length >= 8) break;
+        const base = getBaseName(ep.name);
+        if (!urlSinkEPs.has(base)) continue;
+        if (seenEP.has(ep.name)) continue;
+        seenEP.add(ep.name);
+        testInputs.push({
+          entryPoint: ep.name,
+          type: 'object',
+          value: {},
+          metadata: { pollution: false, generation: 'url_sink_probe', energy: 1.0 }
+        });
+      }
+    }
+
     // Pass 2: Medium-priority from config (only shallow names to avoid noise)
     if (this.config.entryPoints) {
       for (const ep of this.config.entryPoints) {
-        if (testInputs.length >= 5) break;
+        if (testInputs.length >= 8) break;
         const base = getBaseName(ep.name);
         const depth = ep.name.split('.').length;
         if (!medPriorityEPs.has(base) || depth > 2) continue;
@@ -357,7 +411,7 @@ export class Orchestrator {
 
     // Pass 3: Fill with diverse entry points from generated inputs
     for (const inp of inputs) {
-      if (testInputs.length >= 5) break;
+      if (testInputs.length >= 8) break;
       if (!seenEP.has(inp.entryPoint)) {
         seenEP.add(inp.entryPoint);
         testInputs.push(inp);
@@ -369,27 +423,70 @@ export class Orchestrator {
     // Track confirmed property+payloadType combos to avoid re-testing
     if (!this._confirmedSignatures) this._confirmedSignatures = new Set();
 
+    logger.info(`Differential phase: ${descriptors.length} descriptors × ${testInputs.length} EPs × 3 modes`);
+    let descriptorIdx = 0;
+
+    // Properties accessed by URL-sink functions (ajax, fetch, etc.).
+    // URL sinks only fire getter traps for these — skip them for other properties.
+    const urlSinkProperties = new Set([
+      'url', 'method', 'type', 'data', 'contentType', 'headers', 'async',
+      'crossDomain', 'dataType', 'timeout', 'username', 'password', 'processData',
+    ]);
+
     for (const descriptor of descriptors) {
+      descriptorIdx++;
       // Skip combos already confirmed — no need to re-verify
       const sig = `${descriptor.property}:${descriptor.payloadType}`;
       if (this._confirmedSignatures.has(sig)) continue;
 
-      // Try each test input until one confirms or all fail
+      // Try each test input until one confirms or all fail.
+      // Bail out early if multiple consecutive EPs fail — avoids wasting time
+      // on descriptors that won't confirm for any entry point.
       let confirmed = false;
+      let consecutiveNullFails = 0; // only count EPs where the fn truly couldn't be called
+      // URL sink EPs (ajax, getJSON etc.) are expensive — skip them unless the property
+      // being tested is one they actually read from options objects.
+      const isUrlSinkProperty = urlSinkProperties.has(descriptor.property);
       for (const testInput of testInputs) {
+        if (consecutiveNullFails >= 3) break; // 3 un-callable EPs = descriptor won't confirm
+        const epIsUrlSink = urlSinkEPs.has(getBaseName(testInput.entryPoint));
+        if (epIsUrlSink && !isUrlSinkProperty) continue; // URL sinks won't fire for non-URL props
+        let diffResult = null, mergeResult = null, urlResult = null;
         try {
           // Mode 1: Standard differential (pre-pollute Object.prototype)
-          const diffResult = await this.instrumentation.executeDifferentialTracing(
+          diffResult = await this.instrumentation.executeDifferentialTracing(
             testInput, this.config, descriptor
           );
 
+          if (!diffResult) {
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: NULL result (fn not found or threw)`);
+          }
           if (diffResult) {
-            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: confirmed=${diffResult.diff?.isConfirmedGadget} read=${diffResult.diff?.pollutionWasRead} outChanged=${diffResult.diff?.outputChanged} errChanged=${diffResult.diff?.errorChanged}`);            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
               diffResult, testInput, this.config
             );
 
             if (confirmedChain) {
               this._confirmedSignatures.add(sig);
+
+              // Attempt exploit verification for high-confidence gadgets
+              if (confirmedChain.confidence >= 0.75) {
+                try {
+                  const verification = await this.instrumentation.verifyGadgetExploit(
+                    testInput, this.config, descriptor.property
+                  );
+                  if (verification?.verified) {
+                    confirmedChain.exploitVerified = true;
+                    confirmedChain.exploitProof = verification.executionProof;
+                    confirmedChain.exploitPayloadType = verification.payloadType;
+                    confirmedChain.confidence = Math.min(1.0, confirmedChain.confidence + 0.10);
+                    logger.warn(`  EXPLOIT VERIFIED: ${verification.executionProof}`);
+                  }
+                } catch (err) {
+                  logger.debug(`Exploit verification error: ${err.message}`);
+                }
+              }
+
               this.results.confirmedChains.push(confirmedChain);
               this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
               this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
@@ -397,13 +494,30 @@ export class Orchestrator {
               logger.warn(
                 `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
                 `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
-                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)`
+                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)` +
+                `${confirmedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
               );
+              confirmed = true;
+              break; // No need to try more entry points or modes for this descriptor
+            } else if (diffResult.diff?.isCandidate) {
+              // Property was read via Object.prototype but no observable behavior change.
+              // Store as candidate for manual review.
+              if (!this.results.candidateProperties) this.results.candidateProperties = [];
+              const candidateSig = `${descriptor.property}:${testInput.entryPoint}`;
+              if (!this.results.candidateProperties.some(c => c.sig === candidateSig)) {
+                this.results.candidateProperties.push({
+                  sig: candidateSig,
+                  property: descriptor.property,
+                  entryPoint: testInput.entryPoint,
+                  confidence: diffResult.diff.confidence,
+                });
+                logger.debug(`CANDIDATE: Object.prototype.${descriptor.property} read via ${testInput.entryPoint} (no behavior change)`);
+              }
             }
           }
 
           // Mode 2: Merge-PP test (crafted input causes Object.prototype mutation)
-          const mergeResult = await this.instrumentation.executeMergePPDifferential(
+          mergeResult = await this.instrumentation.executeMergePPDifferential(
             testInput, this.config, descriptor
           );
 
@@ -423,12 +537,13 @@ export class Orchestrator {
                 `-> ${mergeChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
                 `(confidence: ${(mergeChain.confidence * 100).toFixed(0)}%)`
               );
+              confirmed = true;
+              break; // No need to try more entry points or modes for this descriptor
             }
           }
 
           // Mode 3: URL gadget test (URL query string → parser → target function)
-          // This is the most important mode — always try it even if Mode 1 or 2 found something
-          const urlResult = await this.instrumentation.executeURLGadgetDifferential(
+          urlResult = await this.instrumentation.executeURLGadgetDifferential(
             testInput, this.config, descriptor
           );
 
@@ -456,12 +571,129 @@ export class Orchestrator {
               break;
             }
           }
+          // Mode 4: Forced branch execution (Dasty technique)
+          // If standard differential didn't confirm, try forcing boolean gate
+          // properties to true alongside the payload. This opens guarded code paths
+          // like: if (opts.debug) { eval(opts.template); }
+          if (!confirmed && !epIsUrlSink) {
+            const forcedResult = await this.instrumentation.executeForcedBranchDifferentialTracing(
+              testInput, this.config, descriptor
+            );
+            if (forcedResult) {
+              const forcedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+                forcedResult, testInput, this.config
+              );
+              if (forcedChain) {
+                this._confirmedSignatures.add(sig);
+                forcedChain.forcedBranch = true;
+                forcedChain.forcedGates = forcedResult.diff?.details?.forcedGatesFired || [];
+
+                // Verify exploit for forced-branch findings
+                if (forcedChain.confidence >= 0.75) {
+                  try {
+                    const verification = await this.instrumentation.verifyGadgetExploit(
+                      testInput, this.config, descriptor.property
+                    );
+                    if (verification?.verified) {
+                      forcedChain.exploitVerified = true;
+                      forcedChain.exploitProof = verification.executionProof;
+                      forcedChain.confidence = Math.min(1.0, forcedChain.confidence + 0.10);
+                    }
+                  } catch { /* verification optional */ }
+                }
+
+                this.results.confirmedChains.push(forcedChain);
+                this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+                this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+                logger.warn(
+                  `CONFIRMED GADGET (FORCED BRANCH): Object.prototype.${descriptor.property} ` +
+                  `-> ${forcedChain.sink?.name || 'behavioral change'} ` +
+                  `(gates: ${forcedChain.forcedGates.join(',') || 'none'}, ` +
+                  `confidence: ${(forcedChain.confidence * 100).toFixed(0)}%)` +
+                  `${forcedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
+                );
+                confirmed = true;
+                break;
+              }
+            }
+          }
         } catch (error) {
           logger.debug(`Differential test failed for ${descriptor.property} via ${testInput.entryPoint}: ${error.message}`);
+        }
+        if (!confirmed) {
+          // Only count as a null-fail when the function truly couldn't be invoked.
+          // A non-null result that didn't confirm is informative — keep trying other EPs.
+          const allModesNull = !diffResult && !mergeResult && !urlResult;
+          if (allModesNull) consecutiveNullFails++;
+          else consecutiveNullFails = 0;
         }
       }
       if (!confirmed) {
         this.inputGeneration.updatePropertyFeedback(descriptor.property, false);
+      }
+    }
+
+    // ── Pass 2: Multi-property co-pollution ────────────────────────────────────
+    // Catch conjunctive gadgets that require 2+ properties polluted simultaneously
+    // (e.g., `if (opts.debug) eval(opts.template)` — neither alone triggers the sink).
+    const candidateProps = this.results.candidateProperties || [];
+    const confirmedProps = [...this._confirmedSignatures].map(sig => sig.split(':')[0]);
+    // Combine candidates (Tier 5 reads without behavior change) with confirmed properties
+    // — a confirmed prop may gate a candidate, or two candidates may gate each other.
+    const allCandidateNames = [...new Set([
+      ...candidateProps.map(c => c.property),
+      ...confirmedProps,
+    ])];
+
+    if (allCandidateNames.length >= 2 && allCandidateNames.length <= 30) {
+      const payloads = this.inputGeneration.getPayloads();
+      // Use first high-priority entry point for co-pollution testing
+      const coTestInput = testInputs[0];
+      if (coTestInput) {
+        const maxPairs = Math.min(50, allCandidateNames.length * (allCandidateNames.length - 1) / 2);
+        let pairsChecked = 0;
+
+        logger.info(`Multi-property phase: testing up to ${maxPairs} property pairs`);
+        for (let i = 0; i < allCandidateNames.length && pairsChecked < maxPairs; i++) {
+          for (let j = i + 1; j < allCandidateNames.length && pairsChecked < maxPairs; j++) {
+            pairsChecked++;
+            // Use boolean_true for the "gate" property and sentinel for the "payload" property
+            const pairDescriptors = [
+              { property: allCandidateNames[i], value: true },
+              { property: allCandidateNames[j], value: payloads[0]?.value || '__UOPFUZZ_MARKER_7f3a__' },
+            ];
+
+            try {
+              const multiResult = await this.instrumentation.executeMultiPropertyDifferentialTracing(
+                coTestInput, this.config, pairDescriptors
+              );
+
+              if (multiResult?.diff?.isConfirmedGadget) {
+                const firedProps = multiResult.diff.details?.firedProperties || [];
+                const combinedName = pairDescriptors.map(d => d.property).join('+');
+                const sig = `multi:${combinedName}`;
+                if (!this._confirmedSignatures.has(sig)) {
+                  this._confirmedSignatures.add(sig);
+                  const chain = this.gadgetAnalysis.analyzeDifferentialResult(
+                    multiResult, coTestInput, this.config
+                  );
+                  if (chain) {
+                    chain.multiProperty = true;
+                    chain.coPolluteProperties = pairDescriptors.map(d => d.property);
+                    this.results.confirmedChains.push(chain);
+                    logger.warn(
+                      `CONFIRMED MULTI-PROPERTY GADGET: ${combinedName} ` +
+                      `(fired: ${firedProps.join(', ')}, confidence: ${(chain.confidence * 100).toFixed(0)}%)`
+                    );
+                  }
+                }
+              }
+            } catch (error) {
+              logger.debug(`Multi-property test ${allCandidateNames[i]}+${allCandidateNames[j]} failed: ${error.message}`);
+            }
+          }
+        }
       }
     }
   }
@@ -514,13 +746,13 @@ export class Orchestrator {
 
             case 'completed':
               workerResults.results = message.results;
-              logger.info(`✅ Worker ${message.workerId} completed with ${message.results.iterationsCompleted} iterations`);
+              logger.info(`Worker ${message.workerId} completed with ${message.results.iterationsCompleted} iterations`);
               resolve(workerResults);
               break;
 
             case 'error':
               workerResults.error = message.error;
-              logger.error(`❌ Worker ${message.workerId} failed: ${message.error.message}`);
+              logger.error(`Worker ${message.workerId} failed: ${message.error.message}`);
               reject(new Error(`Worker ${message.workerId} failed: ${message.error.message}`));
               break;
           }
@@ -528,7 +760,7 @@ export class Orchestrator {
 
         worker.on('error', (error) => {
           workerResults.error = error;
-          logger.error(`❌ Worker ${workerId} error: ${error.message}`);
+          logger.error(`Worker ${workerId} error: ${error.message}`);
           reject(error);
         });
 
@@ -592,7 +824,7 @@ export class Orchestrator {
     this.results.potentialChains = allPotentialChains;
     this.results.errors.push(...allErrors);
 
-    logger.info(`🎯 Parallel execution completed: ${totalIterationsCompleted} total iterations, ${allPotentialChains.length} potential chains found`);
+    logger.info(`Parallel execution completed: ${totalIterationsCompleted} total iterations, ${allPotentialChains.length} potential chains found`);
   }
 
   async analyzeResults() {
@@ -620,12 +852,13 @@ export class Orchestrator {
     const outputDir = path.resolve(this.options.outputDir);
     await fs.mkdir(outputDir, { recursive: true });
 
-    const resultsFile = path.join(outputDir, `results-${Date.now()}.json`);
-    const reportFile = path.join(outputDir, `report-${Date.now()}.txt`);
+    const ts = Date.now();
+    const resultsFile = path.join(outputDir, `results-${ts}.json`);
+    const reportFile = path.join(outputDir, `report-${ts}.md`);
 
     await fs.writeFile(resultsFile, JSON.stringify(this.results, null, 2));
 
-    const report = this.generateReport();
+    const report = generateSingleReport(this.results, this.config);
     await fs.writeFile(reportFile, report);
 
     logger.info(`Results saved to ${outputDir}`);

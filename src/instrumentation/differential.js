@@ -41,6 +41,9 @@ async function executeClean(fn, args, timeoutMs = 5000) {
     });
     const execution = Promise.resolve(fn(...trackedArgs));
     result.output = await Promise.race([execution, timeout]);
+    // Drain microtask queue for consistent comparison with polluted run
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
   } catch (error) {
     result.error = error.message;
   } finally {
@@ -55,30 +58,45 @@ async function executeClean(fn, args, timeoutMs = 5000) {
 }
 
 /**
- * Snapshot all own properties of Object.prototype.
- * Returns a Map<propertyName, {had: boolean, value: any}>.
+ * Snapshot all own properties of Object.prototype AND other critical prototypes.
+ * GHunter (USENIX Security 2024) found that pollution of Function.prototype,
+ * Array.prototype, and String.prototype is a real attack vector — e.g.,
+ * polluting Array.prototype.join with eval triggers code execution on any
+ * [].join() call.
  */
+const MONITORED_PROTOTYPES = [
+  { name: 'Object', proto: Object.prototype },
+  { name: 'Function', proto: Function.prototype },
+  { name: 'Array', proto: Array.prototype },
+  { name: 'String', proto: String.prototype },
+];
+
 function snapshotPrototype() {
   const snap = new Map();
-  for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-    snap.set(key, { had: true, value: Object.prototype[key] });
+  for (const { name, proto } of MONITORED_PROTOTYPES) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      snap.set(`${name}.${key}`, { had: true, value: proto[key], proto: name });
+    }
   }
   return snap;
 }
 
 /**
- * Detect and clean up any properties added to Object.prototype since snapshot.
+ * Detect and clean up any properties added to ANY monitored prototype since snapshot.
  * Returns { polluted: boolean, newProps: string[] }.
  */
 function detectAndRestorePrototype(snapshot) {
   let polluted = false;
   const newProps = [];
 
-  for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-    if (!snapshot.has(key)) {
-      polluted = true;
-      newProps.push(key);
-      try { delete Object.prototype[key]; } catch { /* sealed */ }
+  for (const { name, proto } of MONITORED_PROTOTYPES) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      const snapKey = `${name}.${key}`;
+      if (!snapshot.has(snapKey)) {
+        polluted = true;
+        newProps.push(`${name}.prototype.${key}`);
+        try { delete proto[key]; } catch { /* sealed */ }
+      }
     }
   }
 
@@ -114,25 +132,68 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
 
   const snapshot = snapshotPrototype();
 
+  // Context-aware getter trap: records when Object.prototype[prop] is read on
+  // ANY object, and returns the MOST USEFUL value depending on read context.
+  //
+  // Problem: simple traps return a fixed value. But real gadgets may read the
+  // same property twice:
+  //   if (opts.debug) {           // 1st read: expects truthy
+  //     const cmd = opts.debug;   // 2nd read: expects string
+  //     eval(cmd);
+  //   }
+  //
+  // Solution: first read returns the actual payload value. If the payload is a
+  // string (RCE payload), the trap also satisfies boolean truthiness checks.
+  // If the payload is boolean, we return it consistently.
+  //
+  // For extra coverage, the trap logs each read with a count so the analysis
+  // layer can detect multi-read patterns.
+  let trapFired = false;
+  let trapReadCount = 0;
+  let trapVal = val;
+
   let timer;
   try {
-    Object.prototype[prop] = val;
+    try {
+      Object.defineProperty(Object.prototype, prop, {
+        get() {
+          trapFired = true;
+          trapReadCount++;
+          // For RCE string payloads, they're already truthy (non-empty strings).
+          // For boolean payloads, return as-is.
+          // For function payloads, return as-is (truthy + callable).
+          return trapVal;
+        },
+        set(v) { trapFired = true; trapVal = v; },
+        configurable: true,
+        enumerable: false,
+      });
+    } catch {
+      // Property is non-configurable; fall back to simple assignment
+      Object.prototype[prop] = val;
+    }
 
     const timeout = new Promise((_, reject) => {
       timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
     });
     const execution = Promise.resolve(fn(...trackedArgs));
     result.output = await Promise.race([execution, timeout]);
+
+    // Drain microtask queue: some libraries schedule reads via Promise.resolve().then()
+    // or process.nextTick(). Without draining, the getter trap is torn down before the
+    // async read fires, causing false negatives for async gadgets.
+    // Two rounds of microtask drain catches .then().then() chains (depth 2).
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
   } catch (error) {
     result.error = error.message;
   } finally {
     clearTimeout(timer);
 
-    // Restore our pre-set pollution first
+    // Restore: remove our descriptor, then reinstate original if it existed
+    try { delete Object.prototype[prop]; } catch { /* sealed */ }
     if (hadProperty) {
-      Object.prototype[prop] = originalValue;
-    } else {
-      delete Object.prototype[prop];
+      try { Object.prototype[prop] = originalValue; } catch { /* sealed */ }
     }
 
     // Detect any NEW properties the target added to Object.prototype
@@ -141,35 +202,20 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
       result.prototypePolluted = true;
       result.pollutedProperties = detection.newProps;
     }
-
-    // Also detect if the target changed the value of our pre-set property
-    // (means it wrote to Object.prototype[prop] itself)
-    const currentVal = Object.prototype[prop];
-    if (hadProperty) {
-      if (currentVal !== originalValue) {
-        result.prototypePolluted = true;
-        if (!result.pollutedProperties.includes(prop)) {
-          result.pollutedProperties.push(prop);
-        }
-        Object.prototype[prop] = originalValue;
-      }
-    } else {
-      if (Object.prototype.hasOwnProperty.call(Object.prototype, prop)) {
-        result.prototypePolluted = true;
-        if (!result.pollutedProperties.includes(prop)) {
-          result.pollutedProperties.push(prop);
-        }
-        delete Object.prototype[prop];
-      }
-    }
   }
 
   if (taintLog.length > 0) {
     result.taintAnalysis = analyzeTaintLog(taintLog);
-    result.pollutionWasRead = taintLog.some(
-      e => e.type === 'get' && e.property === prop && (e.isPrototypeChainLookup || e.isUOPCandidate)
-    );
   }
+
+  // Combine active trap signal with taint-proxy signal.
+  // The active trap is the authoritative source: if it fired, the property was
+  // definitely read via Object.prototype during execution.
+  const taintSignal = taintLog.some(
+    e => e.type === 'get' && e.property === prop && (e.isPrototypeChainLookup || e.isUOPCandidate)
+  );
+  result.pollutionWasRead = trapFired || taintSignal;
+  result.trapReadCount = trapReadCount; // How many times the trap fired (multi-read detection)
 
   return result;
 }
@@ -246,9 +292,33 @@ function diffResults(cleanResult, pollutedResult, pollutionDescriptor) {
     diff.isConfirmedGadget = true;
     diff.confidence = Math.max(diff.confidence, 0.60);
   }
-  // Tier 5: Property was read via prototype chain (gadget read)
+  // Tier 5: Active trap fired — property was definitively read via Object.prototype.
+  // However, reading alone does NOT confirm exploitability. Many libraries speculatively
+  // read properties (e.g., `if (opts.debug) ...`) without dangerous consequences.
+  // Only confirm if the property name is in a high-risk category (sink-adjacent).
+  // Otherwise, mark as candidate for manual review.
   else if (pollutedResult.pollutionWasRead) {
-    diff.confidence = Math.max(diff.confidence, 0.40);
+    const HIGH_RISK_PROPS = new Set([
+      // Code execution sinks
+      'template', 'code', 'script', 'eval', 'command', 'shell', 'exec',
+      'source', 'expression', 'compile', 'render', 'Function',
+      // URL/network sinks (SSRF)
+      'url', 'href', 'src', 'action', 'baseURL', 'endpoint', 'proxy',
+      // DOM sinks (XSS)
+      'innerHTML', 'outerHTML', 'textContent', 'onclick', 'onerror',
+      // Config that enables dangerous behavior
+      'compileDebug', 'debug', 'self', 'constructor', 'allowDots',
+      'allowPrototypes', 'outputFunctionName', 'localsName', 'destructuredLocals',
+      'escape', 'client', 'globals', 'filename',
+    ]);
+    if (HIGH_RISK_PROPS.has(pollutionDescriptor.property)) {
+      diff.isConfirmedGadget = true;
+      diff.confidence = Math.max(diff.confidence, 0.50);
+    } else {
+      diff.isConfirmedGadget = false;
+      diff.confidence = Math.max(diff.confidence, 0.30);
+      diff.isCandidate = true;
+    }
   }
 
   return diff;
@@ -531,6 +601,242 @@ export async function executeDifferential(fn, args, pollutionDescriptor, timeout
 }
 
 /**
+ * Forced Branch Execution — inspired by Dasty (KTH, WWW 2024).
+ *
+ * Many gadgets are guarded by boolean checks:
+ *   if (opts.debug) { eval(opts.template); }
+ *
+ * Normal differential testing misses these because the gate property (debug)
+ * is falsy in clean execution, so the sink (eval) is never reached.
+ *
+ * Solution: co-pollute known "gate" properties (debug, verbose, cache, strict,
+ * client, etc.) with `true` alongside the actual payload property. This forces
+ * guarded branches open, exposing sinks that normal execution never reaches.
+ *
+ * Dasty found 67 additional exploitable packages using this technique.
+ *
+ * @param {Function} fn - Entry point function
+ * @param {Array} args - Arguments
+ * @param {object} pollutionDescriptor - { property, value } — the payload
+ * @param {number} timeoutMs
+ * @returns {object} Differential result with forced branch info
+ */
+const GATE_PROPERTIES = [
+  'debug', 'compileDebug', 'verbose', 'cache', 'client', 'strict',
+  'self', 'async', 'raw', 'unsafe', 'dev', 'development', 'production',
+  'allowDots', 'allowPrototypes', 'pretty', 'rmWhitespace',
+];
+
+export async function executeForcedBranchDifferential(fn, args, pollutionDescriptor, timeoutMs = 5000) {
+  const cleanResult = await executeClean(fn, args, timeoutMs);
+
+  // Polluted execution with GATE PROPERTIES forced to true
+  const taintLog = [];
+  const sinkAccesses = [];
+  const result = {
+    output: null, error: null, sinkAccesses, taintLog, taintAnalysis: null,
+    pollutionWasRead: false,
+    prototypePolluted: false,
+    pollutedProperties: [],
+    forcedGates: [],
+  };
+
+  const trackedArgs = args.map(arg => {
+    if (arg && typeof arg === 'object' && !Buffer.isBuffer(arg)) {
+      try { return createTaintProxy(arg, taintLog); } catch { return arg; }
+    }
+    return arg;
+  });
+
+  const prop = pollutionDescriptor.property;
+  const val = pollutionDescriptor.value;
+  const snapshot = snapshotPrototype();
+
+  // Track all installed traps for cleanup
+  const installedTraps = new Map(); // property -> { hadProperty, originalValue }
+
+  let timer;
+  try {
+    // Install the main payload trap
+    const mainTrap = installTrap(prop, val);
+    installedTraps.set(prop, mainTrap);
+
+    // Force all gate properties to `true` (except the payload property itself)
+    for (const gate of GATE_PROPERTIES) {
+      if (gate === prop) continue; // Don't override the actual payload
+      const gateTrap = installTrap(gate, true);
+      installedTraps.set(gate, gateTrap);
+      result.forcedGates.push(gate);
+    }
+
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+    });
+    result.output = await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
+
+    // Drain microtask queue
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
+  } catch (error) {
+    result.error = error.message;
+  } finally {
+    clearTimeout(timer);
+
+    // Restore all traps
+    for (const [trapProp, state] of installedTraps) {
+      try { delete Object.prototype[trapProp]; } catch { /* sealed */ }
+      if (state.hadProperty) {
+        try { Object.prototype[trapProp] = state.originalValue; } catch { /* sealed */ }
+      }
+    }
+
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) {
+      result.prototypePolluted = true;
+      result.pollutedProperties = detection.newProps;
+    }
+  }
+
+  // Check which traps fired
+  const mainState = installedTraps.get(prop);
+  result.pollutionWasRead = mainState?.fired || false;
+  result.forcedGatesFired = [...installedTraps.entries()]
+    .filter(([p, s]) => p !== prop && s.fired)
+    .map(([p]) => p);
+
+  if (taintLog.length > 0) {
+    result.taintAnalysis = analyzeTaintLog(taintLog);
+  }
+
+  const diff = diffResults(cleanResult, result, pollutionDescriptor);
+  diff.details.forcedBranch = true;
+  diff.details.forcedGates = result.forcedGates;
+  diff.details.forcedGatesFired = result.forcedGatesFired;
+
+  return { clean: cleanResult, polluted: result, diff };
+}
+
+/** Install a getter/setter trap on Object.prototype and return cleanup state. */
+function installTrap(prop, val) {
+  const hadProperty = Object.prototype.hasOwnProperty.call(Object.prototype, prop);
+  const originalValue = Object.prototype[prop];
+  const state = { hadProperty, originalValue, fired: false, trapVal: val };
+
+  try {
+    Object.defineProperty(Object.prototype, prop, {
+      get() { state.fired = true; return state.trapVal; },
+      set(v) { state.fired = true; state.trapVal = v; },
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    Object.prototype[prop] = val;
+  }
+
+  return state;
+}
+
+/**
+ * Multi-property co-pollution differential test.
+ *
+ * Some gadgets require two or more Object.prototype properties to be polluted
+ * simultaneously (e.g., `if (opts.debug) eval(opts.template)`).
+ * Single-property testing misses these because neither property alone triggers
+ * the dangerous path.
+ *
+ * @param {Function} fn - Entry point function
+ * @param {Array} args - Arguments
+ * @param {Array<{property: string, value: any}>} descriptors - Properties to co-pollute
+ * @param {number} timeoutMs
+ * @returns {object} Differential result
+ */
+export async function executeMultiPropertyDifferential(fn, args, descriptors, timeoutMs = 5000) {
+  const cleanResult = await executeClean(fn, args, timeoutMs);
+
+  // Polluted execution: set ALL descriptors on Object.prototype simultaneously
+  const taintLog = [];
+  const sinkAccesses = [];
+  const result = {
+    output: null, error: null, sinkAccesses, taintLog, taintAnalysis: null,
+    pollutionWasRead: false,
+    prototypePolluted: false,
+    pollutedProperties: []
+  };
+
+  const trackedArgs = args.map(arg => {
+    if (arg && typeof arg === 'object' && !Buffer.isBuffer(arg)) {
+      try { return createTaintProxy(arg, taintLog); } catch { return arg; }
+    }
+    return arg;
+  });
+
+  const snapshot = snapshotPrototype();
+  const traps = new Map(); // property -> { hadProp, origVal, trapFired }
+
+  let timer;
+  try {
+    // Install getter traps for ALL properties simultaneously
+    for (const desc of descriptors) {
+      const prop = desc.property;
+      const val = desc.value;
+      const hadProperty = Object.prototype.hasOwnProperty.call(Object.prototype, prop);
+      const originalValue = Object.prototype[prop];
+      const trapState = { hadProperty, originalValue, fired: false, trapVal: val };
+      traps.set(prop, trapState);
+
+      try {
+        Object.defineProperty(Object.prototype, prop, {
+          get() { trapState.fired = true; return trapState.trapVal; },
+          set(v) { trapState.fired = true; trapState.trapVal = v; },
+          configurable: true,
+          enumerable: false,
+        });
+      } catch {
+        Object.prototype[prop] = val;
+      }
+    }
+
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+    });
+    result.output = await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
+  } catch (error) {
+    result.error = error.message;
+  } finally {
+    clearTimeout(timer);
+
+    // Restore all properties
+    for (const [prop, state] of traps) {
+      try { delete Object.prototype[prop]; } catch { /* sealed */ }
+      if (state.hadProperty) {
+        try { Object.prototype[prop] = state.originalValue; } catch { /* sealed */ }
+      }
+    }
+
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) {
+      result.prototypePolluted = true;
+      result.pollutedProperties = detection.newProps;
+    }
+  }
+
+  const firedProps = [...traps.entries()].filter(([, s]) => s.fired).map(([p]) => p);
+  result.pollutionWasRead = firedProps.length > 0;
+
+  // Build a combined descriptor for diff comparison
+  const combinedDescriptor = {
+    property: descriptors.map(d => d.property).join('+'),
+    value: descriptors.map(d => `${d.property}=${String(d.value).substring(0, 30)}`).join(', '),
+  };
+
+  const diff = diffResults(cleanResult, result, combinedDescriptor);
+  diff.details.firedProperties = firedProps;
+  diff.details.coPolluteCount = descriptors.length;
+
+  return { clean: cleanResult, polluted: result, diff };
+}
+
+/**
  * Discover which properties a library reads as undefined (UOP candidates).
  * Run a clean execution and collect all property accesses that resolved to undefined.
  * These are the properties an attacker could control via Object.prototype pollution.
@@ -574,4 +880,83 @@ export async function discoverUOPProperties(fn, args, timeoutMs = 5000) {
   }
 
   return [...uopProps];
+}
+
+/**
+ * Verify a confirmed gadget produces actual code execution.
+ *
+ * For confirmed gadgets (Tier 0-2), this re-runs the execution with
+ * a canary-based payload that writes a unique token to a global variable.
+ * If the token is present after execution, we have proof of code execution.
+ *
+ * This turns "property was read and behavior changed" into "attacker-controlled
+ * code actually executed."
+ *
+ * @param {Function} fn - Entry point function
+ * @param {Array} args - Arguments
+ * @param {string} property - The property to pollute
+ * @param {number} timeoutMs
+ * @returns {{ verified: boolean, executionProof: string|null, payloadType: string|null }}
+ */
+export async function verifyExploit(fn, args, property, timeoutMs = 5000) {
+  const canaryToken = `__UOPFUZZ_CANARY_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
+
+  // Payloads that prove code execution by setting a global canary
+  const verificationPayloads = [
+    {
+      type: 'function_call',
+      value: new Function(`globalThis.__uopfuzz_canary = "${canaryToken}"`),
+      check: () => globalThis.__uopfuzz_canary === canaryToken,
+    },
+    {
+      type: 'eval_string',
+      value: `globalThis.__uopfuzz_canary = "${canaryToken}"`,
+      check: () => globalThis.__uopfuzz_canary === canaryToken,
+    },
+    {
+      type: 'constructor_chain',
+      value: `constructor.constructor("globalThis.__uopfuzz_canary = '${canaryToken}'")()\u0000`,
+      check: () => globalThis.__uopfuzz_canary === canaryToken,
+    },
+  ];
+
+  for (const payload of verificationPayloads) {
+    // Clean up canary from previous attempt
+    delete globalThis.__uopfuzz_canary;
+
+    const snapshot = snapshotPrototype();
+    const hadProperty = Object.prototype.hasOwnProperty.call(Object.prototype, property);
+    const originalValue = Object.prototype[property];
+
+    let timer;
+    try {
+      Object.prototype[property] = payload.value;
+
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+      });
+      await Promise.race([Promise.resolve(fn(...args)), timeout]);
+    } catch {
+      // Errors expected — we're testing exploit payloads
+    } finally {
+      clearTimeout(timer);
+      try { delete Object.prototype[property]; } catch { /* sealed */ }
+      if (hadProperty) {
+        try { Object.prototype[property] = originalValue; } catch { /* sealed */ }
+      }
+      detectAndRestorePrototype(snapshot);
+    }
+
+    if (payload.check()) {
+      delete globalThis.__uopfuzz_canary;
+      return {
+        verified: true,
+        executionProof: `Payload type '${payload.type}' on Object.prototype.${property} achieved code execution (canary: ${canaryToken})`,
+        payloadType: payload.type,
+      };
+    }
+  }
+
+  delete globalThis.__uopfuzz_canary;
+  return { verified: false, executionProof: null, payloadType: null };
 }

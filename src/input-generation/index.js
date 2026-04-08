@@ -1,12 +1,37 @@
 import { logger } from '../utils/logger.js';
+import { getKnownProperties, getGadgetsForPackage } from '../gadget-analysis/known-gadgets.js';
 
-// Pre-allocated constant — avoids recreating this array on every call
+// Pre-allocated constant — avoids recreating this array on every call.
+// Covers multiple library categories derived from known CVEs across npm.
 const GENERIC_POLLUTION_PROPS = [
-  'block', 'debug', 'compileDebug', 'self', 'line', 'pretty', 'filename',
+  // ── Template engines (Pug, EJS, Handlebars, Nunjucks, Squirrelly) ──
+  'block', 'compileDebug', 'self', 'line', 'pretty', 'filename',
   'basedir', 'doctype', 'globals', 'filters', 'plugins', 'cache',
   'template', 'autoEscape', 'defaultFilter', 'tags', 'rmWhitespace',
   'e', 'async', 'root', 'views', 'partials', 'helpers', 'layout',
-  'outputFunctionName', 'localsName', 'destructuredLocals', 'escape'
+  'outputFunctionName', 'localsName', 'destructuredLocals', 'escape',
+  // ── HTTP / Network (SSRF, request smuggling, open redirect) ──
+  'url', 'href', 'src', 'method', 'headers', 'auth', 'proxy', 'agent',
+  'hostname', 'host', 'port', 'protocol', 'path', 'baseURL', 'timeout',
+  'socketPath', 'rejectUnauthorized', 'ca', 'cert', 'key', 'pfx',
+  // ── Config / Debug (info disclosure, behavior change) ──
+  'debug', 'verbose', 'mode', 'env', 'level', 'log', 'logger',
+  'silent', 'strict', 'production', 'development',
+  // ── Serialization / Parsing (injection, deserialization) ──
+  'reviver', 'replacer', 'parser', 'serializer', 'decoder', 'space',
+  'allowDots', 'allowPrototypes', 'parameterLimit', 'depth',
+  // ── Shell / Process (RCE) ──
+  'shell', 'cwd', 'encoding', 'stdio', 'argv', 'args', 'execPath',
+  'command', 'script', 'cmd',
+  // ── DOM / Browser (XSS, DOM clobbering) ──
+  'innerHTML', 'outerHTML', 'textContent', 'onclick', 'onerror',
+  'srcdoc', 'data', 'formAction', 'action',
+  // ── Object mechanics (constructor chain, type confusion) ──
+  'constructor', 'toString', 'valueOf', 'toJSON', 'then',
+  'Symbol.toPrimitive', 'Symbol.iterator',
+  // ── Merge / Clone behavior modifiers ──
+  'clone', 'deep', 'recursive', 'overwrite', 'isMergeableObject',
+  'customMerge', 'arrayMerge', 'cloneNode', 'nodeType', 'ownerDocument',
 ];
 
 /**
@@ -572,23 +597,70 @@ export class InputGeneration {
   applyVerticalChaining(input, config) {
     if (input.type !== 'object') return null;
 
+    // Alternate between __proto__ chains and constructor.prototype chains
+    const useConstructor = Math.random() < 0.5;
+
     try {
-      input.value.__proto__ = {
-        level1: 'polluted',
-        __proto__: {
-          level2: 'deeply_polluted',
-          __proto__: {
-            level3: 'very_deeply_polluted'
+      if (useConstructor) {
+        // Constructor chain variant — bypasses __proto__ sanitization
+        input.value.constructor = {
+          prototype: {
+            level1: 'polluted',
+            constructor: {
+              prototype: {
+                level2: 'deeply_polluted',
+                constructor: {
+                  prototype: {
+                    level3: 'very_deeply_polluted',
+                    constructor: {
+                      prototype: {
+                        level4: 'ultra_deep_polluted',
+                        constructor: {
+                          prototype: {
+                            level5: 'max_depth_polluted'
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
           }
-        }
-      };
+        };
+        input.metadata.pollutionMethod = 'constructor_chain';
+      } else {
+        // __proto__ chain — depth increased to 5
+        input.value.__proto__ = {
+          level1: 'polluted',
+          __proto__: {
+            level2: 'deeply_polluted',
+            __proto__: {
+              level3: 'very_deeply_polluted',
+              __proto__: {
+                level4: 'ultra_deep_polluted',
+                __proto__: {
+                  level5: 'max_depth_polluted'
+                }
+              }
+            }
+          }
+        };
+        input.metadata.pollutionMethod = 'proto_chain';
+      }
     } catch (error) {
       input.value.__verticalChain = {
         level1: 'polluted',
         nested: {
           level2: 'deeply_polluted',
           nested: {
-            level3: 'very_deeply_polluted'
+            level3: 'very_deeply_polluted',
+            nested: {
+              level4: 'ultra_deep_polluted',
+              nested: {
+                level5: 'max_depth_polluted'
+              }
+            }
           }
         }
       };
@@ -597,7 +669,7 @@ export class InputGeneration {
 
     input.metadata.pollution = true;
     input.metadata.chainingType = 'vertical';
-    input.metadata.chainDepth = 3;
+    input.metadata.chainDepth = 5;
 
     return input;
   }
@@ -775,21 +847,39 @@ export class InputGeneration {
     const properties = this.getPollutionProperties(config);
     const payloads = this.getPayloads();
 
-    for (let i = 0; i < count; i++) {
-      // Select property: prefer discovered UOP properties (they're real)
-      const property = properties[i % properties.length];
+    // Track which property×payloadType combos have been tested across iterations.
+    // This avoids re-testing the same combo while ensuring we eventually cover all
+    // properties — not just the first `count` in the list.
+    if (!this._descriptorOffset) this._descriptorOffset = 0;
 
-      // Select payload: cycle through different types
-      const payload = payloads[i % payloads.length];
+    for (let i = 0; i < count; i++) {
+      const propIdx = (this._descriptorOffset + i) % properties.length;
+      const property = properties[propIdx];
+
+      // Cycle payload independently so the same property gets different payloads
+      // across iterations (sentinel first, then RCE, then boolean, etc.)
+      const payloadIdx = Math.floor((this._descriptorOffset + i) / properties.length) % payloads.length;
+      const payload = payloads[payloadIdx];
 
       descriptors.push({ property, value: payload.value, payloadType: payload.type });
     }
+
+    // Advance offset so the next call starts where this one left off.
+    // This guarantees every property is tested within ceil(properties.length / count) iterations.
+    this._descriptorOffset = (this._descriptorOffset + count) % properties.length;
 
     return descriptors;
   }
 
   /**
    * Get prioritized list of properties to try polluting.
+   *
+   * Priority order:
+   * 1. Known-gadget properties for this specific package (proven CVEs)
+   * 2. UOP properties discovered from actual execution (taint proxy)
+   * 3. Config-defined pollution points
+   * 4. Generic cross-category properties
+   * 5. Full known-gadget property database (all packages)
    */
   getPollutionProperties(config) {
     const seen = new Set();
@@ -802,14 +892,24 @@ export class InputGeneration {
       }
     };
 
-    // Highest priority: UOP properties discovered from actual execution
+    // Top priority: known CVE gadget properties for THIS specific package
+    const packageGadgets = getGadgetsForPackage(config.name || config.package || '');
+    for (const gadget of packageGadgets) {
+      const prop = gadget.property || gadget.payload?.property;
+      if (prop) addUnique(prop);
+    }
+
+    // High priority: UOP properties discovered from actual execution
     for (const prop of this.discoveredUOPProperties) addUnique(prop);
 
     // Medium priority: config-defined pollution points
     for (const prop of (config.pollutionPoints || [])) addUnique(prop);
 
-    // Low priority: generic high-value targets for template engines
+    // Standard priority: generic high-value targets across library categories
     for (const prop of GENERIC_POLLUTION_PROPS) addUnique(prop);
+
+    // Low priority: comprehensive known-gadget property database (all packages)
+    for (const prop of getKnownProperties()) addUnique(prop);
 
     return properties;
   }
@@ -854,6 +954,23 @@ export class InputGeneration {
       // Null/undefined boundary
       { type: 'empty_string', value: '' },
       { type: 'null', value: null },
+
+      // SSRF — polluting url/href/src/proxy properties
+      { type: 'ssrf_url', value: 'http://169.254.169.254/latest/meta-data/' },
+      { type: 'ssrf_protocol', value: 'file:///etc/passwd' },
+
+      // Path traversal — polluting path/filename/basedir/cwd
+      { type: 'path_traversal', value: '../../../../../../etc/passwd' },
+
+      // Command injection — polluting shell/command/script
+      { type: 'cmd_injection', value: '; id #' },
+      { type: 'cmd_backtick', value: '`id`' },
+
+      // Array payload — triggers different code paths in merge/extend
+      { type: 'array', value: ['__UOPFUZZ_ARRAY__'] },
+
+      // Nested object — triggers recursive processing
+      { type: 'nested_object', value: { nested: { deep: '__UOPFUZZ_DEEP__' } } },
     ];
   }
 

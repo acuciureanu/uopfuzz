@@ -46,25 +46,36 @@ export function createTaintProxy(target, log, rootPath = '$') {
   // Don't double-wrap
   if (target[TAINT_MARKER]) return target;
 
+  // Track type coercion — when a library does String(obj), obj + '', etc.
+  // these implicit calls are security-relevant: polluted toString/valueOf
+  // can inject attacker strings into eval/template/URL contexts.
+  const COERCION_TRAPS = new Set(['toString', 'valueOf', 'toJSON', Symbol.toPrimitive]);
+
   const proxy = new Proxy(target, {
     get(obj, prop, receiver) {
       // Internal markers bypass logging
       if (prop === TAINT_MARKER) return true;
       if (prop === TAINT_LOG) return log;
-      // Symbol properties bypass logging (used by JS internals)
-      if (typeof prop === 'symbol') return Reflect.get(obj, prop, receiver);
+      // Symbol.toPrimitive IS security-relevant — log it
+      if (typeof prop === 'symbol' && prop !== Symbol.toPrimitive && prop !== Symbol.iterator) {
+        return Reflect.get(obj, prop, receiver);
+      }
 
-      const fullPath = `${rootPath}.${String(prop)}`;
+      const propStr = typeof prop === 'symbol' ? prop.toString() : String(prop);
+      const fullPath = `${rootPath}.${propStr}`;
       const exists = Object.prototype.hasOwnProperty.call(obj, prop);
       const value = Reflect.get(obj, prop, receiver);
+
+      const isCoercion = COERCION_TRAPS.has(prop);
 
       log.push({
         type: 'get',
         path: fullPath,
-        property: String(prop),
+        property: propStr,
         exists,
         valueType: value === null ? 'null' : typeof value,
         isUndefined: value === undefined,
+        isCoercion,
         // UOP indicator: property doesn't exist on own object,
         // so JS would fall through to prototype chain
         isPrototypeChainLookup: !exists && value !== undefined,
@@ -164,7 +175,30 @@ export function createTaintProxy(target, log, rootPath = '$') {
         });
       }
       return Reflect.getOwnPropertyDescriptor(obj, prop);
-    }
+    },
+
+    // apply trap: fires when the proxied object is called as a function.
+    // Catches polluted callback/handler properties being invoked.
+    ...(typeof target === 'function' ? {
+      apply(fn, thisArg, argsList) {
+        log.push({
+          type: 'apply',
+          path: rootPath,
+          argsCount: argsList.length,
+          timestamp: Date.now()
+        });
+        return Reflect.apply(fn, thisArg, argsList);
+      },
+      construct(fn, argsList, newTarget) {
+        log.push({
+          type: 'construct',
+          path: rootPath,
+          argsCount: argsList.length,
+          timestamp: Date.now()
+        });
+        return Reflect.construct(fn, argsList, newTarget);
+      }
+    } : {})
   });
 
   return proxy;
@@ -185,6 +219,8 @@ export function analyzeTaintLog(log) {
   const uopCandidates = [];
   const prototypeChainLookups = [];
   const propertyWriteAfterRead = [];
+  const coercionFlows = [];
+  const functionInvocations = [];
   const accessFrequency = new Map();
   let totalAccesses = 0;
 
@@ -232,6 +268,28 @@ export function analyzeTaintLog(log) {
           timestamp: event.timestamp
         });
       }
+
+      // Type coercion detection: toString/valueOf/toJSON/Symbol.toPrimitive
+      // When a library coerces a tainted object to a string, the resulting
+      // string flows into whatever context requested the coercion (template
+      // interpolation, URL construction, SQL query, etc.)
+      if (event.isCoercion) {
+        coercionFlows.push({
+          path: event.path,
+          property: event.property,
+          timestamp: event.timestamp
+        });
+      }
+    }
+
+    // Track function invocations on proxied objects — detects when a
+    // polluted callback/handler is actually called
+    if (event.type === 'apply') {
+      functionInvocations.push({
+        path: event.path,
+        argsCount: event.argsCount,
+        timestamp: event.timestamp
+      });
     }
   }
 
@@ -249,6 +307,8 @@ export function analyzeTaintLog(log) {
     uopCandidates,
     prototypeChainLookups,
     propertyWriteAfterRead,
+    coercionFlows,
+    functionInvocations,
     accessEntropy,
     uniquePropertiesAccessed: accessFrequency.size,
     accessFrequency: Object.fromEntries(accessFrequency)
