@@ -2,6 +2,8 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
+import { hookAll, analyzeProtoLog } from '../utils/v8-proto-intercept.js';
+import { rewriteSource, analyzeASTTaintLog } from '../utils/ast-taint-rewriter.js';
 import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
 import { executeInSandbox } from '../utils/sandbox.js';
 import { createRequire } from 'module';
@@ -168,9 +170,13 @@ export class Instrumentation {
       success: false,
       startTime: Date.now(),
       endTime: null,
-      // New: taint analysis results
+      // Layer 2: Proxy-based taint analysis (taint-proxy.js)
       taintAnalysis: null,
-      // New: V8 coverage metrics for this input
+      // Layer 2b: V8 prototype chain intercept (v8-proto-intercept.js)
+      protoInterceptAnalysis: null,
+      // Layer 2c: AST-rewrite taint analysis (ast-taint-rewriter.js)
+      astTaintAnalysis: null,
+      // Layer 1b: V8 coverage metrics for this input
       v8Coverage: null
     };
 
@@ -239,7 +245,8 @@ export class Instrumentation {
   async executeInputWithTaintTracking(input, config, trace) {
     const taintLog = [];
 
-    // Wrap input in taint-tracking proxy
+    // Layer 2a: Wrap input in Proxy-based taint tracker.
+    // Intercepts every property access on the input object and its nested values.
     let trackedInput = input.value;
     if (trackedInput && typeof trackedInput === 'object' && !Buffer.isBuffer(trackedInput)) {
       try {
@@ -249,23 +256,37 @@ export class Instrumentation {
       }
     }
 
+    // Layer 2b: V8 prototype chain interception.
+    // Inserts a Proxy sentinel into the prototype chain of the input and all
+    // reachable nested objects. Fires on every property lookup that traverses
+    // past the object's own properties — catching library-internal lookups on
+    // objects we did NOT explicitly wrap with a taint proxy.
+    const protoLog = [];
+    if (trackedInput && typeof trackedInput === 'object') {
+      try {
+        const hooked = hookAll(trackedInput, protoLog, { maxDepth: 3, label: 'input' });
+        logger.debug(`V8 proto intercept: hooked ${hooked} objects`);
+      } catch (error) {
+        logger.debug(`V8 proto intercept setup failed: ${error.message}`);
+      }
+    }
+
     // Also set up old-style prototype/property hooks for compatibility
     this.setupPropertyTracing(trace);
     this.setupPrototypeTracing(trace);
 
-    // Execute with the tainted input
+    // Execute with the tainted (and now proto-intercepted) input
     await this.executeInput(
       { ...input, value: trackedInput },
       config,
       trace
     );
 
-    // Analyze taint log
+    // Analyze Layer 2a: Proxy taint log
     if (taintLog.length > 0) {
       trace.taintAnalysis = analyzeTaintLog(taintLog);
 
       // Convert taint events to trace-compatible property accesses
-      // so the existing gadget analysis can use them
       for (const event of taintLog) {
         if (event.type === 'get') {
           trace.propertyAccesses.push({
@@ -288,6 +309,77 @@ export class Instrumentation {
         }
       }
     }
+
+    // Analyze Layer 2b: V8 prototype chain intercept log
+    if (protoLog.length > 0) {
+      trace.protoInterceptAnalysis = analyzeProtoLog(protoLog);
+
+      // Merge V8-intercept UOP candidates into property accesses so
+      // gadget-analysis can see them alongside proxy-based results
+      for (const candidate of trace.protoInterceptAnalysis.uopCandidates) {
+        trace.propertyAccesses.push({
+          type: 'v8_proto_intercept',
+          object: candidate.label,
+          property: candidate.property,
+          timestamp: candidate.timestamp,
+          result: undefined,
+          isUOPCandidate: true,
+          isPrototypeChainLookup: false
+        });
+      }
+    }
+  }
+
+  /**
+   * Rewrite library source with AST-level taint instrumentation (Layer 2c).
+   *
+   * Called once per target library after the source is loaded. Returns an
+   * instrumented copy of the source where every MemberExpression is wrapped
+   * with __tg/__tc/__ts tracking helpers. This catches taint through:
+   *   - Primitive property accesses (e.g. str.length, str.toUpperCase())
+   *     that Proxy cannot intercept because primitives cannot be proxied
+   *   - Library-internal property accesses on objects never passed through
+   *     the fuzzer's taint proxy
+   *
+   * @param {string} source - Raw JS source of the target library
+   * @param {object} [opts] - Options forwarded to rewriteSource
+   * @returns {{ ok: boolean, instrumented: string|null, error: string|null }}
+   */
+  rewriteLibrarySource(source, opts = {}) {
+    try {
+      const result = rewriteSource(source, opts);
+      if (result.ok) {
+        logger.debug('AST taint rewriter: source instrumented successfully');
+      } else {
+        logger.debug(`AST taint rewriter: partial instrumentation — ${result.error}`);
+      }
+      return result;
+    } catch (error) {
+      logger.debug(`AST taint rewriter failed: ${error.message}`);
+      return { ok: false, instrumented: null, error: error.message };
+    }
+  }
+
+  /**
+   * Execute pre-instrumented library source and collect AST taint events.
+   * Complements executeInputWithTaintTracking by running the instrumented
+   * version of the library, capturing taint through primitives.
+   *
+   * @param {string} instrumentedSource - Output of rewriteLibrarySource
+   * @param {Function} entryFn - Function that calls the instrumented library
+   * @returns {{ analysis: object|null, log: Array }}
+   */
+  async executeWithASTTaintTracking(instrumentedSource, entryFn) {
+    const astLog = [];
+    try {
+      // Inject the log array into the instrumented scope, then run
+      const wrappedFn = new Function('__astTaintLog', `${instrumentedSource}\nreturn (${entryFn.toString()})(__astTaintLog);`);
+      await wrappedFn(astLog);
+    } catch (error) {
+      logger.debug(`AST taint execution failed: ${error.message}`);
+    }
+    const analysis = astLog.length > 0 ? analyzeASTTaintLog(astLog) : null;
+    return { analysis, log: astLog };
   }
 
   /**
