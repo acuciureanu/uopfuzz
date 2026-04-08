@@ -41,6 +41,9 @@ async function executeClean(fn, args, timeoutMs = 5000) {
     });
     const execution = Promise.resolve(fn(...trackedArgs));
     result.output = await Promise.race([execution, timeout]);
+    // Drain microtask queue for consistent comparison with polluted run
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
   } catch (error) {
     result.error = error.message;
   } finally {
@@ -55,30 +58,45 @@ async function executeClean(fn, args, timeoutMs = 5000) {
 }
 
 /**
- * Snapshot all own properties of Object.prototype.
- * Returns a Map<propertyName, {had: boolean, value: any}>.
+ * Snapshot all own properties of Object.prototype AND other critical prototypes.
+ * GHunter (USENIX Security 2024) found that pollution of Function.prototype,
+ * Array.prototype, and String.prototype is a real attack vector — e.g.,
+ * polluting Array.prototype.join with eval triggers code execution on any
+ * [].join() call.
  */
+const MONITORED_PROTOTYPES = [
+  { name: 'Object', proto: Object.prototype },
+  { name: 'Function', proto: Function.prototype },
+  { name: 'Array', proto: Array.prototype },
+  { name: 'String', proto: String.prototype },
+];
+
 function snapshotPrototype() {
   const snap = new Map();
-  for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-    snap.set(key, { had: true, value: Object.prototype[key] });
+  for (const { name, proto } of MONITORED_PROTOTYPES) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      snap.set(`${name}.${key}`, { had: true, value: proto[key], proto: name });
+    }
   }
   return snap;
 }
 
 /**
- * Detect and clean up any properties added to Object.prototype since snapshot.
+ * Detect and clean up any properties added to ANY monitored prototype since snapshot.
  * Returns { polluted: boolean, newProps: string[] }.
  */
 function detectAndRestorePrototype(snapshot) {
   let polluted = false;
   const newProps = [];
 
-  for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-    if (!snapshot.has(key)) {
-      polluted = true;
-      newProps.push(key);
-      try { delete Object.prototype[key]; } catch { /* sealed */ }
+  for (const { name, proto } of MONITORED_PROTOTYPES) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      const snapKey = `${name}.${key}`;
+      if (!snapshot.has(snapKey)) {
+        polluted = true;
+        newProps.push(`${name}.prototype.${key}`);
+        try { delete proto[key]; } catch { /* sealed */ }
+      }
     }
   }
 
@@ -114,18 +132,38 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
 
   const snapshot = snapshotPrototype();
 
-  // Active getter trap: records when Object.prototype[prop] is read on ANY object,
-  // not just on the taint-proxied input args. This catches gadgets where the
-  // library reads from Object.prototype on internally-created objects (e.g., plain
-  // option objects, merge targets, DOM-adjacent data structures).
+  // Context-aware getter trap: records when Object.prototype[prop] is read on
+  // ANY object, and returns the MOST USEFUL value depending on read context.
+  //
+  // Problem: simple traps return a fixed value. But real gadgets may read the
+  // same property twice:
+  //   if (opts.debug) {           // 1st read: expects truthy
+  //     const cmd = opts.debug;   // 2nd read: expects string
+  //     eval(cmd);
+  //   }
+  //
+  // Solution: first read returns the actual payload value. If the payload is a
+  // string (RCE payload), the trap also satisfies boolean truthiness checks.
+  // If the payload is boolean, we return it consistently.
+  //
+  // For extra coverage, the trap logs each read with a count so the analysis
+  // layer can detect multi-read patterns.
   let trapFired = false;
+  let trapReadCount = 0;
   let trapVal = val;
 
   let timer;
   try {
     try {
       Object.defineProperty(Object.prototype, prop, {
-        get() { trapFired = true; return trapVal; },
+        get() {
+          trapFired = true;
+          trapReadCount++;
+          // For RCE string payloads, they're already truthy (non-empty strings).
+          // For boolean payloads, return as-is.
+          // For function payloads, return as-is (truthy + callable).
+          return trapVal;
+        },
         set(v) { trapFired = true; trapVal = v; },
         configurable: true,
         enumerable: false,
@@ -140,6 +178,13 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
     });
     const execution = Promise.resolve(fn(...trackedArgs));
     result.output = await Promise.race([execution, timeout]);
+
+    // Drain microtask queue: some libraries schedule reads via Promise.resolve().then()
+    // or process.nextTick(). Without draining, the getter trap is torn down before the
+    // async read fires, causing false negatives for async gadgets.
+    // Two rounds of microtask drain catches .then().then() chains (depth 2).
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
   } catch (error) {
     result.error = error.message;
   } finally {
@@ -170,6 +215,7 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
     e => e.type === 'get' && e.property === prop && (e.isPrototypeChainLookup || e.isUOPCandidate)
   );
   result.pollutionWasRead = trapFired || taintSignal;
+  result.trapReadCount = trapReadCount; // How many times the trap fired (multi-read detection)
 
   return result;
 }
@@ -552,6 +598,142 @@ export async function executeDifferential(fn, args, pollutionDescriptor, timeout
     polluted: pollutedResult,
     diff
   };
+}
+
+/**
+ * Forced Branch Execution — inspired by Dasty (KTH, WWW 2024).
+ *
+ * Many gadgets are guarded by boolean checks:
+ *   if (opts.debug) { eval(opts.template); }
+ *
+ * Normal differential testing misses these because the gate property (debug)
+ * is falsy in clean execution, so the sink (eval) is never reached.
+ *
+ * Solution: co-pollute known "gate" properties (debug, verbose, cache, strict,
+ * client, etc.) with `true` alongside the actual payload property. This forces
+ * guarded branches open, exposing sinks that normal execution never reaches.
+ *
+ * Dasty found 67 additional exploitable packages using this technique.
+ *
+ * @param {Function} fn - Entry point function
+ * @param {Array} args - Arguments
+ * @param {object} pollutionDescriptor - { property, value } — the payload
+ * @param {number} timeoutMs
+ * @returns {object} Differential result with forced branch info
+ */
+const GATE_PROPERTIES = [
+  'debug', 'compileDebug', 'verbose', 'cache', 'client', 'strict',
+  'self', 'async', 'raw', 'unsafe', 'dev', 'development', 'production',
+  'allowDots', 'allowPrototypes', 'pretty', 'rmWhitespace',
+];
+
+export async function executeForcedBranchDifferential(fn, args, pollutionDescriptor, timeoutMs = 5000) {
+  const cleanResult = await executeClean(fn, args, timeoutMs);
+
+  // Polluted execution with GATE PROPERTIES forced to true
+  const taintLog = [];
+  const sinkAccesses = [];
+  const result = {
+    output: null, error: null, sinkAccesses, taintLog, taintAnalysis: null,
+    pollutionWasRead: false,
+    prototypePolluted: false,
+    pollutedProperties: [],
+    forcedGates: [],
+  };
+
+  const trackedArgs = args.map(arg => {
+    if (arg && typeof arg === 'object' && !Buffer.isBuffer(arg)) {
+      try { return createTaintProxy(arg, taintLog); } catch { return arg; }
+    }
+    return arg;
+  });
+
+  const prop = pollutionDescriptor.property;
+  const val = pollutionDescriptor.value;
+  const snapshot = snapshotPrototype();
+
+  // Track all installed traps for cleanup
+  const installedTraps = new Map(); // property -> { hadProperty, originalValue }
+
+  let timer;
+  try {
+    // Install the main payload trap
+    const mainTrap = installTrap(prop, val);
+    installedTraps.set(prop, mainTrap);
+
+    // Force all gate properties to `true` (except the payload property itself)
+    for (const gate of GATE_PROPERTIES) {
+      if (gate === prop) continue; // Don't override the actual payload
+      const gateTrap = installTrap(gate, true);
+      installedTraps.set(gate, gateTrap);
+      result.forcedGates.push(gate);
+    }
+
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
+    });
+    result.output = await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
+
+    // Drain microtask queue
+    await new Promise(r => setTimeout(r, 0));
+    await new Promise(r => setTimeout(r, 0));
+  } catch (error) {
+    result.error = error.message;
+  } finally {
+    clearTimeout(timer);
+
+    // Restore all traps
+    for (const [trapProp, state] of installedTraps) {
+      try { delete Object.prototype[trapProp]; } catch { /* sealed */ }
+      if (state.hadProperty) {
+        try { Object.prototype[trapProp] = state.originalValue; } catch { /* sealed */ }
+      }
+    }
+
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) {
+      result.prototypePolluted = true;
+      result.pollutedProperties = detection.newProps;
+    }
+  }
+
+  // Check which traps fired
+  const mainState = installedTraps.get(prop);
+  result.pollutionWasRead = mainState?.fired || false;
+  result.forcedGatesFired = [...installedTraps.entries()]
+    .filter(([p, s]) => p !== prop && s.fired)
+    .map(([p]) => p);
+
+  if (taintLog.length > 0) {
+    result.taintAnalysis = analyzeTaintLog(taintLog);
+  }
+
+  const diff = diffResults(cleanResult, result, pollutionDescriptor);
+  diff.details.forcedBranch = true;
+  diff.details.forcedGates = result.forcedGates;
+  diff.details.forcedGatesFired = result.forcedGatesFired;
+
+  return { clean: cleanResult, polluted: result, diff };
+}
+
+/** Install a getter/setter trap on Object.prototype and return cleanup state. */
+function installTrap(prop, val) {
+  const hadProperty = Object.prototype.hasOwnProperty.call(Object.prototype, prop);
+  const originalValue = Object.prototype[prop];
+  const state = { hadProperty, originalValue, fired: false, trapVal: val };
+
+  try {
+    Object.defineProperty(Object.prototype, prop, {
+      get() { state.fired = true; return state.trapVal; },
+      set(v) { state.fired = true; state.trapVal = v; },
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    Object.prototype[prop] = val;
+  }
+
+  return state;
 }
 
 /**

@@ -2,7 +2,7 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
-import { executeDifferential, executeMultiPropertyDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
+import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
 import { executeInSandbox } from '../utils/sandbox.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
@@ -411,6 +411,31 @@ export class Instrumentation {
       return null;
     } catch (error) {
       logger.debug(`Sandboxed differential error: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Forced branch execution: co-pollute boolean gate properties (debug, client,
+   * strict, etc.) alongside the payload property to force guarded code paths open.
+   * Inspired by Dasty (KTH, WWW 2024) — found 67 additional exploitable packages.
+   */
+  async executeForcedBranchDifferentialTracing(input, config, pollutionDescriptor) {
+    if (this.options.dryRun) return null;
+    if (!this.targetModule) return null;
+
+    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const fn = this.buildCallableThunk(input, config, sequence);
+    if (!fn) return null;
+
+    const args = sequence
+      ? this.buildCallArgs(sequence.steps[0], input, config)
+      : (input.type === 'template' ? [input.value] : [input.value]);
+
+    try {
+      return await executeForcedBranchDifferential(fn, args, pollutionDescriptor, DIFF_CALL_TIMEOUT_MS);
+    } catch (error) {
+      logger.debug(`Forced branch differential failed: ${error.message}`);
       return null;
     }
   }

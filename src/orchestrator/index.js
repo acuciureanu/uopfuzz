@@ -227,26 +227,47 @@ export class Orchestrator {
         const iterationTime = Date.now() - iterationStart;
         logger.debug(`Iteration ${iteration + 1}/${maxIterations} completed in ${iterationTime}ms`);
 
-        // Convergence detection — scale thresholds with maxIterations so short
-        // runs (e.g. mass scan --max-iterations 15) still exit early.
-        // MIN before triggering: 30% of maxIterations, clamped [3, 20]
-        // Consecutive window: 10% of maxIterations, clamped [2, 10]
-        // Saturation threshold: 95% (relaxed from 98% to handle oscillating libs)
+        // Convergence detection — DUAL metric: both coverage AND gadget discovery rate.
+        // Synthetic coverage alone is unreliable (exits too early, missing gadgets).
+        // We require BOTH:
+        //   1. Coverage saturation (>95%) — no new code paths being discovered
+        //   2. No new gadgets in last N iterations — gadget search is exhausted
+        // This prevents premature exit when coverage saturates but gadgets remain undiscovered.
         const saturation = this.instrumentation.getCoverageTracker().getSaturationRate();
-        const MIN_ITERATIONS_BEFORE_CONVERGENCE = Math.min(20, Math.max(3, Math.floor(maxIterations * 0.3)));
-        const CONVERGENCE_WINDOW = Math.min(10, Math.max(2, Math.floor(maxIterations * 0.1)));
-        if (saturation > 0.95 && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
+        const MIN_ITERATIONS_BEFORE_CONVERGENCE = Math.min(20, Math.max(5, Math.floor(maxIterations * 0.3)));
+        const CONVERGENCE_WINDOW = Math.min(10, Math.max(3, Math.floor(maxIterations * 0.1)));
+
+        // Track gadget discovery rate
+        const currentGadgetCount = (this.results.confirmedChains || []).length;
+        if (!this._lastGadgetCount) this._lastGadgetCount = 0;
+        if (!this._iterationsSinceLastGadget) this._iterationsSinceLastGadget = 0;
+
+        if (currentGadgetCount > this._lastGadgetCount) {
+          this._lastGadgetCount = currentGadgetCount;
+          this._iterationsSinceLastGadget = 0;
+          consecutiveSaturatedIterations = 0; // Reset — new gadget found
+        } else {
+          this._iterationsSinceLastGadget++;
+        }
+
+        // Both conditions must be true to converge
+        const coverageSaturated = saturation > 0.95;
+        const gadgetSearchExhausted = this._iterationsSinceLastGadget >= CONVERGENCE_WINDOW * 2;
+
+        if (coverageSaturated && gadgetSearchExhausted && iteration >= MIN_ITERATIONS_BEFORE_CONVERGENCE) {
           consecutiveSaturatedIterations++;
           if (consecutiveSaturatedIterations >= CONVERGENCE_WINDOW) {
-            logger.info(`Coverage saturated at ${(saturation * 100).toFixed(1)}% after ${iteration + 1} iterations`);
+            logger.info(`Converged: coverage ${(saturation * 100).toFixed(1)}%, no new gadgets in ${this._iterationsSinceLastGadget} iterations`);
             this.results.convergenceInfo = {
               convergedAt: iteration + 1,
               saturationRate: saturation,
-              reason: 'coverage_saturation'
+              gadgetCount: currentGadgetCount,
+              iterationsSinceLastGadget: this._iterationsSinceLastGadget,
+              reason: 'coverage_and_gadget_saturation'
             };
             break;
           }
-        } else if (saturation <= 0.95) {
+        } else if (!coverageSaturated || !gadgetSearchExhausted) {
           consecutiveSaturatedIterations = 0;
         }
 
@@ -548,6 +569,53 @@ export class Orchestrator {
               }
               confirmed = true;
               break;
+            }
+          }
+          // Mode 4: Forced branch execution (Dasty technique)
+          // If standard differential didn't confirm, try forcing boolean gate
+          // properties to true alongside the payload. This opens guarded code paths
+          // like: if (opts.debug) { eval(opts.template); }
+          if (!confirmed && !epIsUrlSink) {
+            const forcedResult = await this.instrumentation.executeForcedBranchDifferentialTracing(
+              testInput, this.config, descriptor
+            );
+            if (forcedResult) {
+              const forcedChain = this.gadgetAnalysis.analyzeDifferentialResult(
+                forcedResult, testInput, this.config
+              );
+              if (forcedChain) {
+                this._confirmedSignatures.add(sig);
+                forcedChain.forcedBranch = true;
+                forcedChain.forcedGates = forcedResult.diff?.details?.forcedGatesFired || [];
+
+                // Verify exploit for forced-branch findings
+                if (forcedChain.confidence >= 0.75) {
+                  try {
+                    const verification = await this.instrumentation.verifyGadgetExploit(
+                      testInput, this.config, descriptor.property
+                    );
+                    if (verification?.verified) {
+                      forcedChain.exploitVerified = true;
+                      forcedChain.exploitProof = verification.executionProof;
+                      forcedChain.confidence = Math.min(1.0, forcedChain.confidence + 0.10);
+                    }
+                  } catch { /* verification optional */ }
+                }
+
+                this.results.confirmedChains.push(forcedChain);
+                this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+                this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+                logger.warn(
+                  `CONFIRMED GADGET (FORCED BRANCH): Object.prototype.${descriptor.property} ` +
+                  `-> ${forcedChain.sink?.name || 'behavioral change'} ` +
+                  `(gates: ${forcedChain.forcedGates.join(',') || 'none'}, ` +
+                  `confidence: ${(forcedChain.confidence * 100).toFixed(0)}%)` +
+                  `${forcedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
+                );
+                confirmed = true;
+                break;
+              }
             }
           }
         } catch (error) {

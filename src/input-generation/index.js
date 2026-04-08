@@ -1,4 +1,5 @@
 import { logger } from '../utils/logger.js';
+import { getKnownProperties, getGadgetsForPackage } from '../gadget-analysis/known-gadgets.js';
 
 // Pre-allocated constant — avoids recreating this array on every call.
 // Covers multiple library categories derived from known CVEs across npm.
@@ -872,6 +873,13 @@ export class InputGeneration {
 
   /**
    * Get prioritized list of properties to try polluting.
+   *
+   * Priority order:
+   * 1. Known-gadget properties for this specific package (proven CVEs)
+   * 2. UOP properties discovered from actual execution (taint proxy)
+   * 3. Config-defined pollution points
+   * 4. Generic cross-category properties
+   * 5. Full known-gadget property database (all packages)
    */
   getPollutionProperties(config) {
     const seen = new Set();
@@ -884,14 +892,24 @@ export class InputGeneration {
       }
     };
 
-    // Highest priority: UOP properties discovered from actual execution
+    // Top priority: known CVE gadget properties for THIS specific package
+    const packageGadgets = getGadgetsForPackage(config.name || config.package || '');
+    for (const gadget of packageGadgets) {
+      const prop = gadget.property || gadget.payload?.property;
+      if (prop) addUnique(prop);
+    }
+
+    // High priority: UOP properties discovered from actual execution
     for (const prop of this.discoveredUOPProperties) addUnique(prop);
 
     // Medium priority: config-defined pollution points
     for (const prop of (config.pollutionPoints || [])) addUnique(prop);
 
-    // Low priority: generic high-value targets for template engines
+    // Standard priority: generic high-value targets across library categories
     for (const prop of GENERIC_POLLUTION_PROPS) addUnique(prop);
+
+    // Low priority: comprehensive known-gadget property database (all packages)
+    for (const prop of getKnownProperties()) addUnique(prop);
 
     return properties;
   }

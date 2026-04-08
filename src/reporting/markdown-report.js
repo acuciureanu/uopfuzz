@@ -1,3 +1,5 @@
+import { benchmarkDetection, getGadgetsForPackage } from '../gadget-analysis/known-gadgets.js';
+
 /**
  * Markdown Report Generator
  *
@@ -220,6 +222,34 @@ export function generateSingleReport(results, config) {
     }
     md += '\n';
     md += `**Seed corpus:** ${se.seedCount || 0} seeds | **Entropy:** ${(se.corpusEntropy || 0).toFixed(3)} bits\n\n`;
+  }
+
+  // ── Known Gadget Benchmark ───────────────────────────────────────────────────
+  const knownGadgets = getGadgetsForPackage(libName);
+  if (knownGadgets.length > 0) {
+    const benchmark = benchmarkDetection(confirmedChains, libName);
+    md += `## Known Gadget Benchmark\n\n`;
+    md += `Comparing results against ${knownGadgets.length} publicly documented vulnerabilities for \`${libName}\`.\n\n`;
+    md += `| Metric | Value |\n|--------|-------|\n`;
+    md += `| Known vulnerabilities | ${knownGadgets.length} |\n`;
+    md += `| Detected | ${benchmark.detected.length} |\n`;
+    md += `| Missed | ${benchmark.missed.length} |\n`;
+    md += `| Detection rate | ${(benchmark.detectionRate * 100).toFixed(0)}% |\n\n`;
+
+    if (benchmark.detected.length > 0) {
+      md += `**Detected:**\n`;
+      for (const g of benchmark.detected) {
+        md += `- \`${g.property || g.function}\` (${g.cve || 'no CVE'}) — ${g.impact}\n`;
+      }
+      md += '\n';
+    }
+    if (benchmark.missed.length > 0) {
+      md += `**Missed (may require more iterations or different payload):**\n`;
+      for (const g of benchmark.missed) {
+        md += `- \`${g.property || g.function}\` (${g.cve || 'no CVE'}) — ${g.description || g.impact}\n`;
+      }
+      md += '\n';
+    }
   }
 
   // ── Unconfirmed Candidates ───────────────────────────────────────────────────

@@ -66,6 +66,59 @@ try {
   }
 } catch { /* child_process not available */ }
 
+// ─── SECURITY: Sink interception ─────────────────────────────
+// Intercept dangerous sinks to detect when polluted values reach them.
+// These are NOT blocked — they execute normally — but accesses are logged
+// so the differential oracle can detect new sink activity.
+const sinkLog = [];
+
+// Hook eval() — the most common PP gadget target
+const originalEval = globalThis.eval;
+globalThis.eval = function(code) {
+  sinkLog.push({ sink: 'eval', args: [String(code).substring(0, 200)], timestamp: Date.now() });
+  return originalEval.call(this, code);
+};
+
+// Hook Function() constructor — second most common RCE sink
+const OriginalFunction = globalThis.Function;
+globalThis.Function = function(...args) {
+  sinkLog.push({ sink: 'Function', args: args.map(a => String(a).substring(0, 200)), timestamp: Date.now() });
+  return new OriginalFunction(...args);
+};
+// Preserve prototype chain
+globalThis.Function.prototype = OriginalFunction.prototype;
+
+// Hook setTimeout/setInterval with string args (equivalent to eval)
+const originalSetTimeout = globalThis.setTimeout;
+globalThis.setTimeout = function(fn, delay, ...args) {
+  if (typeof fn === 'string') {
+    sinkLog.push({ sink: 'setTimeout', args: [fn.substring(0, 200)], timestamp: Date.now() });
+  }
+  return originalSetTimeout.call(this, fn, delay, ...args);
+};
+
+const originalSetInterval = globalThis.setInterval;
+globalThis.setInterval = function(fn, delay, ...args) {
+  if (typeof fn === 'string') {
+    sinkLog.push({ sink: 'setInterval', args: [fn.substring(0, 200)], timestamp: Date.now() });
+  }
+  return originalSetInterval.call(this, fn, delay, ...args);
+};
+
+// Hook vm module (code execution in sandbox context)
+try {
+  const vm = require('vm');
+  for (const method of ['runInThisContext', 'runInNewContext', 'compileFunction']) {
+    if (vm[method]) {
+      const orig = vm[method];
+      vm[method] = function(...args) {
+        sinkLog.push({ sink: `vm.${method}`, args: [String(args[0]).substring(0, 200)], timestamp: Date.now() });
+        return orig.apply(this, args);
+      };
+    }
+  }
+} catch { /* vm not available */ }
+
 // ─── MESSAGE HANDLER ─────────────────────────────────────────
 process.on('message', async (msg) => {
   const { mode, packageName, entryPoint, args, timeoutMs, pollution } = msg;
@@ -156,11 +209,14 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
 
   // Clean execution
   let cleanOutput, cleanError;
+  const cleanStartTime = Date.now();
+  sinkLog.length = 0; // Clear any previous sink logs
   try {
     cleanOutput = safeSerialize(await withTimeout(fn(...args), timeoutMs));
   } catch (err) {
     cleanError = err.message;
   }
+  const cleanSinkCount = sinkLog.length;
 
   // Snapshot Object.prototype
   const snapshot = new Map();
@@ -214,6 +270,14 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
     }
   }
 
+  // Separate sink accesses: entries [0..cleanSinkCount) are from clean execution,
+  // entries [cleanSinkCount..) are from polluted execution
+  const cleanSinks = sinkLog.slice(0, cleanSinkCount);
+  const pollutedSinks = sinkLog.slice(cleanSinkCount);
+  const newSinkAccesses = pollutedSinks.filter(ps =>
+    !cleanSinks.some(cs => cs.sink === ps.sink)
+  );
+
   return {
     clean: { output: cleanOutput, error: cleanError },
     polluted: { output: pollutedOutput, error: pollutedError },
@@ -222,6 +286,8 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
     prototypePolluted: pollutedProperties.length > 0,
     pollutedProperties,
     pollutionWasRead: trapFired,
+    sinkAccesses: pollutedSinks,
+    newSinkAccesses,
   };
 }
 
