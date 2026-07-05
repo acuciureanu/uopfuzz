@@ -1,5 +1,6 @@
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { logger } from '../utils/logger.js';
+import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
 
 /**
  * Differential Execution Oracle
@@ -58,50 +59,13 @@ async function executeClean(fn, args, timeoutMs = 5000) {
 }
 
 /**
- * Snapshot all own properties of Object.prototype AND other critical prototypes.
- * GHunter (USENIX Security 2024) found that pollution of Function.prototype,
- * Array.prototype, and String.prototype is a real attack vector — e.g.,
- * polluting Array.prototype.join with eval triggers code execution on any
- * [].join() call.
+ * Prototype snapshot/detect/restore is provided by ../utils/prototype-monitor.js
+ * (imported above) so the in-process oracle and the sandbox child process share
+ * one implementation and cannot drift. It monitors Object, Function, Array, and
+ * String prototypes and records key presence only — never reads property values,
+ * which would throw on Function.prototype's poisoned `caller`/`arguments`
+ * accessors under strict mode.
  */
-const MONITORED_PROTOTYPES = [
-  { name: 'Object', proto: Object.prototype },
-  { name: 'Function', proto: Function.prototype },
-  { name: 'Array', proto: Array.prototype },
-  { name: 'String', proto: String.prototype },
-];
-
-function snapshotPrototype() {
-  const snap = new Map();
-  for (const { name, proto } of MONITORED_PROTOTYPES) {
-    for (const key of Object.getOwnPropertyNames(proto)) {
-      snap.set(`${name}.${key}`, { had: true, value: proto[key], proto: name });
-    }
-  }
-  return snap;
-}
-
-/**
- * Detect and clean up any properties added to ANY monitored prototype since snapshot.
- * Returns { polluted: boolean, newProps: string[] }.
- */
-function detectAndRestorePrototype(snapshot) {
-  let polluted = false;
-  const newProps = [];
-
-  for (const { name, proto } of MONITORED_PROTOTYPES) {
-    for (const key of Object.getOwnPropertyNames(proto)) {
-      const snapKey = `${name}.${key}`;
-      if (!snapshot.has(snapKey)) {
-        polluted = true;
-        newProps.push(`${name}.prototype.${key}`);
-        try { delete proto[key]; } catch { /* sealed */ }
-      }
-    }
-  }
-
-  return { polluted, newProps };
-}
 
 /**
  * Execute with Object.prototype pollution active.

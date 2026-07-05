@@ -496,13 +496,15 @@ export class Instrumentation {
     const pkgBase = config.package?.split('@')[0];
     const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
 
+    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
+
     if (canSandbox) {
-      const mergeInput = {
-        ...input,
-        value: JSON.parse(`{"__proto__":{"${descriptor.property}":${JSON.stringify(descriptor.value)}}}`),
-      };
-      const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
-      return this._sandboxedDifferential(config.package, mergeInput, descriptor, timeoutMs);
+      // Use the worker's dedicated 'merge_pp' mode, which tries the real
+      // calling conventions (fn({}, payload), fn(true, {}, payload), path-based
+      // set, etc.). Routing this through generic 'differential' mode would call
+      // fn(payload) with a single argument, which never triggers merge-based
+      // pollution (e.g. lodash.merge needs a target object as arg 0).
+      return this._sandboxedMergePP(config.package, input.entryPoint, descriptor, timeoutMs);
     }
 
     if (!this.targetModule) return null;
@@ -510,13 +512,63 @@ export class Instrumentation {
     const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
     if (!rawFn) return null;
 
-    const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
-
     try {
       logger.debug(`MergePP testing entry point: ${input.entryPoint} (fn=${rawFn?.name || 'anonymous'})`);
       return await executeMergePPTest(rawFn, [{}], descriptor.property, descriptor.value, timeoutMs);
     } catch (error) {
       logger.debug(`Merge PP test failed for ${input.entryPoint}: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Sandboxed merge-PP test via the worker's 'merge_pp' mode.
+   * Translates the worker's { pollutionDetected, pollutedProperties } into the
+   * diff shape gadget-analysis expects (mirrors executeMergePPTest's return).
+   */
+  async _sandboxedMergePP(packageName, entryPoint, descriptor, timeoutMs) {
+    try {
+      const safeDescriptor = {
+        property: descriptor.property,
+        value: typeof descriptor.value === 'function' ? '__UOPFUZZ_MARKER_7f3a__' : descriptor.value,
+      };
+
+      const result = await executeInSandbox(packageName, entryPoint, [{}], {
+        timeoutMs,
+        blockNetwork: this.options.blockNetwork !== false,
+        pollution: safeDescriptor,
+        mode: 'merge_pp',
+      });
+
+      if (!result?.pollutionDetected) return null;
+
+      const pollutedProperties = result.pollutedProperties || [];
+      return {
+        clean: { output: null, error: null, sinkAccesses: [], taintLog: [] },
+        polluted: {
+          output: null, error: result.error || null, sinkAccesses: [], taintLog: [],
+          pollutionWasRead: false,
+          prototypePolluted: true,
+          pollutedProperties,
+        },
+        diff: {
+          property: pollutedProperties[0] || descriptor.property,
+          payload: descriptor.value,
+          isConfirmedGadget: true,
+          confidence: 0.95,
+          prototypePolluted: true,
+          pollutedProperties,
+          pollutionWasRead: false,
+          outputChanged: false,
+          errorChanged: false,
+          newSinkAccesses: [],
+          details: { payloadType: 'merge_pp', payloadReachedOutput: false, sandboxed: true },
+        },
+        output: null,
+        error: result.error || null,
+      };
+    } catch (error) {
+      logger.debug(`Sandboxed merge-PP error: ${error.message}`);
       return null;
     }
   }
