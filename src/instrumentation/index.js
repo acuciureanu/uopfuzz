@@ -371,8 +371,17 @@ export class Instrumentation {
         return null;
       }
 
-      // Translate sandbox result to the format gadget-analysis expects
+      // Translate sandbox result to the format gadget-analysis expects.
+      //
+      // ZERO-FP: the sandbox path no longer hardcodes isConfirmedGadget on a bare
+      // output/error diff (its old behavior — even looser than in-process). Only a
+      // REAL prototype mutation is a pollution candidate ('pp'); an output/error
+      // diff is a code-execution candidate ('rce') that must survive independent
+      // reproduction before it is ever reported as a vulnerability.
       if (result.outputChanged || result.errorChanged || result.prototypePolluted) {
+        const payloadReachedOutput = result.polluted?.output?.includes?.(String(descriptor.value)) &&
+          !result.clean?.output?.includes?.(String(descriptor.value));
+        const isPP = !!result.prototypePolluted;
         return {
           clean: { output: result.clean?.output, error: result.clean?.error, sinkAccesses: [], taintLog: [] },
           polluted: {
@@ -381,7 +390,7 @@ export class Instrumentation {
             sinkAccesses: [],
             taintLog: [],
             pollutionWasRead: true,
-            prototypePolluted: result.prototypePolluted || false,
+            prototypePolluted: isPP,
             pollutedProperties: result.pollutedProperties || [],
           },
           diff: {
@@ -391,17 +400,21 @@ export class Instrumentation {
             errorChanged: result.errorChanged || false,
             newSinkAccesses: [],
             pollutionWasRead: true,
-            prototypePolluted: result.prototypePolluted || false,
+            prototypePolluted: isPP,
             pollutedProperties: result.pollutedProperties || [],
-            isConfirmedGadget: true,
-            confidence: result.prototypePolluted ? 0.95 : (result.outputChanged ? 0.75 : 0.60),
+            // Only real mutation is a pre-confirmed pollution candidate; behavioral
+            // diffs are reproduction candidates, never confirmed here.
+            isConfirmedGadget: isPP,
+            isCandidate: !isPP,
+            proofType: isPP ? 'pp' : 'rce',
+            reproducible: true,
+            confidence: isPP ? 0.95 : (result.outputChanged ? 0.75 : 0.60),
             details: {
               cleanOutput: result.clean?.output?.substring?.(0, 500),
               pollutedOutput: result.polluted?.output?.substring?.(0, 500),
               cleanError: result.clean?.error,
               pollutedError: result.polluted?.error,
-              payloadReachedOutput: result.polluted?.output?.includes?.(String(descriptor.value)) &&
-                !result.clean?.output?.includes?.(String(descriptor.value)),
+              payloadReachedOutput,
               sandboxed: true,
             },
           },
@@ -555,6 +568,8 @@ export class Instrumentation {
           property: pollutedProperties[0] || descriptor.property,
           payload: descriptor.value,
           isConfirmedGadget: true,
+          proofType: 'pp',
+          reproducible: true,
           confidence: 0.95,
           prototypePolluted: true,
           pollutedProperties,

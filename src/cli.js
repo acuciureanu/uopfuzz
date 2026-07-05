@@ -92,17 +92,29 @@ program.action(async (options) => {
     logger.info(chalk.green.bold('Fuzzing session completed'));
     logger.info(`Results saved to: ${options.output}`);
 
-    const confirmed = results.confirmedChains?.length || 0;
-    const candidates = results.potentialChains?.length || 0;
+    const confirmedChains = results.confirmedChains || [];
+    const confirmed = confirmedChains.length;
+    const zerodays = confirmedChains.filter(c => c.novelty?.label === 'novel-0day').length;
+    const knownCves = confirmedChains.filter(c => c.novelty?.label === 'known-cve').length;
+    const unproven = (results.candidateChains?.length || 0);
 
     if (confirmed > 0) {
-      logger.warn(chalk.red.bold(`${confirmed} CONFIRMED gadget chains found`));
+      logger.warn(chalk.red.bold(
+        `${confirmed} PROVEN vulnerabilit${confirmed !== 1 ? 'ies' : 'y'} ` +
+        `(${zerodays} potential 0-day, ${knownCves} known CVE) — reproduced in fresh processes`
+      ));
+      for (const c of confirmedChains) {
+        const tag = c.novelty?.label === 'novel-0day'
+          ? chalk.red.bold(`POTENTIAL 0-DAY${c.novelty?.regressionSuspect ? ' (regression suspect)' : ''}`)
+          : chalk.yellow(`known CVE${c.novelty?.cve ? ' ' + c.novelty.cve : ''}`);
+        logger.warn(`  • ${tag}: Object.prototype.${c.source?.property} via ${c.input?.entryPoint} [${c.proof?.type}]`);
+      }
     }
-    if (candidates > 0) {
-      logger.info(`${candidates} unconfirmed candidates`);
+    if (unproven > 0) {
+      logger.info(`${unproven} unproven lead${unproven !== 1 ? 's' : ''} (did not reproduce — NOT vulnerabilities; see report)`);
     }
-    if (confirmed === 0 && candidates === 0) {
-      logger.info('No gadget chains found');
+    if (confirmed === 0) {
+      logger.info('No vulnerabilities reproduced');
     }
 
   } catch (error) {

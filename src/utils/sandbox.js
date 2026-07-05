@@ -43,10 +43,18 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
     blockNetwork = true,
     pollution = null,
     mode = 'execute', // 'execute' | 'differential' | 'discover_uop'
+    // Optional: run a different worker script (e.g. the independent reproduction
+    // worker) instead of the default sandbox worker. Kept as a passthrough so the
+    // fork/timeout/env-scrub plumbing is shared, without coupling the verdict
+    // logic of the two workers.
+    workerScript = 'sandbox-worker.js',
+    // Optional: extra IPC fields forwarded verbatim to the worker (e.g. the
+    // property/gates/value the reproduction worker needs).
+    extra = null,
   } = options;
 
   return new Promise((resolve, reject) => {
-    const workerPath = path.join(__dirname, 'sandbox-worker.js');
+    const workerPath = path.join(__dirname, workerScript);
 
     // Build environment for the child process
     const childEnv = { ...process.env };
@@ -135,6 +143,7 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
       args: serializeArgs(args),
       timeoutMs,
       pollution,
+      ...(extra || {}),
     });
   });
 }

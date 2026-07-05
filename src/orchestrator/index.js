@@ -8,6 +8,8 @@ import { InputGeneration } from '../input-generation/index.js';
 import { Instrumentation } from '../instrumentation/index.js';
 import { GadgetAnalysis } from '../gadget-analysis/index.js';
 import { generateSingleReport } from '../reporting/markdown-report.js';
+import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
+import { classifyFinding } from '../gadget-analysis/novelty.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -182,9 +184,15 @@ export class Orchestrator {
     const timeout = this.options.timeout * 1000;
     let consecutiveSaturatedIterations = 0;
 
-    // Track confirmed chains separately from candidates
+    // Track confirmed chains separately from candidates.
+    // confirmedChains → reproduction-PROVEN vulnerabilities only.
+    // candidateChains → discovery-oracle leads that did NOT reproduce
+    //                   independently (unproven; manual review, never "VULNERABLE").
     if (!this.results.confirmedChains) {
       this.results.confirmedChains = [];
+    }
+    if (!this.results.candidateChains) {
+      this.results.candidateChains = [];
     }
 
     for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -304,6 +312,118 @@ export class Orchestrator {
    * 2. Pollution Testing: For each candidate property × payload combination,
    *    run the differential oracle (clean vs polluted) and confirm gadgets.
    */
+  /**
+   * The zero-false-positive gate. A discovery-oracle result becomes a reported
+   * vulnerability ONLY if it reproduces independently in fresh child processes
+   * (real prototype mutation for proofType 'pp', canary code execution for 'rce').
+   * Otherwise it is recorded as an unproven candidate — never "VULNERABLE".
+   *
+   * @returns {Promise<boolean>} true if a proven vulnerability was recorded.
+   */
+  async proveAndRecord(diffResult, testInput, descriptor, extra = {}) {
+    const diff = diffResult?.diff;
+    if (!diff) return false;
+    if (!this.results.candidateChains) this.results.candidateChains = [];
+
+    const pkg = this.config.package;
+    const version = this.config.version;
+    const entryPoint = testInput.entryPoint;
+    const proofType = diff.proofType || (diff.prototypePolluted ? 'pp' : 'rce');
+
+    // Without an installable/require-able package we cannot reproduce in a fresh
+    // process, so we cannot prove it → record as a candidate, never confirm.
+    let proof = null;
+    if (pkg && diff.reproducible !== false) {
+      try {
+        if (proofType === 'pp') {
+          proof = await reproduceProto(pkg, entryPoint,
+            { property: descriptor.property, value: descriptor.value },
+            { version, blockNetwork: this.options.blockNetwork !== false });
+        } else {
+          const gates = extra.gates
+            || diff.details?.forcedGatesFired
+            || (extra.coPolluteProperties || []).filter(p => p !== descriptor.property);
+          proof = await reproduceRce(pkg, entryPoint,
+            { property: descriptor.property, gates, minimalArgs: [testInput.value ?? {}] },
+            { version, blockNetwork: this.options.blockNetwork !== false });
+        }
+      } catch (err) {
+        logger.debug(`Reproduction error for ${descriptor.property} via ${entryPoint}: ${err.message}`);
+      }
+    }
+
+    if (proof?.verified) {
+      // Build the chain object, forcing analyzeDifferentialResult to emit it.
+      diff.isConfirmedGadget = true;
+      const chain = this.gadgetAnalysis.analyzeDifferentialResult(diffResult, testInput, this.config);
+      if (!chain) return false;
+
+      // Normalize the displayed property to the bare attacker-supplied key
+      // (merge/URL diffs carry a fully-qualified "Object.prototype.x" name).
+      if (chain.source) chain.source.property = descriptor.property;
+
+      chain.novelty = classifyFinding(chain, { package: pkg, version });
+
+      // Report-level dedup by BUG identity so one merge/source bug does not
+      // surface once per property name tried. A PP source is identified by
+      // (entry point + advisory); an RCE gadget by (entry point + property).
+      if (!this._reportedSignatures) this._reportedSignatures = new Set();
+      const repSig = proofType === 'pp'
+        ? `pp:${entryPoint}:${chain.novelty?.cve || chain.novelty?.label}`
+        : `rce:${entryPoint}:${descriptor.property}`;
+      if (this._reportedSignatures.has(repSig)) {
+        this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+        return true; // same underlying bug already recorded
+      }
+      this._reportedSignatures.add(repSig);
+
+      chain.proof = {
+        type: proofType === 'pp' ? 'prototype-pollution' : 'code-execution',
+        verified: true,
+        runs: proof.runs,
+        newProps: proof.newProps || null,
+        canaryToken: proof.canary || null,
+        payloadType: proof.payloadType || null,
+        callConvention: proof.callConvention || null,
+      };
+      chain.standalonePoC = proof.standalonePoC || null;
+      chain.exploitVerified = proofType === 'rce';
+      Object.assign(chain, extra.chainMeta || {});
+
+      this.results.confirmedChains.push(chain);
+      this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+      this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+      const noveltyTag = chain.novelty.label === 'known-cve'
+        ? `KNOWN CVE${chain.novelty.cve ? ' ' + chain.novelty.cve : ''}`
+        : `POTENTIAL 0-DAY${chain.novelty.regressionSuspect ? ' (regression suspect)' : ''}`;
+      logger.warn(
+        `PROVEN ${chain.proof.type.toUpperCase()} [${noveltyTag}]: ` +
+        `Object.prototype.${descriptor.property} via ${entryPoint} ` +
+        `(reproduced ${proof.runs}× in fresh processes)`
+      );
+      return true;
+    }
+
+    // Not proven → unproven candidate (never counted as a vulnerability).
+    const candSig = `${proofType}:${descriptor.property}:${entryPoint}`;
+    if (!this.results.candidateChains.some(c => c.sig === candSig)) {
+      this.results.candidateChains.push({
+        sig: candSig,
+        property: descriptor.property,
+        entryPoint,
+        proofType,
+        confidence: diff.confidence || 0,
+        signal: diff.prototypePolluted ? 'prototype-mutation'
+          : diff.newSinkAccesses?.length ? 'new-sink'
+          : diff.outputChanged ? 'output-changed'
+          : diff.errorChanged ? 'error-changed' : 'property-read',
+        reason: pkg ? 'did-not-reproduce' : 'no-installable-package',
+      });
+    }
+    return false;
+  }
+
   async executeDifferentialPhase(inputs, iteration) {
     // UOP discovery: probe multiple diverse inputs to find property accesses.
     // Do this every 5 iterations, probing up to 3 different entry points.
@@ -462,46 +582,11 @@ export class Orchestrator {
             logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: NULL result (fn not found or threw)`);
           }
           if (diffResult) {
-            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: confirmed=${diffResult.diff?.isConfirmedGadget} read=${diffResult.diff?.pollutionWasRead} outChanged=${diffResult.diff?.outputChanged} errChanged=${diffResult.diff?.errorChanged}`);            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
-              diffResult, testInput, this.config
-            );
+            const d = diffResult.diff;
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: proofType=${d?.proofType} reproducible=${d?.reproducible} read=${d?.pollutionWasRead} outChanged=${d?.outputChanged} errChanged=${d?.errChanged}`);
 
-            if (confirmedChain) {
-              this._confirmedSignatures.add(sig);
-
-              // Attempt exploit verification for high-confidence gadgets
-              if (confirmedChain.confidence >= 0.75) {
-                try {
-                  const verification = await this.instrumentation.verifyGadgetExploit(
-                    testInput, this.config, descriptor.property
-                  );
-                  if (verification?.verified) {
-                    confirmedChain.exploitVerified = true;
-                    confirmedChain.exploitProof = verification.executionProof;
-                    confirmedChain.exploitPayloadType = verification.payloadType;
-                    confirmedChain.confidence = Math.min(1.0, confirmedChain.confidence + 0.10);
-                    logger.warn(`  EXPLOIT VERIFIED: ${verification.executionProof}`);
-                  }
-                } catch (err) {
-                  logger.debug(`Exploit verification error: ${err.message}`);
-                }
-              }
-
-              this.results.confirmedChains.push(confirmedChain);
-              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-              logger.warn(
-                `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
-                `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
-                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)` +
-                `${confirmedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
-              );
-              confirmed = true;
-              break; // No need to try more entry points or modes for this descriptor
-            } else if (diffResult.diff?.isCandidate) {
-              // Property was read via Object.prototype but no observable behavior change.
-              // Store as candidate for manual review.
+            // Feed the co-pollution phase with read-but-unchanged candidates.
+            if (d?.isCandidate) {
               if (!this.results.candidateProperties) this.results.candidateProperties = [];
               const candidateSig = `${descriptor.property}:${testInput.entryPoint}`;
               if (!this.results.candidateProperties.some(c => c.sig === candidateSig)) {
@@ -509,10 +594,15 @@ export class Orchestrator {
                   sig: candidateSig,
                   property: descriptor.property,
                   entryPoint: testInput.entryPoint,
-                  confidence: diffResult.diff.confidence,
+                  confidence: d.confidence,
                 });
-                logger.debug(`CANDIDATE: Object.prototype.${descriptor.property} read via ${testInput.entryPoint} (no behavior change)`);
               }
+            }
+
+            // ZERO-FP GATE: only reproduction can confirm.
+            if (d && (d.isConfirmedGadget || (d.isCandidate && d.reproducible))) {
+              confirmed = await this.proveAndRecord(diffResult, testInput, descriptor);
+              if (confirmed) { this._confirmedSignatures.add(sig); break; }
             }
           }
 
@@ -521,25 +611,9 @@ export class Orchestrator {
             testInput, this.config, descriptor
           );
 
-          if (mergeResult) {
-            const mergeChain = this.gadgetAnalysis.analyzeDifferentialResult(
-              mergeResult, testInput, this.config
-            );
-
-            if (mergeChain) {
-              this._confirmedSignatures.add(sig);
-              this.results.confirmedChains.push(mergeChain);
-              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-              logger.warn(
-                `CONFIRMED PROTOTYPE POLLUTION: ${descriptor.property} via merge payload ` +
-                `-> ${mergeChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
-                `(confidence: ${(mergeChain.confidence * 100).toFixed(0)}%)`
-              );
-              confirmed = true;
-              break; // No need to try more entry points or modes for this descriptor
-            }
+          if (mergeResult?.diff) {
+            confirmed = await this.proveAndRecord(mergeResult, testInput, descriptor);
+            if (confirmed) { this._confirmedSignatures.add(sig); break; }
           }
 
           // Mode 3: URL gadget test (URL query string → parser → target function)
@@ -547,30 +621,11 @@ export class Orchestrator {
             testInput, this.config, descriptor
           );
 
-          if (urlResult) {
-            const urlChain = this.gadgetAnalysis.analyzeDifferentialResult(
-              urlResult, testInput, this.config
-            );
-
-            if (urlChain) {
-              this._confirmedSignatures.add(sig);
-              this.results.confirmedChains.push(urlChain);
-              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-              const exploitURL = urlResult.diff?.details?.exploitURL || '';
-              logger.warn(
-                `CONFIRMED URL GADGET: ${descriptor.property} via ${testInput.entryPoint} ` +
-                `-> ${urlChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
-                `(confidence: ${(urlChain.confidence * 100).toFixed(0)}%)`
-              );
-              if (exploitURL) {
-                logger.warn(`  Exploit: ${exploitURL}`);
-              }
-              confirmed = true;
-              break;
-            }
+          if (urlResult?.diff) {
+            confirmed = await this.proveAndRecord(urlResult, testInput, descriptor);
+            if (confirmed) { this._confirmedSignatures.add(sig); break; }
           }
+
           // Mode 4: Forced branch execution (Dasty technique)
           // If standard differential didn't confirm, try forcing boolean gate
           // properties to true alongside the payload. This opens guarded code paths
@@ -579,43 +634,14 @@ export class Orchestrator {
             const forcedResult = await this.instrumentation.executeForcedBranchDifferentialTracing(
               testInput, this.config, descriptor
             );
-            if (forcedResult) {
-              const forcedChain = this.gadgetAnalysis.analyzeDifferentialResult(
-                forcedResult, testInput, this.config
-              );
-              if (forcedChain) {
-                this._confirmedSignatures.add(sig);
-                forcedChain.forcedBranch = true;
-                forcedChain.forcedGates = forcedResult.diff?.details?.forcedGatesFired || [];
-
-                // Verify exploit for forced-branch findings
-                if (forcedChain.confidence >= 0.75) {
-                  try {
-                    const verification = await this.instrumentation.verifyGadgetExploit(
-                      testInput, this.config, descriptor.property
-                    );
-                    if (verification?.verified) {
-                      forcedChain.exploitVerified = true;
-                      forcedChain.exploitProof = verification.executionProof;
-                      forcedChain.confidence = Math.min(1.0, forcedChain.confidence + 0.10);
-                    }
-                  } catch { /* verification optional */ }
-                }
-
-                this.results.confirmedChains.push(forcedChain);
-                this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-                this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-                logger.warn(
-                  `CONFIRMED GADGET (FORCED BRANCH): Object.prototype.${descriptor.property} ` +
-                  `-> ${forcedChain.sink?.name || 'behavioral change'} ` +
-                  `(gates: ${forcedChain.forcedGates.join(',') || 'none'}, ` +
-                  `confidence: ${(forcedChain.confidence * 100).toFixed(0)}%)` +
-                  `${forcedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
-                );
-                confirmed = true;
-                break;
-              }
+            const fd = forcedResult?.diff;
+            if (fd && (fd.isConfirmedGadget || (fd.isCandidate && fd.reproducible))) {
+              const gates = fd.details?.forcedGatesFired || [];
+              confirmed = await this.proveAndRecord(forcedResult, testInput, descriptor, {
+                gates,
+                chainMeta: { forcedBranch: true, forcedGates: gates },
+              });
+              if (confirmed) { this._confirmedSignatures.add(sig); break; }
             }
           }
         } catch (error) {
@@ -669,24 +695,21 @@ export class Orchestrator {
                 coTestInput, this.config, pairDescriptors
               );
 
-              if (multiResult?.diff?.isConfirmedGadget) {
-                const firedProps = multiResult.diff.details?.firedProperties || [];
+              const md = multiResult?.diff;
+              if (md && (md.isConfirmedGadget || (md.isCandidate && md.reproducible))) {
                 const combinedName = pairDescriptors.map(d => d.property).join('+');
                 const sig = `multi:${combinedName}`;
                 if (!this._confirmedSignatures.has(sig)) {
-                  this._confirmedSignatures.add(sig);
-                  const chain = this.gadgetAnalysis.analyzeDifferentialResult(
-                    multiResult, coTestInput, this.config
-                  );
-                  if (chain) {
-                    chain.multiProperty = true;
-                    chain.coPolluteProperties = pairDescriptors.map(d => d.property);
-                    this.results.confirmedChains.push(chain);
-                    logger.warn(
-                      `CONFIRMED MULTI-PROPERTY GADGET: ${combinedName} ` +
-                      `(fired: ${firedProps.join(', ')}, confidence: ${(chain.confidence * 100).toFixed(0)}%)`
-                    );
-                  }
+                  // Reproduce the conjunctive gadget: the second descriptor is the
+                  // payload property; the first is the gate (forced true).
+                  const payloadDesc = pairDescriptors[1];
+                  const gateProp = pairDescriptors[0].property;
+                  const proven = await this.proveAndRecord(multiResult, coTestInput, payloadDesc, {
+                    gates: [gateProp],
+                    coPolluteProperties: pairDescriptors.map(d => d.property),
+                    chainMeta: { multiProperty: true, coPolluteProperties: pairDescriptors.map(d => d.property) },
+                  });
+                  if (proven) this._confirmedSignatures.add(sig);
                 }
               }
             } catch (error) {

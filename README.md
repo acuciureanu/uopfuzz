@@ -6,6 +6,12 @@ A plug-and-play framework for Undefined-Oriented Programming (UOP) in prototype 
 
 UoPFuzz is a hybrid security research framework that combines fuzzing with concolic execution to detect and chain prototype pollution gadgets in JavaScript libraries. It focuses on Node.js environments to identify vulnerabilities leading to dangerous sinks like `eval` or `exec`.
 
+### Zero-false-positive reporting
+
+A finding is only reported as a **vulnerability** when it is *independently reproduced in fresh, isolated child processes* (twice) by a second oracle that computes ground-truth facts — either a **real prototype mutation** (an own-property added to a builtin prototype) or **real code execution** (a canary token reaching `globalThis` through a code sink). Behavioral heuristics (output/error changed, a property merely read) never confirm a vulnerability on their own; they are kept as clearly-labeled **unproven leads** for manual review. Every proven finding is cross-referenced against a built-in CVE database and labeled **KNOWN CVE** or **POTENTIAL 0-DAY**, and ships with a standalone, runnable PoC. See `src/verification/reproduce.js` and `tests/integration/zero-fp-validation.test.js`.
+
+> "Potential 0-day" means *not present in the built-in advisory database* — a candidate that still requires human verification against public advisories before disclosure. The tool files nothing externally on its own.
+
 ## Features
 
 - **Configuration-driven**: YAML-based target library definitions for plug-and-play usage

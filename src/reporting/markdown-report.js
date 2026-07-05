@@ -78,17 +78,28 @@ export function generateSingleReport(results, config) {
   const candidates = potentialChains.length;
   const errors = (results.errors || []).length;
 
+  // Novelty split — every confirmed chain carries a proof + novelty label.
+  const zerodays = confirmedChains.filter(c => c.novelty?.label === 'novel-0day');
+  const knownCves = confirmedChains.filter(c => c.novelty?.label === 'known-cve');
+  const unprovenLeads = (results.candidateChains || []).length;
+
   if (confirmed > 0) {
-    md += `> **VULNERABLE** — ${confirmed} confirmed prototype-pollution gadget${confirmed !== 1 ? 's' : ''} found.\n\n`;
-  } else if (candidates > 0) {
-    md += `> **INCONCLUSIVE** — ${candidates} unconfirmed candidate${candidates !== 1 ? 's' : ''} found; differential oracle did not confirm.\n\n`;
+    md += `> **VULNERABLE** — ${confirmed} independently-reproduced prototype-pollution vulnerabilit${confirmed !== 1 ? 'ies' : 'y'} `;
+    md += `(${zerodays.length} potential 0-day, ${knownCves.length} known CVE). `;
+    md += `Each was reproduced in fresh, isolated processes — not inferred from a behavioral heuristic.\n\n`;
+  } else if (candidates > 0 || unprovenLeads > 0) {
+    md += `> **INCONCLUSIVE** — no finding reproduced independently. `;
+    md += `${unprovenLeads + candidates} unproven lead${(unprovenLeads + candidates) !== 1 ? 's' : ''} recorded for manual review (NOT vulnerabilities).\n\n`;
   } else {
-    md += `> **CLEAN** — No gadgets found within the parameters tested.\n\n`;
+    md += `> **CLEAN** — No vulnerabilities reproduced within the parameters tested. `;
+    md += `Note: a CLEAN result is bounded by the search (per-call timeouts, entry points probed, prototypes/sinks monitored) and is not a proof of absence.\n\n`;
   }
 
   md += `| Metric | Value |\n|--------|-------|\n`;
-  md += `| Confirmed gadgets | ${confirmed} |\n`;
-  md += `| Unconfirmed candidates | ${candidates} |\n`;
+  md += `| Proven vulnerabilities | ${confirmed} |\n`;
+  md += `| — Potential 0-days | ${zerodays.length} |\n`;
+  md += `| — Known CVEs | ${knownCves.length} |\n`;
+  md += `| Unproven leads (manual review) | ${unprovenLeads + candidates} |\n`;
   md += `| Errors during scan | ${errors} |\n`;
   if (cs.coveredEdges !== undefined) {
     md += `| AFL edge coverage | ${cs.coveredEdges} edges (${pct(cs.coveredEdges, 65536)} bitmap) |\n`;
@@ -101,42 +112,60 @@ export function generateSingleReport(results, config) {
   }
   md += '\n';
 
-  // ── Confirmed Gadgets ────────────────────────────────────────────────────────
+  // ── Proven Vulnerabilities ───────────────────────────────────────────────────
   if (confirmed > 0) {
-    md += `## Confirmed Gadgets\n\n`;
-    md += `These vulnerabilities were confirmed by the differential oracle (causal evidence — not correlation).\n\n`;
+    md += `## Proven Vulnerabilities\n\n`;
+    md += `Each finding below was **independently reproduced in fresh, isolated Node processes** `;
+    md += `(twice) — real prototype mutation or real code execution, not a behavioral heuristic.\n\n`;
 
     for (const [i, chain] of confirmedChains.entries()) {
       const poc = chain.poc || {};
       const isURL = poc.type === 'url_gadget';
       const score = parseFloat(chain.riskLevel) || 0;
+      const nov = chain.novelty || {};
+      const novLabel = nov.label === 'known-cve'
+        ? `KNOWN CVE${nov.cve ? ' — ' + nov.cve : ''}`
+        : `POTENTIAL 0-DAY${nov.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
+      const proof = chain.proof || {};
 
-      md += `### Gadget #${i + 1} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
+      md += `### Finding #${i + 1} — ${novLabel} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
       md += `| Field | Value |\n|-------|-------|\n`;
       md += `| Library | \`${libName}@${libVersion}\` |\n`;
       md += `| Entry point | \`${escMd(chain.input?.entryPoint)}\` |\n`;
       md += `| Polluted property | \`Object.prototype.${escMd(chain.source?.property)}\` |\n`;
       md += `| Payload | \`${escMd(String(chain.source?.payload || '').substring(0, 80))}\` |\n`;
+      md += `| Proof | ${proof.type === 'code-execution' ? 'Code execution (canary fired)' : 'Prototype pollution (own-property added)'} — reproduced ${proof.runs || 2}× |\n`;
+      if (proof.newProps?.length) {
+        md += `| Polluted prototype key(s) | ${proof.newProps.map(p => `\`${p}\``).join(', ')} |\n`;
+      }
+      if (proof.payloadType) {
+        md += `| Execution payload | \`${escMd(proof.payloadType)}\` |\n`;
+      }
+      md += `| Novelty | ${novLabel} |\n`;
       if (chain.metadata?.cvssVector) {
         md += `| CVSS vector | \`${chain.metadata.cvssVector}\` |\n`;
       }
-      md += `| Confidence | ${((chain.confidence || 0) * 100).toFixed(0)}% |\n`;
       md += `| Type | ${isURL ? 'URL gadget' : (chain.multiProperty ? 'Multi-property gadget' : 'Direct prototype pollution')} |\n`;
-      if (chain.exploitVerified) {
-        md += `| Exploit verified | YES — code execution confirmed |\n`;
-        md += `| Exploit payload | \`${escMd(chain.exploitPayloadType)}\` |\n`;
-      }
       if (chain.coPolluteProperties?.length > 0) {
         md += `| Co-polluted properties | ${chain.coPolluteProperties.map(p => `\`${p}\``).join(' + ')} |\n`;
       }
       md += '\n';
+
+      if (nov.regressionSuspect && nov.note) {
+        md += `> ⚠ **Regression suspect:** ${nov.note}\n\n`;
+      }
+
+      if (chain.standalonePoC) {
+        md += `#### Reproduction (standalone PoC)\n\n`;
+        md += `\`\`\`javascript\n${chain.standalonePoC}\n\`\`\`\n\n`;
+      }
 
       if (isURL && poc.attackerInput?.url) {
         md += `#### Attacker-Controlled Input\n\n`;
         md += `\`\`\`\n${poc.attackerInput.url}\n\`\`\`\n\n`;
       }
 
-      if (poc.exploit?.code) {
+      if (poc.exploit?.code && !chain.standalonePoC) {
         md += `#### Proof of Concept\n\n`;
         md += `\`\`\`javascript\n${poc.exploit.code}\n\`\`\`\n\n`;
       }
@@ -152,6 +181,22 @@ export function generateSingleReport(results, config) {
         md += '\n\n';
       }
     }
+  }
+
+  // ── Unproven Leads (discovery-oracle signals that did NOT reproduce) ─────────
+  const candidateChains = results.candidateChains || [];
+  if (candidateChains.length > 0) {
+    md += `## Unproven Leads (NOT vulnerabilities)\n\n`;
+    md += `The discovery oracle observed a signal for these, but they **did not reproduce** in an `;
+    md += `independent fresh process, so they are **not** reported as vulnerabilities. Kept only as `;
+    md += `leads for manual review (e.g. browser-only packages that can't load in the child, `;
+    md += `sequence/async gadgets, or non-deterministic behavior).\n\n`;
+    md += `| Property | Entry Point | Signal | Proof attempted | Reason |\n|----------|-------------|--------|-----------------|--------|\n`;
+    for (const c of candidateChains.slice(0, 40)) {
+      md += `| \`${escMd(c.property)}\` | \`${escMd(c.entryPoint)}\` | ${escMd(c.signal)} | ${escMd(c.proofType)} | ${escMd(c.reason)} |\n`;
+    }
+    if (candidateChains.length > 40) md += `\n*… and ${candidateChains.length - 40} more*\n`;
+    md += '\n';
   }
 
   // ── Candidate Properties (Tier 5 — read but no behavior change) ──────────────
