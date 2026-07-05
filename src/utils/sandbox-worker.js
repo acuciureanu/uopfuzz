@@ -13,6 +13,7 @@
  */
 
 import { createRequire } from 'module';
+import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: Network blocking ──────────────────────────────
@@ -218,11 +219,9 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
   }
   const cleanSinkCount = sinkLog.length;
 
-  // Snapshot Object.prototype
-  const snapshot = new Map();
-  for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-    snapshot.set(key, true);
-  }
+  // Snapshot all monitored prototypes (Object/Function/Array/String) via the
+  // shared monitor — same detection the in-process oracle uses.
+  const snapshot = snapshotPrototype();
 
   // Polluted execution
   const prop = pollution.property;
@@ -261,13 +260,9 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
       try { Object.prototype[prop] = origVal; } catch { /* sealed */ }
     }
 
-    // Detect new properties added to Object.prototype
-    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-      if (!snapshot.has(key)) {
-        pollutedProperties.push(key);
-        try { delete Object.prototype[key]; } catch { /* sealed */ }
-      }
-    }
+    // Detect new properties added to any monitored prototype
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) pollutedProperties.push(...detection.newProps);
   }
 
   // Separate sink accesses: entries [0..cleanSinkCount) are from clean execution,
@@ -356,25 +351,15 @@ async function mergePPTest(fn, baseArgs, pollution, timeoutMs) {
   ];
 
   for (const callArgs of argVariants) {
-    const snapshot = new Map();
-    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-      snapshot.set(key, true);
-    }
+    const snapshot = snapshotPrototype();
 
     try {
       await withTimeout(Promise.resolve(fn(...callArgs)), timeoutMs);
     } catch { /* expected */ }
 
-    const pollutedProperties = [];
-    for (const key of Object.getOwnPropertyNames(Object.prototype)) {
-      if (!snapshot.has(key)) {
-        pollutedProperties.push(key);
-        try { delete Object.prototype[key]; } catch { /* sealed */ }
-      }
-    }
-
-    if (pollutedProperties.length > 0) {
-      return { pollutionDetected: true, pollutedProperties };
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) {
+      return { pollutionDetected: true, pollutedProperties: detection.newProps };
     }
   }
 
