@@ -1,5 +1,5 @@
 import { compareVersions } from '../sources/version-scanner.js';
-import { getGadgetsForPackage } from './known-gadgets.js';
+import { getGadgetsForPackage, PP_SOURCES } from './known-gadgets.js';
 
 /**
  * Novelty / 0-day classifier.
@@ -80,6 +80,32 @@ function findingProperties(finding) {
 export function classifyFinding(finding, ctx) {
   const pkg = (ctx.package || '').split('@')[0];
   const version = ctx.version || '';
+
+  // ── PP SOURCE bugs (proofType 'pp') ────────────────────────────────────────
+  // A prototype-pollution *source* (a merge/clone/set function that writes an
+  // attacker-chosen key onto a prototype) is ONE bug regardless of which
+  // property demonstrates it. Novelty therefore keys on package + version, not
+  // the arbitrary attacker property — otherwise the same documented CVE gets
+  // relabeled "0-day" every time a new property name is tried.
+  if (ctx.proofType === 'pp') {
+    const pkgSources = PP_SOURCES.filter(s => s.package === pkg);
+    const inRange = pkgSources.find(s => versionInRange(version, s.versions));
+    if (inRange) {
+      return { label: 'known-cve', cve: inRange.cve || null, matchedRange: inRange.versions };
+    }
+    if (pkgSources.length > 0) {
+      const nearest = pkgSources[0];
+      return {
+        label: 'novel-0day',
+        regressionSuspect: true,
+        cve: nearest.cve || null,
+        note: `Reproduced prototype-pollution source in ${pkg}@${version}; the package has a documented PP source (${nearest.cve || 'advisory'} ${nearest.versions}) but this version is outside that range — regression or DB/range error, human triage required.`,
+      };
+    }
+    return { label: 'novel-0day' };
+  }
+
+  // ── PP GADGET bugs (proofType 'rce') ───────────────────────────────────────
   const props = findingProperties(finding);
   const known = getGadgetsForPackage(pkg);
 

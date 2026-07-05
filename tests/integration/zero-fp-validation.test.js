@@ -92,6 +92,24 @@ describe('novelty classifier (offline)', () => {
     assert.equal(c.label, 'novel-0day');
   });
 
+  test('a PP source classifies by version, not the attacker property', () => {
+    // merge-deep <3.0.3 is a documented PP source (CVE-2021-23397). The finding
+    // must be known-cve regardless of which arbitrary key demonstrated it.
+    const f1 = { source: { property: 'polluted' }, input: { entryPoint: 'clone' } };
+    const f2 = { source: { property: 'isBuffer' }, input: { entryPoint: 'clone' } };
+    const c1 = classifyFinding(f1, { package: 'merge-deep', version: '3.0.0', proofType: 'pp' });
+    const c2 = classifyFinding(f2, { package: 'merge-deep', version: '3.0.0', proofType: 'pp' });
+    assert.equal(c1.label, 'known-cve');
+    assert.equal(c2.label, 'known-cve', 'a different attacker property must not fake a 0-day');
+    assert.equal(c1.cve, c2.cve);
+  });
+
+  test('a PP source in an unknown package is a novel-0day', () => {
+    const f = { source: { property: 'x' }, input: { entryPoint: 'merge' } };
+    const c = classifyFinding(f, { package: 'nobody-knows-this', version: '1.0.0', proofType: 'pp' });
+    assert.equal(c.label, 'novel-0day');
+  });
+
   test('flags reproduction on a patched version as regression-suspect', () => {
     const finding = { source: { property: 'polluted' }, input: { entryPoint: 'merge' } };
     const c = classifyFinding(finding, { package: 'lodash', version: '4.17.21' });

@@ -997,6 +997,12 @@ export class Instrumentation {
       return targetModule.default[entryPointName];
     }
 
+    // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
+    // When no named property matched, fall back to the module (or its default)
+    // being callable itself.
+    if (typeof targetModule === 'function') return targetModule;
+    if (typeof targetModule.default === 'function') return targetModule.default;
+
     return null;
   }
 

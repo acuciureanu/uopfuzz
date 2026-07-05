@@ -391,6 +391,9 @@ function resolveEntryPoint(module, name) {
   }
   if (typeof module[name] === 'function') return module[name];
   if (module.default && typeof module.default[name] === 'function') return module.default[name];
+  // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
+  if (typeof module === 'function') return module;
+  if (typeof module.default === 'function') return module.default;
   return null;
 }
 

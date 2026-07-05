@@ -362,14 +362,15 @@ export class Orchestrator {
       // (merge/URL diffs carry a fully-qualified "Object.prototype.x" name).
       if (chain.source) chain.source.property = descriptor.property;
 
-      chain.novelty = classifyFinding(chain, { package: pkg, version });
+      chain.novelty = classifyFinding(chain, { package: pkg, version, proofType });
 
       // Report-level dedup by BUG identity so one merge/source bug does not
-      // surface once per property name tried. A PP source is identified by
-      // (entry point + advisory); an RCE gadget by (entry point + property).
+      // surface once per property name tried. A PP *source* is one bug per
+      // polluting function (the attacker property is irrelevant); an RCE gadget
+      // is identified by (entry point + property).
       if (!this._reportedSignatures) this._reportedSignatures = new Set();
       const repSig = proofType === 'pp'
-        ? `pp:${entryPoint}:${chain.novelty?.cve || chain.novelty?.label}`
+        ? `pp:${entryPoint}`
         : `rce:${entryPoint}:${descriptor.property}`;
       if (this._reportedSignatures.has(repSig)) {
         this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
@@ -474,13 +475,17 @@ export class Orchestrator {
     const urlSinkEPs = new Set(['ajax', 'post', 'getJSON', 'getScript', 'fetch', 'request', 'send']);
     const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
 
+    // A bare-function module (module.exports = fn, e.g. merge-deep) is registered
+    // under the package base name — treat that entry point as high-priority too.
+    const pkgBase = (this.config.package || '').split('@')[0];
+
     // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
     // This is deterministic — not dependent on random input generation.
     if (this.config.entryPoints) {
       for (const ep of this.config.entryPoints) {
         if (testInputs.length >= 5) break;
         const base = getBaseName(ep.name);
-        if (!highPriorityEPs.has(base)) continue;
+        if (!highPriorityEPs.has(base) && ep.name !== pkgBase) continue;
         if (seenEP.has(ep.name)) continue;
         seenEP.add(ep.name);
         testInputs.push({
