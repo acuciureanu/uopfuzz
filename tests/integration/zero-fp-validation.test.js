@@ -42,6 +42,23 @@ describe('reproduction harness — hermetic fixtures (offline)', () => {
     assert.equal(r.verified, false, 'a __proto__-guarded merge must never reproduce');
   });
 
+  test('standalone PoC calls target(...) directly for a bare-function-export module', async () => {
+    // Auto-discovery names a bare-function entry point after the package
+    // itself (src/target-integration/discovery.js:270-272: `module.exports =
+    // fn` registers { name: packageName, fn: targetModule }), so entryPoint
+    // === pkg in this real-world case (e.g. extend-deep@0.1.6). The PoC
+    // generator must call target(...) directly, not target.<entryPoint>(...)
+    // — the latter is invalid JS once entryPoint contains characters that
+    // can't be a bare property name (a path, a hyphenated package name, etc).
+    const bare = FIX('bare-merge');
+    const r = await reproduceProto(bare, bare, { property: 'polluted', value: true });
+    assert.equal(r.verified, true, 'the bare-function merge fixture must reproduce');
+    assert.ok(r.standalonePoC.includes('target({}, payload)'),
+      'a bare-function module must be invoked directly as target(...)');
+    assert.ok(!r.standalonePoC.includes(`target.${bare}(`),
+      'must not splice the package identifier in as an invalid property access');
+  });
+
   test('confirms real code execution via canary (rce-gadget)', async () => {
     const r = await reproduceRce(FIX('rce-gadget'), 'render', { property: 'command', gates: [], minimalArgs: [{}] });
     assert.equal(r.verified, true, 'a read-to-eval gadget must reproduce code execution');
