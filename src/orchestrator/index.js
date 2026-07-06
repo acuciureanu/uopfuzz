@@ -349,6 +349,27 @@ export class Orchestrator {
    *
    * @returns {Promise<boolean>} true if a proven vulnerability was recorded.
    */
+  /**
+   * Resolve this target's config.sequences entry (if any) for the entry point
+   * under test into plain-data { call, method?, args } steps the reproduction
+   * worker can replay over IPC — no functions cross the boundary. Needed
+   * because some gadgets (CVE-2022-29078: EJS's compile()) only execute when
+   * the function an entry point RETURNS is subsequently invoked; a single call
+   * to the entry point alone never reaches the sink, so reproduction must
+   * replay the same multi-step chain discovery used.
+   */
+  buildResolvedSequence(testInput) {
+    const seqDef = this.config.sequences?.find(s => s.entryPoint === testInput.entryPoint);
+    if (!seqDef) return null;
+    return {
+      steps: seqDef.steps.map(step => ({
+        call: step.call,
+        method: step.method,
+        args: this.instrumentation.buildCallArgs(step, testInput, this.config),
+      })),
+    };
+  }
+
   async proveAndRecord(diffResult, testInput, descriptor, extra = {}) {
     const diff = diffResult?.diff;
     if (!diff) return false;
@@ -373,7 +394,7 @@ export class Orchestrator {
             || diff.details?.forcedGatesFired
             || (extra.coPolluteProperties || []).filter(p => p !== descriptor.property);
           proof = await reproduceRce(pkg, entryPoint,
-            { property: descriptor.property, gates, minimalArgs: [testInput.value ?? {}] },
+            { property: descriptor.property, gates, minimalArgs: [testInput.value ?? {}], sequence: this.buildResolvedSequence(testInput) },
             { version, blockNetwork: this.options.blockNetwork !== false });
         }
       } catch (err) {
@@ -967,7 +988,9 @@ export class Orchestrator {
 
         report += 'PROOF OF CONCEPT\n';
         report += '=================\n';
-        if (poc?.exploit?.code) {
+        if (chain.standalonePoC) {
+          report += '\n' + chain.standalonePoC + '\n';
+        } else if (poc?.exploit?.code) {
           report += '\n' + poc.exploit.code + '\n';
         }
 

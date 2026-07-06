@@ -45,6 +45,22 @@ describe('reproduction harness — hermetic fixtures (offline)', () => {
     const r = await reproduceRce(FIX('benign'), 'greet', { property: 'command', gates: [], minimalArgs: [{}] });
     assert.equal(r.verified, false, 'a function that never reaches a sink must never reproduce');
   });
+
+  test('confirms RCE that only fires once the compile()-returned function is invoked (two-step sequence)', async () => {
+    // Mirrors CVE-2022-29078 (EJS): compile() alone never executes the gadget —
+    // only calling the function it returns does. A reproduction driver that
+    // only ever calls the entry point once (ignoring config.sequences) can
+    // never confirm this, even though the vulnerability is real.
+    const sequence = {
+      steps: [
+        { call: 'compile', args: ['tmpl', {}] },
+        { call: '__result__', args: [{ name: 'test' }] },
+      ],
+    };
+    const r = await reproduceRce(FIX('sequence-gadget'), 'compile',
+      { property: 'command', gates: [], minimalArgs: ['tmpl'], sequence });
+    assert.equal(r.verified, true, 'a gadget that only executes when the compiled function is invoked must still reproduce');
+  });
 });
 
 // ─── Discovery-oracle demotion (offline) ─────────────────────────────────────

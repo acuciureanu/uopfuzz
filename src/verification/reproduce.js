@@ -61,7 +61,11 @@ export async function reproduceProto(packageName, entryPoint, descriptor, opts =
 /**
  * @param {string} packageName
  * @param {string} entryPoint
- * @param {{ property: string, gates?: string[], minimalArgs?: any[] }} spec
+ * @param {{ property: string, gates?: string[], minimalArgs?: any[], sequence?: { steps: Array<{ call: string, method?: string, args?: any[] }> } }} spec
+ *   `sequence`, when present, mirrors a config.sequences entry with each step's
+ *   args already resolved to plain values (e.g. `compile()` followed by
+ *   invoking its returned function — CVE-2022-29078-style gadgets only fire on
+ *   the second call, never on the entry point alone).
  * @param {object} [opts]
  * @returns {Promise<{ verified: boolean, payloadType?: string, canary?: string, gates?: string[], runs: number, standalonePoC?: string }>}
  */
@@ -75,7 +79,7 @@ export async function reproduceRce(packageName, entryPoint, spec, opts = {}) {
       blockNetwork: opts.blockNetwork !== false,
       workerScript: REPRO_WORKER,
       mode: 'repro_rce',
-      extra: { property: spec.property, gates: spec.gates || [], nonce: run },
+      extra: { property: spec.property, gates: spec.gates || [], sequence: spec.sequence || null, nonce: run },
     }).catch(err => ({ verified: false, error: err.message }));
     results.push(r);
     if (!r?.verified) break;
