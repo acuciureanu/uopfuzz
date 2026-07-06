@@ -4,6 +4,7 @@ import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
 import { executeInSandbox } from '../utils/sandbox.js';
+import { packageBaseName } from '../utils/package-name.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let childProcessModule;
@@ -313,7 +314,7 @@ export class Instrumentation {
     // Sandboxed execution: run in child process.
     // Skip sandbox for browser-only packages — they require jsdom which
     // the sandbox child process doesn't have.
-    const pkgBase = config.package?.split('@')[0];
+    const pkgBase = packageBaseName(config.package || '');
     const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
     if (canSandbox) {
       return this._sandboxedDifferential(config.package, input, pollutionDescriptor, timeoutMs);
@@ -506,7 +507,7 @@ export class Instrumentation {
     if (this.options.dryRun) return null;
 
     const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
-    const pkgBase = config.package?.split('@')[0];
+    const pkgBase = packageBaseName(config.package || '');
     const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
 
     const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
@@ -522,7 +523,7 @@ export class Instrumentation {
 
     if (!this.targetModule) return null;
 
-    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint, config.package);
     if (!rawFn) return null;
 
     try {
@@ -592,7 +593,7 @@ export class Instrumentation {
     if (this.options.dryRun) return null;
 
     const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
-    const pkgBase = config.package?.split('@')[0];
+    const pkgBase = packageBaseName(config.package || '');
     const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
 
     if (canSandbox) {
@@ -605,7 +606,7 @@ export class Instrumentation {
 
     if (!this.targetModule) return null;
 
-    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+    const rawFn = this.getEntryPointFunction(this.targetModule, input.entryPoint, config.package);
     if (!rawFn) return null;
 
     const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
@@ -624,7 +625,7 @@ export class Instrumentation {
    */
   buildCallableThunk(input, config, sequence) {
     if (!sequence) {
-      const fn = this.getEntryPointFunction(this.targetModule, input.entryPoint);
+      const fn = this.getEntryPointFunction(this.targetModule, input.entryPoint, config.package);
       return fn || null;
     }
 
@@ -644,7 +645,7 @@ export class Instrumentation {
             return lastResult;
           }
         } else {
-          fn = self.getEntryPointFunction(self.targetModule, step.call);
+          fn = self.getEntryPointFunction(self.targetModule, step.call, config.package);
           if (!fn) return null;
         }
         const args = i === 0 ? firstArgs : self.buildCallArgs(step, input, config);
@@ -898,7 +899,7 @@ export class Instrumentation {
           return;
         }
       } else {
-        fn = this.getEntryPointFunction(this.targetModule, step.call);
+        fn = this.getEntryPointFunction(this.targetModule, step.call, config.package);
         if (!fn) {
           trace.errors.push({ message: `Entry point ${step.call} not found`, timestamp: Date.now() });
           return;
@@ -926,7 +927,7 @@ export class Instrumentation {
    */
   async executeSingleCall(input, config, trace) {
     const entryPointName = input.entryPoint;
-    const entryPoint = this.getEntryPointFunction(this.targetModule, entryPointName);
+    const entryPoint = this.getEntryPointFunction(this.targetModule, entryPointName, config.package);
 
     if (!entryPoint) {
       throw new Error(`Entry point ${entryPointName} not found in target module`);
@@ -974,7 +975,7 @@ export class Instrumentation {
     return args;
   }
 
-  getEntryPointFunction(targetModule, entryPointName) {
+  getEntryPointFunction(targetModule, entryPointName, packageName) {
     if (entryPointName.includes('.')) {
       const path = entryPointName.split('.');
       let current = targetModule;
@@ -998,10 +999,12 @@ export class Instrumentation {
     }
 
     // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
-    // When no named property matched, fall back to the module (or its default)
-    // being callable itself.
-    if (typeof targetModule === 'function') return targetModule;
-    if (typeof targetModule.default === 'function') return targetModule.default;
+    // Only fall back to the module itself when entryPointName IS the package's
+    // own name — never as a catch-all for an unrelated or nonexistent name.
+    if (entryPointName === packageName) {
+      if (typeof targetModule === 'function') return targetModule;
+      if (typeof targetModule.default === 'function') return targetModule.default;
+    }
 
     return null;
   }

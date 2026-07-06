@@ -17,6 +17,7 @@ import {
   buildRecord,
   DEFAULT_DISCOVERY_STORE_PATH,
 } from '../gadget-analysis/discovery-store.js';
+import { packageBaseName } from '../utils/package-name.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -551,7 +552,7 @@ export class Orchestrator {
 
     // A bare-function module (module.exports = fn, e.g. merge-deep) is registered
     // under the package base name — treat that entry point as high-priority too.
-    const pkgBase = (this.config.package || '').split('@')[0];
+    const pkgBase = packageBaseName(this.config.package || '');
 
     // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
     // This is deterministic — not dependent on random input generation.
@@ -662,7 +663,7 @@ export class Orchestrator {
           }
           if (diffResult) {
             const d = diffResult.diff;
-            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: proofType=${d?.proofType} reproducible=${d?.reproducible} read=${d?.pollutionWasRead} outChanged=${d?.outputChanged} errChanged=${d?.errChanged}`);
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: proofType=${d?.proofType} reproducible=${d?.reproducible} read=${d?.pollutionWasRead} outChanged=${d?.outputChanged} errChanged=${d?.errorChanged}`);
 
             // Feed the co-pollution phase with read-but-unchanged candidates.
             if (d?.isCandidate) {

@@ -28,6 +28,8 @@
  * 4. Benchmark scoring — measure detection rate against ground truth
  */
 
+import { packageBaseName } from '../utils/package-name.js';
+
 // ─── PP SOURCES (merge/extend functions that pollute Object.prototype) ────────
 
 export const PP_SOURCES = [
@@ -536,7 +538,7 @@ export function getKnownSourceFunctions() {
  * @returns {Array} Known gadgets and sources for this package
  */
 export function getGadgetsForPackage(packageName) {
-  const base = packageName.split('@')[0];
+  const base = packageBaseName(packageName);
   return [
     ...PP_SOURCES.filter(s => s.package === base),
     ...PP_GADGETS.filter(g => g.package === base),

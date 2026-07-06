@@ -161,7 +161,7 @@ async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, po
   }
 
   // Resolve the entry point function
-  const fn = resolveEntryPoint(targetModule, entryPoint);
+  const fn = resolveEntryPoint(targetModule, entryPoint, packageName);
   if (!fn) {
     return { error: `Entry point ${entryPoint} not found in ${packageName}`, output: null };
   }
@@ -376,7 +376,7 @@ function withTimeout(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function resolveEntryPoint(module, name) {
+function resolveEntryPoint(module, name, packageName) {
   if (name.includes('.')) {
     const parts = name.split('.');
     let current = module;
@@ -392,8 +392,12 @@ function resolveEntryPoint(module, name) {
   if (typeof module[name] === 'function') return module[name];
   if (module.default && typeof module.default[name] === 'function') return module.default[name];
   // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
-  if (typeof module === 'function') return module;
-  if (typeof module.default === 'function') return module.default;
+  // Only fall back to the module itself when `name` IS the package's own name —
+  // never as a catch-all for an unrelated or nonexistent entry point name.
+  if (name === packageName) {
+    if (typeof module === 'function') return module;
+    if (typeof module.default === 'function') return module.default;
+  }
   return null;
 }
 

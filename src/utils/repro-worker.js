@@ -100,14 +100,14 @@ async function handle(mode, packageName, entryPoint, args, msg, timeoutMs) {
     return { error: `Cannot load ${packageName}: ${targetModule.__loadError}`, verified: false };
   }
 
-  const fn = resolveEntryPoint(targetModule, entryPoint);
+  const fn = resolveEntryPoint(targetModule, entryPoint, packageName);
   if (!fn) return { error: `Entry point ${entryPoint} not found in ${packageName}`, verified: false };
 
   const realArgs = deserializeArgs(args);
 
   switch (mode) {
     case 'repro_pp':  return reproPP(fn, realArgs, msg, timeoutMs);
-    case 'repro_rce': return reproRCE(fn, realArgs, msg, timeoutMs, targetModule);
+    case 'repro_rce': return reproRCE(fn, realArgs, msg, timeoutMs, targetModule, packageName);
     default:          return { error: `Unknown repro mode: ${mode}`, verified: false };
   }
 }
@@ -119,7 +119,7 @@ async function handle(mode, packageName, entryPoint, args, msg, timeoutMs) {
  * function an entry point RETURNS is subsequently invoked — a single call to
  * the entry point itself never reaches the sink.
  */
-async function runSequence(targetModule, steps, timeoutMs) {
+async function runSequence(targetModule, steps, timeoutMs, packageName) {
   let lastResult = null;
   for (const step of steps) {
     let fn;
@@ -132,7 +132,7 @@ async function runSequence(targetModule, steps, timeoutMs) {
         return lastResult;
       }
     } else {
-      fn = resolveEntryPoint(targetModule, step.call);
+      fn = resolveEntryPoint(targetModule, step.call, packageName);
       if (!fn) return null;
     }
     const args = deserializeArgs(step.args || []);
@@ -204,19 +204,29 @@ async function reproPP(fn, baseArgs, msg, timeoutMs) {
 /**
  * repro_rce: prove code execution. Set a canary payload on Object.prototype for
  * the primary property; force any gate properties to true; invoke the entry
- * point; check whether the canary token reached globalThis.
+ * point (or replay a resolved multi-step sequence, for gadgets like
+ * CVE-2022-29078 that only fire on a function the entry point RETURNS); check
+ * whether the canary token reached globalThis.
+ *
+ * The constructor_chain payload ends with a NUL character (built at runtime via
+ * String.fromCharCode, never written as literal escape text in this source file,
+ * so the file itself stays plain UTF-8 with no embedded control bytes). Some
+ * template/code-generation gadgets splice this payload into generated source,
+ * and a trailing NUL can terminate a subsequent literal there, letting the
+ * injected call survive compilation.
  */
-async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule) {
+async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName) {
   const prop = msg.property;
   const gates = Array.isArray(msg.gates) ? msg.gates.filter(g => g && g !== prop) : [];
   const sequenceSteps = msg.sequence?.steps;
   // Unique per-attempt token; built inside the worker so no function crosses IPC.
   const token = `UOPFUZZ_${msg.nonce || 'x'}_${gates.length}`;
+  const nulChar = String.fromCharCode(0);
 
   const payloads = [
     { type: 'function_call', make: () => new Function(`globalThis['${CANARY_GLOBAL}']='${token}'`) },
     { type: 'eval_string', make: () => `globalThis['${CANARY_GLOBAL}']='${token}'` },
-    { type: 'constructor_chain', make: () => `constructor.constructor("globalThis['${CANARY_GLOBAL}']='${token}'")() ` },
+    { type: 'constructor_chain', make: () => `constructor.constructor("globalThis['${CANARY_GLOBAL}']='${token}'")()${nulChar}` },
   ];
 
   for (const payload of payloads) {
@@ -227,7 +237,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule) {
       for (const g of gates) installProp(g, true, installed);
       try {
         if (Array.isArray(sequenceSteps) && sequenceSteps.length) {
-          await runSequence(targetModule, sequenceSteps, timeoutMs);
+          await runSequence(targetModule, sequenceSteps, timeoutMs, packageName);
         } else {
           await withTimeout(Promise.resolve(fn(...clone(baseArgs))), timeoutMs);
         }
@@ -288,7 +298,13 @@ function describeConvention(callArgs, prop) {
   return 'fn(target, payload)';
 }
 
-function resolveEntryPoint(module, name) {
+/**
+ * Resolve the callable for `name` on `module`. The bare-function fallback
+ * (module.exports = fn, e.g. merge-deep, deep-extend) only applies when `name`
+ * actually identifies the module itself (equals the package name) — it must
+ * never silently substitute the whole module for an unrelated/unresolved name.
+ */
+function resolveEntryPoint(module, name, packageName) {
   if (!name) return null;
   if (name.includes('.')) {
     const parts = name.split('.');
@@ -302,8 +318,12 @@ function resolveEntryPoint(module, name) {
   if (typeof module[name] === 'function') return module[name];
   if (module.default && typeof module.default[name] === 'function') return module.default[name];
   // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
-  if (typeof module === 'function') return module;
-  if (typeof module.default === 'function') return module.default;
+  // Only fall back to the module itself when `name` IS the package's own name —
+  // never as a catch-all for an unrelated or nonexistent entry point name.
+  if (name === packageName) {
+    if (typeof module === 'function') return module;
+    if (typeof module.default === 'function') return module.default;
+  }
   return null;
 }
 

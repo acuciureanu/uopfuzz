@@ -2,6 +2,7 @@ import { compareVersions } from '../sources/version-scanner.js';
 import { getGadgetsForPackage, PP_SOURCES } from './known-gadgets.js';
 import { osvKnownCve, osvOtherAdvisories } from '../sources/osv.js';
 import { findPriorSighting } from './discovery-store.js';
+import { packageBaseName } from '../utils/package-name.js';
 
 /**
  * Novelty / undocumented-vulnerability classifier.
@@ -157,7 +158,7 @@ function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regress
  * @returns {{ label: 'known-cve'|'undocumented-vulnerability'|'previously-discovered', cve?: string, matchedRange?: string, regressionSuspect?: boolean, note?: string, source?: string, osvNote?: string, priorSighting?: { discoveredAt: string, version: string } }}
  */
 export function classifyFinding(finding, ctx) {
-  const pkg = (ctx.package || '').split('@')[0];
+  const pkg = packageBaseName(ctx.package || '');
   const version = ctx.version || '';
   const osvVulns = ctx.osvVulns;
 
