@@ -11,6 +11,12 @@ import { generateSingleReport } from '../reporting/markdown-report.js';
 import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
 import { classifyFinding } from '../gadget-analysis/novelty.js';
 import { fetchOsvVulns } from '../sources/osv.js';
+import {
+  loadDiscoveries,
+  appendDiscovery,
+  buildRecord,
+  DEFAULT_DISCOVERY_STORE_PATH,
+} from '../gadget-analysis/discovery-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -68,6 +74,11 @@ export class Orchestrator {
       // Enrich the novelty gate with live OSV.dev advisories (once per run).
       // Fail-safe: never throws; degrades to static-DB-only if unavailable.
       await this.fetchOsvData();
+
+      // Load this tool's durable discovery store (once per run) so confirmed
+      // findings can be recognized as rediscoveries of bugs previously found.
+      // Same timing/defensive contract as fetchOsvData: never throws, [] on miss.
+      this.priorDiscoveries = loadDiscoveries(DEFAULT_DISCOVERY_STORE_PATH);
 
       logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
@@ -412,7 +423,11 @@ export class Orchestrator {
       // (merge/URL diffs carry a fully-qualified "Object.prototype.x" name).
       if (chain.source) chain.source.property = descriptor.property;
 
-      chain.novelty = classifyFinding(chain, { package: pkg, version, proofType, osvVulns: this.osvVulns });
+      chain.novelty = classifyFinding(chain, {
+        package: pkg, version, proofType,
+        osvVulns: this.osvVulns,
+        priorDiscoveries: this.priorDiscoveries || [],
+      });
 
       // Report-level dedup by BUG identity so one merge/source bug does not
       // surface once per property name tried. A PP *source* is one bug per
@@ -445,9 +460,18 @@ export class Orchestrator {
       this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
       this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
 
+      // Persist every confirmed finding to the durable, append-only discovery
+      // store — the full audit trail of what this tool has reproduced (whether
+      // a known CVE, a regression suspect, a rediscovery, or a first-sighting
+      // undocumented vulnerability). Never throws; a write failure is logged
+      // and swallowed.
+      appendDiscovery(buildRecord(chain, { package: pkg, version, proofType }), DEFAULT_DISCOVERY_STORE_PATH);
+
       const noveltyTag = chain.novelty.label === 'known-cve'
         ? `KNOWN CVE${chain.novelty.cve ? ' ' + chain.novelty.cve : ''}`
-        : `POTENTIAL 0-DAY${chain.novelty.regressionSuspect ? ' (regression suspect)' : ''}`;
+        : chain.novelty.label === 'previously-discovered'
+          ? `PREVIOUSLY DISCOVERED${chain.novelty.priorSighting?.discoveredAt ? ' (first seen ' + chain.novelty.priorSighting.discoveredAt : ''}${chain.novelty.priorSighting?.version ? ' @ ' + chain.novelty.priorSighting.version : ''}${chain.novelty.priorSighting?.discoveredAt ? ')' : ''}`
+          : `UNDOCUMENTED VULNERABILITY${chain.novelty.regressionSuspect ? ' (regression suspect)' : ''}`;
       logger.warn(
         `PROVEN ${chain.proof.type.toUpperCase()} [${noveltyTag}]: ` +
         `Object.prototype.${descriptor.property} via ${entryPoint} ` +

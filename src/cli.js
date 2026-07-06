@@ -96,21 +96,24 @@ program.action(async (options) => {
 
     const confirmedChains = results.confirmedChains || [];
     const confirmed = confirmedChains.length;
-    const zerodays = confirmedChains.filter(c => c.novelty?.label === 'novel-0day').length;
+    const undocumented = confirmedChains.filter(c => c.novelty?.label === 'undocumented-vulnerability').length;
+    const rediscovered = confirmedChains.filter(c => c.novelty?.label === 'previously-discovered').length;
     const knownCves = confirmedChains.filter(c => c.novelty?.label === 'known-cve').length;
     const unproven = (results.candidateChains?.length || 0);
 
     if (confirmed > 0) {
       logger.warn(chalk.red.bold(
         `${confirmed} PROVEN vulnerabilit${confirmed !== 1 ? 'ies' : 'y'} ` +
-        `(${zerodays} potential 0-day, ${knownCves} known CVE) — reproduced in fresh processes`
+        `(${undocumented} undocumented, ${rediscovered} previously discovered, ${knownCves} known CVE) — reproduced in fresh processes`
       ));
       for (const c of confirmedChains) {
         const srcTag = c.novelty?.source === 'osv' ? ' via OSV.dev'
           : c.novelty?.source === 'static+osv' ? ' (built-in DB + OSV.dev)' : '';
-        const tag = c.novelty?.label === 'novel-0day'
-          ? chalk.red.bold(`POTENTIAL 0-DAY${c.novelty?.regressionSuspect ? ' (regression suspect)' : ''}`)
-          : chalk.yellow(`known CVE${c.novelty?.cve ? ' ' + c.novelty.cve : ''}${srcTag}`);
+        const tag = c.novelty?.label === 'known-cve'
+          ? chalk.yellow(`known CVE${c.novelty?.cve ? ' ' + c.novelty.cve : ''}${srcTag}`)
+          : c.novelty?.label === 'previously-discovered'
+            ? chalk.blue(`previously discovered${c.novelty?.priorSighting?.discoveredAt ? ' (first seen ' + c.novelty.priorSighting.discoveredAt + ')' : ''}`)
+            : chalk.red.bold(`UNDOCUMENTED VULNERABILITY${c.novelty?.regressionSuspect ? ' (regression suspect)' : ''}`);
         logger.warn(`  • ${tag}: Object.prototype.${c.source?.property} via ${c.input?.entryPoint} [${c.proof?.type}]`);
       }
     }

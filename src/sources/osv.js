@@ -153,7 +153,7 @@ function _rangeContains(events, version) {
  * OSV answers at package@version granularity and returns EVERY advisory for that
  * version. Only PP-class advisories may flip a finding's novelty to known-cve —
  * otherwise an unrelated CVE (ReDoS, path traversal…) at the same version would
- * bury a genuine novel PP 0-day. Matches on CWE-1321 or PP keywords.
+ * bury a genuine undocumented PP vulnerability. Matches on CWE-1321 or PP keywords.
  */
 export function isPrototypePollution(vuln) {
   if (!vuln) return false;

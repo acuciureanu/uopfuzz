@@ -79,13 +79,14 @@ export function generateSingleReport(results, config) {
   const errors = (results.errors || []).length;
 
   // Novelty split — every confirmed chain carries a proof + novelty label.
-  const zerodays = confirmedChains.filter(c => c.novelty?.label === 'novel-0day');
+  const undocumented = confirmedChains.filter(c => c.novelty?.label === 'undocumented-vulnerability');
+  const rediscovered = confirmedChains.filter(c => c.novelty?.label === 'previously-discovered');
   const knownCves = confirmedChains.filter(c => c.novelty?.label === 'known-cve');
   const unprovenLeads = (results.candidateChains || []).length;
 
   if (confirmed > 0) {
     md += `> **VULNERABLE** — ${confirmed} independently-reproduced prototype-pollution vulnerabilit${confirmed !== 1 ? 'ies' : 'y'} `;
-    md += `(${zerodays.length} potential 0-day, ${knownCves.length} known CVE). `;
+    md += `(${undocumented.length} undocumented, ${rediscovered.length} previously discovered, ${knownCves.length} known CVE). `;
     md += `Each was reproduced in fresh, isolated processes — not inferred from a behavioral heuristic.\n\n`;
   } else if (candidates > 0 || unprovenLeads > 0) {
     md += `> **INCONCLUSIVE** — no finding reproduced independently. `;
@@ -97,7 +98,8 @@ export function generateSingleReport(results, config) {
 
   md += `| Metric | Value |\n|--------|-------|\n`;
   md += `| Proven vulnerabilities | ${confirmed} |\n`;
-  md += `| — Potential 0-days | ${zerodays.length} |\n`;
+  md += `| — Undocumented vulnerabilities | ${undocumented.length} |\n`;
+  md += `| — Previously discovered | ${rediscovered.length} |\n`;
   md += `| — Known CVEs | ${knownCves.length} |\n`;
   md += `| Unproven leads (manual review) | ${unprovenLeads + candidates} |\n`;
   md += `| Errors during scan | ${errors} |\n`;
@@ -128,7 +130,9 @@ export function generateSingleReport(results, config) {
         : nov.source === 'static' ? ' (built-in DB)' : '';
       const novLabel = nov.label === 'known-cve'
         ? `KNOWN CVE${nov.cve ? ' — ' + nov.cve : ''}${srcTag}`
-        : `POTENTIAL 0-DAY${nov.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
+        : nov.label === 'previously-discovered'
+          ? `PREVIOUSLY DISCOVERED`
+          : `UNDOCUMENTED VULNERABILITY${nov.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
       const proof = chain.proof || {};
 
       md += `### Finding #${i + 1} — ${novLabel} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
@@ -156,6 +160,12 @@ export function generateSingleReport(results, config) {
 
       if (nov.regressionSuspect && nov.note) {
         md += `> ⚠ **Regression suspect:** ${nov.note}\n\n`;
+      } else if (nov.label === 'previously-discovered' && nov.priorSighting) {
+        const ps = nov.priorSighting;
+        md += `> ℹ Previously discovered by this tool`;
+        if (ps.discoveredAt) md += ` on \`${ps.discoveredAt}\``;
+        if (ps.version) md += ` at \`${libName}@${ps.version}\``;
+        md += ` — no public CVE.\n\n`;
       } else if (nov.source === 'osv' && nov.note) {
         md += `> ℹ ${nov.note}\n\n`;
       }

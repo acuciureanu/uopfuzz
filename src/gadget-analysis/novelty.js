@@ -1,28 +1,40 @@
 import { compareVersions } from '../sources/version-scanner.js';
 import { getGadgetsForPackage, PP_SOURCES } from './known-gadgets.js';
 import { osvKnownCve, osvOtherAdvisories } from '../sources/osv.js';
+import { findPriorSighting } from './discovery-store.js';
 
 /**
- * Novelty / 0-day classifier.
+ * Novelty / undocumented-vulnerability classifier.
  *
- * "0-day" means a previously-unknown vulnerability. A tool that re-discovers a
- * documented CVE has not found a 0-day. This module cross-references a
- * reproduction-proven finding against (1) the built-in static known-vulnerability
- * database (known-gadgets.js) and (2) — when available — live OSV.dev advisories,
- * labelling it:
+ * "Undocumented" means no public advisory (static DB or OSV.dev) covers this
+ * finding. A tool that re-discovers a documented CVE has not found anything
+ * undocumented. This module cross-references a reproduction-proven finding
+ * against (1) the built-in static known-vulnerability database
+ * (known-gadgets.js), (2) — when available — live OSV.dev advisories, and (3)
+ * this tool's own durable discovery store, labelling it:
  *
- *   - 'known-cve'  : a documented advisory (static DB and/or OSV) covers this
- *                    package@version. Good for regression, NOT a 0-day.
- *   - 'novel-0day' : no known advisory covers it. A candidate 0-day (still needs
- *                    human confirmation). `regressionSuspect` marks the ambiguous
- *                    case where the static DB documents the package as patched at
- *                    this version yet it still reproduced.
+ *   - 'known-cve'                  : a documented advisory (static DB and/or OSV)
+ *                                    covers this package@version. Good for
+ *                                    regression, not undocumented.
+ *   - 'undocumented-vulnerability' : no known advisory covers it and this tool
+ *                                    has never recorded it before. A candidate
+ *                                    undocumented vulnerability (still needs
+ *                                    human confirmation before disclosure).
+ *   - 'previously-discovered'      : no public advisory, but this tool recorded
+ *                                    the same bug on an earlier run — a
+ *                                    rediscovery, not a first sighting. Carries
+ *                                    `priorSighting.{discoveredAt,version}`.
+ *
+ * `regressionSuspect` marks the ambiguous case where the static DB documents the
+ * package as patched at this version yet it still reproduced (label stays
+ * 'undocumented-vulnerability' with the flag set — a regression triage signal,
+ * distinct from a clean first sighting).
  *
  * `source` records provenance of a known-cve label: 'static' | 'osv' | 'static+osv'.
  *
  * OSV is class-aware: only prototype-pollution advisories (see
  * src/sources/osv.js `isPrototypePollution`) may flip a finding to known-cve.
- * An unrelated CVE at the same version must never bury a genuine novel PP 0-day.
+ * An unrelated CVE at the same version must never bury a genuine undocumented PP vulnerability.
  */
 
 /**
@@ -102,7 +114,7 @@ function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regress
       });
     }
     return withNote({
-      label: 'novel-0day',
+      label: 'undocumented-vulnerability',
       regressionSuspect: true,
       cve: staticOutOfRange.cve || null,
       note: regressionNote,
@@ -120,16 +132,29 @@ function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regress
     });
   }
 
-  // Nothing known anywhere → candidate 0-day.
-  return withNote({ label: 'novel-0day' });
+  // Nothing known anywhere → candidate undocumented vulnerability.
+  return withNote({ label: 'undocumented-vulnerability' });
 }
 
 /**
- * Classify a reproduction-proven finding as a known CVE or a novel 0-day.
+ * Classify a reproduction-proven finding as a known CVE, a rediscovery, or a
+ * first-sighting undocumented vulnerability.
+ *
+ * Precedence (highest first):
+ *   1. Static-DB / OSV documented advisory          → 'known-cve'
+ *   2. Documented as patched yet still reproduces   → 'undocumented-vulnerability'
+ *      with `regressionSuspect: true` (triage signal)
+ *   3. No public advisory, but a prior sighting in
+ *      `ctx.priorDiscoveries` (this tool's own store) → 'previously-discovered'
+ *   4. Otherwise (first sighting, no advisory)      → 'undocumented-vulnerability'
+ *
+ * Steps 1–2 are unchanged from before; step 3 is the new rediscovery
+ * recognition. `ctx.priorDiscoveries` defaults to `[]` (same backward-compatible
+ * pattern `osvVulns` already uses — passing nothing is identical to today).
  *
  * @param {object} finding - a confirmed chain (has source.property, etc.)
- * @param {{ package: string, version: string, proofType?: 'pp'|'rce', osvVulns?: Array|null }} ctx
- * @returns {{ label: 'known-cve'|'novel-0day', cve?: string, matchedRange?: string, regressionSuspect?: boolean, note?: string, source?: string, osvNote?: string }}
+ * @param {{ package: string, version: string, proofType?: 'pp'|'rce', osvVulns?: Array|null, priorDiscoveries?: Array }} ctx
+ * @returns {{ label: 'known-cve'|'undocumented-vulnerability'|'previously-discovered', cve?: string, matchedRange?: string, regressionSuspect?: boolean, note?: string, source?: string, osvNote?: string, priorSighting?: { discoveredAt: string, version: string } }}
  */
 export function classifyFinding(finding, ctx) {
   const pkg = (ctx.package || '').split('@')[0];
@@ -140,6 +165,7 @@ export function classifyFinding(finding, ctx) {
   // A prototype-pollution *source* (a merge/clone/set function that writes an
   // attacker-chosen key onto a prototype) is ONE bug regardless of which property
   // demonstrates it. Novelty keys on package + version, not the arbitrary property.
+  let verdict;
   if (ctx.proofType === 'pp') {
     const pkgSources = PP_SOURCES.filter(s => s.package === pkg);
     const staticInRange = pkgSources.find(s => versionInRange(version, s.versions)) || null;
@@ -147,7 +173,10 @@ export function classifyFinding(finding, ctx) {
     const regressionNote = staticOutOfRange
       ? `Reproduced prototype-pollution source in ${pkg}@${version}; the package has a documented PP source (${staticOutOfRange.cve || 'advisory'} ${staticOutOfRange.versions}) but this version is outside that range — regression or DB/range error, human triage required.`
       : null;
-    return combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns });
+    verdict = combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns });
+    // A PP source is one bug per polluting function — match prior sightings
+    // property-agnostically, mirroring the static-DB logic above.
+    return applyPriorSighting(verdict, ctx.priorDiscoveries, { package: pkg, entryPoint: finding.input?.entryPoint });
   }
 
   // ── PP GADGET bugs (proofType 'rce') ───────────────────────────────────────
@@ -171,5 +200,32 @@ export function classifyFinding(finding, ctx) {
     ? `Reproduced on ${pkg}@${version}, documented as patched by ${staticOutOfRange.cve || 'advisory'} (${staticOutOfRange.versions}). Either a regression or a database/range error — human triage required.`
     : null;
 
-  return combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns });
+  verdict = combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns });
+  return applyPriorSighting(verdict, ctx.priorDiscoveries, {
+    package: pkg,
+    entryPoint: finding.input?.entryPoint,
+    property: finding.source?.property,
+  });
+}
+
+/**
+ * Precedence step: a clean first-sighting (undocumented, not a regression
+ * suspect) becomes `previously-discovered` when this tool already recorded it.
+ * Static-DB / OSV / regression-suspect verdicts are returned untouched — they
+ * outrank a prior sighting.
+ */
+function applyPriorSighting(verdict, priorDiscoveries, key) {
+  if (!verdict || verdict.label !== 'undocumented-vulnerability' || verdict.regressionSuspect) {
+    return verdict;
+  }
+  const prior = findPriorSighting(priorDiscoveries || [], key);
+  if (!prior) return verdict;
+  return {
+    ...verdict,
+    label: 'previously-discovered',
+    priorSighting: {
+      discoveredAt: prior.discoveredAt || null,
+      version: prior.version || null,
+    },
+  };
 }
