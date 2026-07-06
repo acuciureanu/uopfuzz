@@ -10,6 +10,7 @@ import { GadgetAnalysis } from '../gadget-analysis/index.js';
 import { generateSingleReport } from '../reporting/markdown-report.js';
 import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
 import { classifyFinding } from '../gadget-analysis/novelty.js';
+import { fetchOsvVulns } from '../sources/osv.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -63,6 +64,10 @@ export class Orchestrator {
 
       logger.info('Setting up target environment...');
       await this.setupTarget();
+
+      // Enrich the novelty gate with live OSV.dev advisories (once per run).
+      // Fail-safe: never throws; degrades to static-DB-only if unavailable.
+      await this.fetchOsvData();
 
       logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
@@ -313,6 +318,30 @@ export class Orchestrator {
    *    run the differential oracle (clean vs polluted) and confirm gadgets.
    */
   /**
+   * Fetch live OSV.dev advisories for the target package@version, once per run,
+   * to enrich the novelty gate. Fail-safe: never throws; leaves `this.osvVulns`
+   * null (→ static-DB-only classification) when disabled, dry-run, or unreachable
+   * (offline / --network=none / egress-blocked). NOT gated on --allow-network:
+   * that flag governs the untrusted target's egress, whereas this is a trusted
+   * read-only metadata call from the orchestrator itself. Opt out with --no-osv.
+   */
+  async fetchOsvData() {
+    this.osvVulns = null;
+    if (this.options.dryRun || this.options.noOsv) return;
+    const pkg = this.config?.package;
+    const version = this.config?.version;
+    if (!pkg || !version) return;
+
+    const result = await fetchOsvVulns(pkg, version, { ecosystem: 'npm' }); // never throws
+    if (result.ok && result.vulns.length > 0) {
+      this.osvVulns = result.vulns;
+      logger.info(`OSV.dev: ${result.vulns.length} advisor${result.vulns.length !== 1 ? 'ies' : 'y'} for ${pkg}@${version}`);
+    } else if (!result.ok) {
+      logger.debug(`OSV.dev lookup unavailable for ${pkg}@${version}: ${result.error} (using static DB only)`);
+    }
+  }
+
+  /**
    * The zero-false-positive gate. A discovery-oracle result becomes a reported
    * vulnerability ONLY if it reproduces independently in fresh child processes
    * (real prototype mutation for proofType 'pp', canary code execution for 'rce').
@@ -362,7 +391,7 @@ export class Orchestrator {
       // (merge/URL diffs carry a fully-qualified "Object.prototype.x" name).
       if (chain.source) chain.source.property = descriptor.property;
 
-      chain.novelty = classifyFinding(chain, { package: pkg, version, proofType });
+      chain.novelty = classifyFinding(chain, { package: pkg, version, proofType, osvVulns: this.osvVulns });
 
       // Report-level dedup by BUG identity so one merge/source bug does not
       // surface once per property name tried. A PP *source* is one bug per

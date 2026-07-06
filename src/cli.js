@@ -29,7 +29,8 @@ program
   .option('--skip-integrity-check', 'Skip package integrity verification')
   .option('--sandbox', 'Run target code in isolated child process (recommended)', true)
   .option('--no-sandbox', 'Disable child process isolation (faster, less safe)')
-  .option('--allow-network', 'Allow network access during target execution');
+  .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (novelty labels use the built-in DB only). Note: an OSV query reveals the analyzed package@version to a third party');
 
 program.action(async (options) => {
   try {
@@ -84,6 +85,7 @@ program.action(async (options) => {
       skipIntegrityCheck: options.skipIntegrityCheck || false,
       sandbox: options.sandbox !== false,
       blockNetwork: !options.allowNetwork,
+      noOsv: options.osv === false,
     };
 
     const orchestrator = new Orchestrator(orchestratorOpts);
@@ -104,9 +106,11 @@ program.action(async (options) => {
         `(${zerodays} potential 0-day, ${knownCves} known CVE) — reproduced in fresh processes`
       ));
       for (const c of confirmedChains) {
+        const srcTag = c.novelty?.source === 'osv' ? ' via OSV.dev'
+          : c.novelty?.source === 'static+osv' ? ' (built-in DB + OSV.dev)' : '';
         const tag = c.novelty?.label === 'novel-0day'
           ? chalk.red.bold(`POTENTIAL 0-DAY${c.novelty?.regressionSuspect ? ' (regression suspect)' : ''}`)
-          : chalk.yellow(`known CVE${c.novelty?.cve ? ' ' + c.novelty.cve : ''}`);
+          : chalk.yellow(`known CVE${c.novelty?.cve ? ' ' + c.novelty.cve : ''}${srcTag}`);
         logger.warn(`  • ${tag}: Object.prototype.${c.source?.property} via ${c.input?.entryPoint} [${c.proof?.type}]`);
       }
     }
@@ -147,6 +151,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (novelty labels use the built-in DB only)')
   .action(async (options) => {
     try {
       if (options.verbose) logger.level = 'debug';
@@ -164,6 +169,7 @@ program
         skipIntegrityCheck: options.skipIntegrityCheck || false,
         sandbox: options.sandbox !== false,
         blockNetwork: !options.allowNetwork,
+        noOsv: options.osv === false,
       };
 
       const runner = new MassRunner({
@@ -210,6 +216,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (novelty labels use the built-in DB only)')
   .action(async (options) => {
     try {
       if (options.verbose) logger.level = 'debug';
@@ -244,6 +251,7 @@ program
         skipIntegrityCheck: options.skipIntegrityCheck || false,
         sandbox: options.sandbox !== false,
         blockNetwork: !options.allowNetwork,
+        noOsv: options.osv === false,
       };
 
       const runner = new VersionRunner({

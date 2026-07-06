@@ -123,8 +123,11 @@ export function generateSingleReport(results, config) {
       const isURL = poc.type === 'url_gadget';
       const score = parseFloat(chain.riskLevel) || 0;
       const nov = chain.novelty || {};
+      const srcTag = nov.source === 'osv' ? ' (OSV.dev)'
+        : nov.source === 'static+osv' ? ' (built-in DB + OSV.dev)'
+        : nov.source === 'static' ? ' (built-in DB)' : '';
       const novLabel = nov.label === 'known-cve'
-        ? `KNOWN CVE${nov.cve ? ' — ' + nov.cve : ''}`
+        ? `KNOWN CVE${nov.cve ? ' — ' + nov.cve : ''}${srcTag}`
         : `POTENTIAL 0-DAY${nov.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
       const proof = chain.proof || {};
 
@@ -153,6 +156,11 @@ export function generateSingleReport(results, config) {
 
       if (nov.regressionSuspect && nov.note) {
         md += `> ⚠ **Regression suspect:** ${nov.note}\n\n`;
+      } else if (nov.source === 'osv' && nov.note) {
+        md += `> ℹ ${nov.note}\n\n`;
+      }
+      if (nov.osvNote) {
+        md += `> ℹ ${nov.osvNote}\n\n`;
       }
 
       if (chain.standalonePoC) {

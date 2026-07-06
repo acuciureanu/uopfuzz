@@ -118,6 +118,74 @@ describe('novelty classifier (offline)', () => {
   });
 });
 
+// ─── OSV.dev augmentation (synthetic vulns, no network) ──────────────────────
+describe('novelty classifier + OSV.dev (offline, synthetic osvVulns)', () => {
+  const ppOsvVuln = (introduced, fixed) => ({
+    id: 'GHSA-test-pp', summary: 'Prototype Pollution in x', aliases: ['CVE-2099-0001'],
+    database_specific: { cwe_ids: ['CWE-1321'] },
+    affected: [{ ranges: [{ type: 'SEMVER', events: [{ introduced }, ...(fixed ? [{ fixed }] : [])] }] }],
+  });
+  const nonPpOsvVuln = () => ({
+    id: 'GHSA-test-redos', summary: 'ReDoS in x', aliases: ['CVE-2099-9999'],
+    database_specific: { cwe_ids: ['CWE-1333'] },
+    affected: [{ ranges: [{ type: 'SEMVER', events: [{ introduced: '0' }] }] }],
+  });
+
+  test('OSV alone labels a package absent from the static DB as known-cve', () => {
+    const f = { source: { property: 'x' }, input: { entryPoint: 'merge' } };
+    const c = classifyFinding(f, {
+      package: 'nobody-knows-this', version: '1.0.0', proofType: 'pp',
+      osvVulns: [ppOsvVuln('0', '2.0.0')],
+    });
+    assert.equal(c.label, 'known-cve');
+    assert.equal(c.source, 'osv');
+    assert.equal(c.cve, 'CVE-2099-0001');
+  });
+
+  test('OSV upgrades a regression-suspect to a clean known-cve', () => {
+    // lodash@4.17.21 is out of the static DB range → normally regression-suspect.
+    // OSV confirming a PP advisory covering 4.17.21 makes it a clean known-cve.
+    const finding = { source: { property: 'polluted' }, input: { entryPoint: 'merge' } };
+    const c = classifyFinding(finding, {
+      package: 'lodash', version: '4.17.21', proofType: 'pp',
+      osvVulns: [ppOsvVuln('0', '5.0.0')],
+    });
+    assert.equal(c.label, 'known-cve');
+    assert.notEqual(c.regressionSuspect, true);
+    assert.equal(c.source, 'osv');
+  });
+
+  test('a non-PP OSV advisory does NOT suppress a novel finding', () => {
+    const f = { source: { property: 'x' }, input: { entryPoint: 'merge' } };
+    const c = classifyFinding(f, {
+      package: 'nobody-knows-this', version: '1.0.0', proofType: 'pp',
+      osvVulns: [nonPpOsvVuln()],
+    });
+    assert.equal(c.label, 'novel-0day', 'an unrelated CVE must not bury a novel PP 0-day');
+    assert.ok(c.osvNote, 'but it should be noted as an FYI');
+  });
+
+  test('static+OSV agree → source static+osv, static CVE id preserved', () => {
+    const f = { source: { property: 'polluted' }, input: { entryPoint: 'merge' } };
+    const staticOnly = classifyFinding(f, { package: 'lodash', version: '4.17.4', proofType: 'pp' });
+    const withOsv = classifyFinding(f, {
+      package: 'lodash', version: '4.17.4', proofType: 'pp',
+      osvVulns: [ppOsvVuln('0', '4.17.12')],
+    });
+    assert.equal(withOsv.label, 'known-cve');
+    assert.equal(withOsv.source, 'static+osv');
+    assert.equal(withOsv.cve, staticOnly.cve, 'static DB CVE id wins over OSV');
+  });
+
+  test('osvVulns:null is identical to today (fully backward compatible)', () => {
+    const f = { source: { property: 'x' }, input: { entryPoint: 'merge' } };
+    const a = classifyFinding(f, { package: 'nobody-knows-this', version: '1.0.0', proofType: 'pp' });
+    const b = classifyFinding(f, { package: 'nobody-knows-this', version: '1.0.0', proofType: 'pp', osvVulns: null });
+    assert.deepEqual(a, b);
+    assert.equal(a.label, 'novel-0day');
+  });
+});
+
 // ─── Real-package (gated: skip when not installed) ───────────────────────────
 describe('real-package reproduction (skipped when absent)', () => {
   const require = createRequire(import.meta.url);

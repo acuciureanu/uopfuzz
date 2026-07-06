@@ -1,39 +1,40 @@
 import { compareVersions } from '../sources/version-scanner.js';
 import { getGadgetsForPackage, PP_SOURCES } from './known-gadgets.js';
+import { osvKnownCve, osvOtherAdvisories } from '../sources/osv.js';
 
 /**
  * Novelty / 0-day classifier.
  *
  * "0-day" means a previously-unknown vulnerability. A tool that re-discovers a
  * documented CVE has not found a 0-day. This module cross-references a
- * reproduction-proven finding against the built-in known-vulnerability database
- * (known-gadgets.js) using semver-range matching, and labels it:
+ * reproduction-proven finding against (1) the built-in static known-vulnerability
+ * database (known-gadgets.js) and (2) — when available — live OSV.dev advisories,
+ * labelling it:
  *
- *   - 'known-cve'  : package + property + version-in-documented-range matches a
- *                    known advisory. Good for regression, NOT a 0-day.
- *   - 'novel-0day' : no known advisory covers this package/property/version.
- *                    A candidate 0-day (still needs human confirmation before
- *                    disclosure). `regressionSuspect` is set when the property
- *                    matches a known CVE but the installed version is documented
- *                    as patched — genuinely ambiguous (real regression vs a
- *                    DB/range error), flagged for human triage.
+ *   - 'known-cve'  : a documented advisory (static DB and/or OSV) covers this
+ *                    package@version. Good for regression, NOT a 0-day.
+ *   - 'novel-0day' : no known advisory covers it. A candidate 0-day (still needs
+ *                    human confirmation). `regressionSuspect` marks the ambiguous
+ *                    case where the static DB documents the package as patched at
+ *                    this version yet it still reproduced.
+ *
+ * `source` records provenance of a known-cve label: 'static' | 'osv' | 'static+osv'.
+ *
+ * OSV is class-aware: only prototype-pollution advisories (see
+ * src/sources/osv.js `isPrototypePollution`) may flip a finding to known-cve.
+ * An unrelated CVE at the same version must never bury a genuine novel PP 0-day.
  */
 
 /**
  * Test whether `version` satisfies a range string as they appear in
  * known-gadgets.js: '*', '<x.y.z', '<=x.y.z', '>=x.y.z', exact 'x.y.z', or a
  * compound 'from..to' (inclusive). Returns false on unparseable input.
- *
- * @param {string} version
- * @param {string} range
- * @returns {boolean}
  */
 export function versionInRange(version, range) {
   if (!version || !range) return false;
   const r = String(range).trim();
   if (r === '*') return true;
 
-  // compound range: "4.0.0..4.17.0" (inclusive)
   if (r.includes('..')) {
     const [from, to] = r.split('..').map(s => s.trim());
     return compareVersions(version, from) >= 0 && compareVersions(version, to) <= 0;
@@ -54,16 +55,11 @@ export function versionInRange(version, range) {
   }
 }
 
-/**
- * Extract the property name(s) associated with a finding for matching.
- * @param {object} finding
- * @returns {Set<string>}
- */
+/** Extract property name(s) associated with a finding for static-DB matching. */
 function findingProperties(finding) {
   const props = new Set();
   if (finding.source?.property) props.add(finding.source.property);
   for (const p of finding.differential?.pollutedProperties || []) {
-    // pollutedProperties look like "Object.prototype.polluted" — take last key
     props.add(String(p).split('.').pop());
   }
   for (const p of finding.coPolluteProperties || []) props.add(p);
@@ -71,69 +67,109 @@ function findingProperties(finding) {
 }
 
 /**
+ * Merge the static-DB verdict with the OSV signal per the decision table.
+ * OSV is already class-filtered to prototype-pollution advisories.
+ */
+function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns }) {
+  const osv = osvKnownCve(osvVulns, version);            // PP-class match or null
+  const otherAdv = osvOtherAdvisories(osvVulns, version); // non-PP ids (FYI only)
+  const osvNote = otherAdv.length
+    ? `OSV lists ${otherAdv.length} other (non-prototype-pollution) advisor${otherAdv.length !== 1 ? 'ies' : 'y'} at this version: ${otherAdv.slice(0, 3).join(', ')}${otherAdv.length > 3 ? '…' : ''}.`
+    : null;
+  const withNote = (obj) => (osvNote ? { ...obj, osvNote } : obj);
+
+  // Static DB confirms a documented range covering this version.
+  if (staticInRange) {
+    return withNote({
+      label: 'known-cve',
+      cve: staticInRange.cve || osv?.cve || null,
+      matchedRange: staticInRange.versions,
+      source: osv ? 'static+osv' : 'static',
+    });
+  }
+
+  // Static DB documents the package but this version is outside its range.
+  if (staticOutOfRange) {
+    if (osv) {
+      // OSV independently confirms this version IS affected → static DB is stale,
+      // not a regression. Clean known-cve, no human triage needed.
+      return withNote({
+        label: 'known-cve',
+        cve: osv.cve,
+        matchedRange: osv.matchedRange,
+        source: 'osv',
+        note: `OSV advisory ${osv.cve} confirms ${pkg}@${version} is affected; the static DB's documented range (${staticOutOfRange.versions}) appears stale.`,
+      });
+    }
+    return withNote({
+      label: 'novel-0day',
+      regressionSuspect: true,
+      cve: staticOutOfRange.cve || null,
+      note: regressionNote,
+      source: 'static',
+    });
+  }
+
+  // Static DB has nothing for this package/property.
+  if (osv) {
+    return withNote({
+      label: 'known-cve',
+      cve: osv.cve,
+      matchedRange: osv.matchedRange,
+      source: 'osv',
+    });
+  }
+
+  // Nothing known anywhere → candidate 0-day.
+  return withNote({ label: 'novel-0day' });
+}
+
+/**
  * Classify a reproduction-proven finding as a known CVE or a novel 0-day.
  *
  * @param {object} finding - a confirmed chain (has source.property, etc.)
- * @param {{ package: string, version: string }} ctx
- * @returns {{ label: 'known-cve'|'novel-0day', cve?: string, matchedRange?: string, regressionSuspect?: boolean, note?: string }}
+ * @param {{ package: string, version: string, proofType?: 'pp'|'rce', osvVulns?: Array|null }} ctx
+ * @returns {{ label: 'known-cve'|'novel-0day', cve?: string, matchedRange?: string, regressionSuspect?: boolean, note?: string, source?: string, osvNote?: string }}
  */
 export function classifyFinding(finding, ctx) {
   const pkg = (ctx.package || '').split('@')[0];
   const version = ctx.version || '';
+  const osvVulns = ctx.osvVulns;
 
   // ── PP SOURCE bugs (proofType 'pp') ────────────────────────────────────────
   // A prototype-pollution *source* (a merge/clone/set function that writes an
-  // attacker-chosen key onto a prototype) is ONE bug regardless of which
-  // property demonstrates it. Novelty therefore keys on package + version, not
-  // the arbitrary attacker property — otherwise the same documented CVE gets
-  // relabeled "0-day" every time a new property name is tried.
+  // attacker-chosen key onto a prototype) is ONE bug regardless of which property
+  // demonstrates it. Novelty keys on package + version, not the arbitrary property.
   if (ctx.proofType === 'pp') {
     const pkgSources = PP_SOURCES.filter(s => s.package === pkg);
-    const inRange = pkgSources.find(s => versionInRange(version, s.versions));
-    if (inRange) {
-      return { label: 'known-cve', cve: inRange.cve || null, matchedRange: inRange.versions };
-    }
-    if (pkgSources.length > 0) {
-      const nearest = pkgSources[0];
-      return {
-        label: 'novel-0day',
-        regressionSuspect: true,
-        cve: nearest.cve || null,
-        note: `Reproduced prototype-pollution source in ${pkg}@${version}; the package has a documented PP source (${nearest.cve || 'advisory'} ${nearest.versions}) but this version is outside that range — regression or DB/range error, human triage required.`,
-      };
-    }
-    return { label: 'novel-0day' };
+    const staticInRange = pkgSources.find(s => versionInRange(version, s.versions)) || null;
+    const staticOutOfRange = !staticInRange && pkgSources.length > 0 ? pkgSources[0] : null;
+    const regressionNote = staticOutOfRange
+      ? `Reproduced prototype-pollution source in ${pkg}@${version}; the package has a documented PP source (${staticOutOfRange.cve || 'advisory'} ${staticOutOfRange.versions}) but this version is outside that range — regression or DB/range error, human triage required.`
+      : null;
+    return combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns });
   }
 
   // ── PP GADGET bugs (proofType 'rce') ───────────────────────────────────────
   const props = findingProperties(finding);
   const known = getGadgetsForPackage(pkg);
 
-  let propertyMatchOutsideRange = null;
-
+  let staticInRange = null;
+  let staticOutOfRange = null;
   for (const entry of known) {
     const entryProp = entry.property || entry.payload?.property;
-    // Sources are keyed by function; also allow function-name overlap for source bugs.
     const propMatch = entryProp && props.has(entryProp);
     const fnMatch = entry.function && finding.input?.entryPoint &&
       String(finding.input.entryPoint).split('.').pop() === entry.function;
     if (!propMatch && !fnMatch) continue;
 
-    if (versionInRange(version, entry.versions)) {
-      return { label: 'known-cve', cve: entry.cve || null, matchedRange: entry.versions };
-    }
-    // Property/function matches a known advisory but version is outside its range.
-    propertyMatchOutsideRange = entry;
+    if (versionInRange(version, entry.versions)) { staticInRange = entry; break; }
+    staticOutOfRange = entry; // property/function matches but version out of range
   }
 
-  if (propertyMatchOutsideRange) {
-    return {
-      label: 'novel-0day',
-      regressionSuspect: true,
-      cve: propertyMatchOutsideRange.cve || null,
-      note: `Reproduced on ${pkg}@${version}, documented as patched by ${propertyMatchOutsideRange.cve || 'advisory'} (${propertyMatchOutsideRange.versions}). Either a regression or a database/range error — human triage required.`,
-    };
-  }
+  const regressionNote = staticOutOfRange
+    ? `Reproduced on ${pkg}@${version}, documented as patched by ${staticOutOfRange.cve || 'advisory'} (${staticOutOfRange.versions}). Either a regression or a database/range error — human triage required.`
+    : null;
 
-  return { label: 'novel-0day' };
+  return combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regressionNote, osvVulns });
 }
