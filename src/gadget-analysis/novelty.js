@@ -169,8 +169,18 @@ export function classifyFinding(finding, ctx) {
   let verdict;
   if (ctx.proofType === 'pp') {
     const pkgSources = PP_SOURCES.filter(s => s.package === pkg);
-    const staticInRange = pkgSources.find(s => versionInRange(version, s.versions)) || null;
-    const staticOutOfRange = !staticInRange && pkgSources.length > 0 ? pkgSources[0] : null;
+    // A package can carry multiple PP-source CVEs with overlapping version
+    // ranges (e.g. lodash merge vs defaultsDeep vs zipObjectDeep) — picking the
+    // first package match regardless of function mislabels the CVE. Prefer
+    // entries whose documented `function` matches the entry point actually
+    // fuzzed; fall back to the unfiltered package list when the entry point
+    // doesn't map to any known function name, so an unmapped alias still gets
+    // classified instead of silently skipped.
+    const entryFn = finding.input?.entryPoint ? String(finding.input.entryPoint).split('.').pop() : null;
+    const fnMatched = entryFn ? pkgSources.filter(s => s.function === entryFn) : [];
+    const candidateSources = fnMatched.length ? fnMatched : pkgSources;
+    const staticInRange = candidateSources.find(s => versionInRange(version, s.versions)) || null;
+    const staticOutOfRange = !staticInRange && candidateSources.length > 0 ? candidateSources[0] : null;
     const regressionNote = staticOutOfRange
       ? `Reproduced prototype-pollution source in ${pkg}@${version}; the package has a documented PP source (${staticOutOfRange.cve || 'advisory'} ${staticOutOfRange.versions}) but this version is outside that range — regression or DB/range error, human triage required.`
       : null;
