@@ -18,6 +18,7 @@ import {
   DEFAULT_DISCOVERY_STORE_PATH,
 } from '../gadget-analysis/discovery-store.js';
 import { packageBaseName } from '../utils/package-name.js';
+import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -62,6 +63,16 @@ export class Orchestrator {
   async run() {
     try {
       this.results.startTime = new Date();
+
+      // Baseline snapshot for the run-end safety net in saveResults(). In-process
+      // differential modes (forced-branch, multi-property) install/restore traps
+      // around each individual call, but a run of many iterations against a
+      // library that itself touches Object.prototype (observed with ejs,
+      // handlebars, pug) can still leave residual own-properties behind by the
+      // time the run ends — which has crashed fs.writeFile with an internal
+      // Node assertion. This baseline lets saveResults() restore a clean state
+      // unconditionally before doing I/O, regardless of which call leaked.
+      this._startupPrototypeSnapshot = snapshotPrototype();
 
       logger.info('Loading configuration...');
       await this.loadConfiguration();
@@ -952,6 +963,15 @@ export class Orchestrator {
   }
 
   async saveResults() {
+    // Defensive cleanup net: restore Object.prototype to its run-start baseline
+    // before any I/O. See the comment on _startupPrototypeSnapshot in run().
+    if (this._startupPrototypeSnapshot) {
+      const detection = detectAndRestorePrototype(this._startupPrototypeSnapshot);
+      if (detection.polluted) {
+        logger.debug(`saveResults: cleaned up ${detection.newProps.length} residual prototype propert${detection.newProps.length === 1 ? 'y' : 'ies'} before writing output: ${detection.newProps.join(', ')}`);
+      }
+    }
+
     const outputDir = path.resolve(this.options.outputDir);
     await fs.mkdir(outputDir, { recursive: true });
 
