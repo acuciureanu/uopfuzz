@@ -8,21 +8,27 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /**
  * Sandboxed Target Execution
  *
- * Runs target code in an isolated child process to prevent:
- * 1. Malicious code from accessing the fuzzer's process state
- * 2. Filesystem writes outside the sandbox
- * 3. Network exfiltration during execution
- * 4. Process-level attacks (process.exit, process.env manipulation)
+ * Runs target code in a child process. This raises the cost of the common,
+ * low-effort bad behaviors — a library that phones home, shells out at runtime,
+ * reads the operator's secrets from the environment, or kills the process — but
+ * it is NOT a security boundary against a targeted exploit. The child shares this
+ * process's uid, filesystem, and network namespace; the in-child protections are
+ * best-effort JavaScript monkey-patches (see worker-hardening.js).
  *
- * Defense in depth:
- * - Layer 1: Child process isolation (separate V8 instance, separate memory)
- * - Layer 2: Network restriction via NODE_OPTIONS=--dns-result-order and unref
- * - Layer 3: Filesystem restriction via chroot/chdir (when running as root in container)
- * - Layer 4: Timeout enforcement from the parent process
- * - Layer 5: Dev container (outer boundary — see .devcontainer/)
+ * The ACTUAL isolation boundary is the dev container (.devcontainer/): no secrets
+ * in its environment, egress governed by the network policy, ephemeral
+ * filesystem. Untrusted targets should only be fuzzed inside it.
  *
- * The child process loads the target, executes it, and returns results via IPC.
- * If it crashes, hangs, or tries to escape, the parent kills it.
+ * Layers, weakest-claim-first:
+ * - Child process isolation: separate V8/heap; a crash or hang is contained and
+ *   the parent SIGKILLs it (real, reliable).
+ * - Env scrub: known secret-bearing vars are stripped from the child (below).
+ * - Capability blocks in the child: network (opt-in), child_process, and
+ *   worker_threads are monkey-patched off (worker-hardening.js) — best-effort.
+ * - Timeout enforcement from the parent (real, reliable).
+ * - Dev container: the outer boundary that actually contains a hostile target.
+ *
+ * The child loads the target, executes it, and returns results via IPC.
  */
 
 /**

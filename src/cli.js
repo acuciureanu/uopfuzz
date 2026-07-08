@@ -63,11 +63,17 @@ program.action(async (options) => {
       logger.warn(chalk.yellow('⚠ --allow-network: target code can make outbound connections'));
     }
 
-    if (!process.env.UOPFUZZ_CONTAINER && !options.dryRun) {
+    if (!options.dryRun) {
       logger.info(chalk.yellow(
-        'Tip: Run inside the dev container for maximum isolation:\n' +
-        '  devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . node src/cli.js --target <pkg>'
+        'Only analyze packages you are authorized to test. Target code IS executed — ' +
+        'run untrusted packages inside the dev container (the real isolation boundary). See the Safety model in README.md.'
       ));
+      if (!process.env.UOPFUZZ_CONTAINER) {
+        logger.info(chalk.yellow(
+          'Tip: Run inside the dev container for isolation:\n' +
+          '  devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . node src/cli.js --target <pkg>'
+        ));
+      }
     }
 
     const orchestratorOpts = {
