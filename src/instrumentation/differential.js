@@ -1,6 +1,7 @@
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { logger } from '../utils/logger.js';
 import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
+import { classifyDiff } from './classify-diff.js';
 
 /**
  * Differential Execution Oracle
@@ -242,60 +243,19 @@ function diffResults(cleanResult, pollutedResult, pollutionDescriptor) {
   //   proofType 'pp'  → try to reproduce real Object.prototype mutation
   //   proofType 'rce' → try to reproduce real code execution (canary)
   //
-  // Only Tier 0 (an actual prototype mutation observed in-run) is left as a
-  // pre-confirmed pollution candidate; everything else is a candidate pending
-  // reproduction. `confidence` is retained for ranking/effort ordering only.
-  diff.isConfirmedGadget = false;
-  diff.isCandidate = false;
-  diff.proofType = null;
-  diff.reproducible = false;
-
-  if (diff.prototypePolluted) {
-    // Tier 0: the target actually added a property to a monitored prototype.
-    diff.isConfirmedGadget = true; // pollution candidate — still gated on reproduction
-    diff.proofType = 'pp';
-    diff.reproducible = true;
-    diff.confidence = Math.max(diff.confidence, 0.85);
-  } else if (diff.newSinkAccesses.length > 0 && diff.pollutionWasRead) {
-    // Tier 1: a code sink fired while the polluted property was read.
-    diff.isCandidate = true;
-    diff.proofType = 'rce';
-    diff.reproducible = true;
-    diff.confidence = Math.max(diff.confidence, 0.95);
-  } else if (payloadInOutput && diff.pollutionWasRead) {
-    // Tier 2: the payload reached output (injection) — try code execution.
-    diff.isCandidate = true;
-    diff.proofType = 'rce';
-    diff.reproducible = true;
-    diff.confidence = Math.max(diff.confidence, 0.90);
-  } else if (diff.outputChanged && diff.pollutionWasRead) {
-    diff.isCandidate = true;
-    diff.proofType = 'rce';
-    diff.reproducible = true;
-    diff.confidence = Math.max(diff.confidence, 0.75);
-  } else if (diff.errorChanged && diff.pollutionWasRead) {
-    diff.isCandidate = true;
-    diff.proofType = 'rce';
-    diff.reproducible = true;
-    diff.confidence = Math.max(diff.confidence, 0.60);
-  } else if (pollutedResult.pollutionWasRead) {
-    // Tier 5: the property was read but nothing observable changed. High-risk
-    // (sink-adjacent) names are still worth a reproduction attempt; the rest are
-    // low-value leads kept only for manual review (no reproduction attempt).
-    const HIGH_RISK_PROPS = new Set([
-      'template', 'code', 'script', 'eval', 'command', 'shell', 'exec',
-      'source', 'expression', 'compile', 'render', 'Function',
-      'url', 'href', 'src', 'action', 'baseURL', 'endpoint', 'proxy',
-      'innerHTML', 'outerHTML', 'textContent', 'onclick', 'onerror',
-      'compileDebug', 'debug', 'self', 'constructor', 'allowDots',
-      'allowPrototypes', 'outputFunctionName', 'localsName', 'destructuredLocals',
-      'escape', 'client', 'globals', 'filename',
-    ]);
-    diff.isCandidate = true;
-    diff.proofType = 'rce';
-    diff.reproducible = HIGH_RISK_PROPS.has(pollutionDescriptor.property);
-    diff.confidence = Math.max(diff.confidence, diff.reproducible ? 0.50 : 0.30);
-  }
+  // The tier ladder is shared with the sandboxed oracle via classifyDiff() so
+  // the two can never drift (invariant #4). `confidence` is retained for
+  // ranking/effort ordering only.
+  const verdict = classifyDiff({
+    property: pollutionDescriptor.property,
+    prototypePolluted: diff.prototypePolluted,
+    pollutionWasRead: diff.pollutionWasRead,
+    newSinkAccesses: diff.newSinkAccesses,
+    payloadInOutput,
+    outputChanged: diff.outputChanged,
+    errorChanged: diff.errorChanged,
+  });
+  Object.assign(diff, verdict);
 
   return diff;
 }

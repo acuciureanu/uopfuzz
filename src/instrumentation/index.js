@@ -3,6 +3,7 @@ import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
+import { classifyDiff } from './classify-diff.js';
 import { executeInSandbox } from '../utils/sandbox.js';
 import { packageBaseName } from '../utils/package-name.js';
 import { createRequire } from 'module';
@@ -374,23 +375,45 @@ export class Instrumentation {
 
       // Translate sandbox result to the format gadget-analysis expects.
       //
-      // ZERO-FP: the sandbox path no longer hardcodes isConfirmedGadget on a bare
-      // output/error diff (its old behavior — even looser than in-process). Only a
-      // REAL prototype mutation is a pollution candidate ('pp'); an output/error
-      // diff is a code-execution candidate ('rce') that must survive independent
-      // reproduction before it is ever reported as a vulnerability.
-      if (result.outputChanged || result.errorChanged || result.prototypePolluted) {
-        const payloadReachedOutput = result.polluted?.output?.includes?.(String(descriptor.value)) &&
-          !result.clean?.output?.includes?.(String(descriptor.value));
-        const isPP = !!result.prototypePolluted;
+      // The tier verdict is computed by the SHARED classifyDiff() — the same
+      // ladder the in-process oracle uses — fed the sandbox worker's REAL facts.
+      // This closes the drift that invariant #4 forbids: the sandbox worker
+      // already computes pollutionWasRead (getter-trap fired) and newSinkAccesses
+      // (eval/Function/vm hooks), which this reconciliation used to discard —
+      // hardcoding pollutionWasRead=true and dropping every sink access, so Tier 1
+      // was unreachable in the default (sandboxed) mode. Now those facts flow
+      // through untouched.
+      //
+      // ZERO-FP: classifyDiff only PROPOSES candidates. Only a real prototype
+      // mutation (Tier 0) is pre-confirmed; every behavioral diff is a
+      // reproduction candidate that must survive independent reproduction before
+      // it is ever reported as a vulnerability.
+      const newSinkAccesses = result.newSinkAccesses || [];
+      const pollutionWasRead = !!result.pollutionWasRead;
+      const isPP = !!result.prototypePolluted;
+      if (result.outputChanged || result.errorChanged || isPP ||
+          newSinkAccesses.length > 0 || pollutionWasRead) {
+        const payloadReachedOutput = !!(result.polluted?.output?.includes?.(String(descriptor.value)) &&
+          !result.clean?.output?.includes?.(String(descriptor.value)));
+        const verdict = classifyDiff({
+          property: descriptor.property,
+          prototypePolluted: isPP,
+          pollutionWasRead,
+          newSinkAccesses,
+          payloadInOutput: payloadReachedOutput,
+          outputChanged: result.outputChanged || false,
+          errorChanged: result.errorChanged || false,
+        });
+        // Nothing actionable — not even a manual-review lead. Drop it.
+        if (!verdict.isConfirmedGadget && !verdict.isCandidate) return null;
         return {
           clean: { output: result.clean?.output, error: result.clean?.error, sinkAccesses: [], taintLog: [] },
           polluted: {
             output: result.polluted?.output,
             error: result.polluted?.error,
-            sinkAccesses: [],
+            sinkAccesses: newSinkAccesses,
             taintLog: [],
-            pollutionWasRead: true,
+            pollutionWasRead,
             prototypePolluted: isPP,
             pollutedProperties: result.pollutedProperties || [],
           },
@@ -399,17 +422,11 @@ export class Instrumentation {
             payload: descriptor.value,
             outputChanged: result.outputChanged || false,
             errorChanged: result.errorChanged || false,
-            newSinkAccesses: [],
-            pollutionWasRead: true,
+            newSinkAccesses,
+            pollutionWasRead,
             prototypePolluted: isPP,
             pollutedProperties: result.pollutedProperties || [],
-            // Only real mutation is a pre-confirmed pollution candidate; behavioral
-            // diffs are reproduction candidates, never confirmed here.
-            isConfirmedGadget: isPP,
-            isCandidate: !isPP,
-            proofType: isPP ? 'pp' : 'rce',
-            reproducible: true,
-            confidence: isPP ? 0.95 : (result.outputChanged ? 0.75 : 0.60),
+            ...verdict,
             details: {
               cleanOutput: result.clean?.output?.substring?.(0, 500),
               pollutedOutput: result.polluted?.output?.substring?.(0, 500),
