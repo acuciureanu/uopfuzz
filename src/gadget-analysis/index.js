@@ -21,6 +21,15 @@ import { logger } from '../utils/logger.js';
  *    USENIX Security 2023): Systematic taxonomy of prototype
  *    pollution gadget patterns.
  */
+// detectAndRestorePrototype() (prototype-monitor.js) reports polluted keys fully
+// qualified, e.g. "Object.prototype.polluted" — fine for display, but templates
+// below re-prepend "Object.prototype." themselves, so bare it here first or the
+// generated PoC ends up with `Object.prototype.Object.prototype.x` and an
+// invalid `{ Object.prototype.x: ... }` object-literal key.
+function bareProperty(prop) {
+  return typeof prop === 'string' ? prop.replace(/^[A-Za-z_$][\w$]*\.prototype\./, '') : prop;
+}
+
 export class GadgetAnalysis {
   constructor(options) {
     this.options = options;
@@ -193,15 +202,15 @@ export class GadgetAnalysis {
 
     if (diff.prototypePolluted) {
       const props = diff.pollutedProperties?.length > 0
-        ? diff.pollutedProperties.join(', ')
-        : diff.property;
+        ? diff.pollutedProperties.map(bareProperty).join(', ')
+        : bareProperty(diff.property);
       if (diff.details.exploitURL) {
         parts.push(`CONFIRMED URL GADGET: Object.prototype.${props} polluted via URL query string → ${diff.details.payloadType}`);
       } else {
         parts.push(`CONFIRMED PROTOTYPE POLLUTION: Object.prototype.${props} was modified`);
       }
     } else {
-      parts.push(`CONFIRMED: Object.prototype.${diff.property} pollution`);
+      parts.push(`CONFIRMED: Object.prototype.${bareProperty(diff.property)} pollution`);
     }
 
     if (diff.newSinkAccesses.length > 0) {
@@ -225,7 +234,7 @@ export class GadgetAnalysis {
     const target = config?.name || 'unknown';
     const version = config?.version || '';
     const ep = chain.input?.entryPoint || 'unknown';
-    const prop = chain.source?.property || 'unknown';
+    const prop = bareProperty(chain.source?.property || 'unknown');
     const val = chain.source?.payload || '';
     const exploitURL = chain.differential?.exploitURL;
     const payloadType = chain.differential?.payloadType || '';

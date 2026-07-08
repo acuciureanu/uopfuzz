@@ -28,6 +28,8 @@
  * 4. Benchmark scoring — measure detection rate against ground truth
  */
 
+import { packageBaseName } from '../utils/package-name.js';
+
 // ─── PP SOURCES (merge/extend functions that pollute Object.prototype) ────────
 
 export const PP_SOURCES = [
@@ -271,7 +273,7 @@ export const PP_GADGETS = [
   // EJS — outputFunctionName
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
     cve: 'CVE-2022-29078',
     property: 'outputFunctionName',
     payload: "x;process.mainModule.require('child_process').execSync('id');//",
@@ -283,7 +285,8 @@ export const PP_GADGETS = [
   },
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
+    cve: 'CVE-2022-29078',
     property: 'destructuredLocals',
     payload: ["x;process.mainModule.require('child_process').execSync('id');//"],
     sink: 'Function',
@@ -294,7 +297,8 @@ export const PP_GADGETS = [
   },
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
+    cve: 'CVE-2022-29078',
     property: 'client',
     payload: true,
     sink: 'Function',
@@ -305,7 +309,8 @@ export const PP_GADGETS = [
   },
   {
     package: 'ejs',
-    versions: '<3.1.10',
+    versions: '<3.1.7',
+    cve: 'CVE-2022-29078',
     property: 'escapeFunction',
     payload: "1;return process.mainModule.require('child_process').execSync('id').toString()//",
     sink: 'Function',
@@ -533,7 +538,7 @@ export function getKnownSourceFunctions() {
  * @returns {Array} Known gadgets and sources for this package
  */
 export function getGadgetsForPackage(packageName) {
-  const base = packageName.split('@')[0];
+  const base = packageBaseName(packageName);
   return [
     ...PP_SOURCES.filter(s => s.package === base),
     ...PP_GADGETS.filter(g => g.package === base),

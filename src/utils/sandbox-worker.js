@@ -14,33 +14,15 @@
 
 import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
+import { hardenWorkerProcess } from './worker-hardening.js';
 const require = createRequire(import.meta.url);
 
-// ─── SECURITY: Network blocking ──────────────────────────────
-if (process.env.UOPFUZZ_BLOCK_NETWORK === '1') {
-  try {
-    const net = require('net');
-    const originalConnect = net.Socket.prototype.connect;
-    net.Socket.prototype.connect = function (...args) {
-      const err = new Error('Network access blocked by UoPFuzz sandbox');
-      err.code = 'ENETBLOCKED';
-      this.destroy(err);
-      return this;
-    };
-
-    // Also block dgram (UDP)
-    try {
-      const dgram = require('dgram');
-      const originalBind = dgram.Socket.prototype.bind;
-      dgram.Socket.prototype.bind = function () {
-        throw new Error('Network access blocked by UoPFuzz sandbox');
-      };
-    } catch { /* dgram not available */ }
-  } catch (err) {
-    // If we can't block network, log and continue
-    process.stderr.write(`Warning: Could not block network: ${err.message}\n`);
-  }
-}
+// ─── SECURITY: capability blocks (shared with repro-worker.js) ───────────────
+// child_process and worker_threads are always blocked; network egress is blocked
+// unless the operator opted in via --allow-network (UOPFUZZ_BLOCK_NETWORK unset).
+// See worker-hardening.js for the threat model — these are best-effort in-process
+// blocks, and the dev container is the real isolation boundary.
+hardenWorkerProcess(require, { blockNetwork: process.env.UOPFUZZ_BLOCK_NETWORK === '1' });
 
 // ─── SECURITY: Restrict dangerous process methods ────────────
 const originalExit = process.exit;
@@ -54,18 +36,6 @@ process.exit = function (code) {
   // Actually exit after sending
   originalExit.call(process, 0);
 };
-
-// Prevent target from spawning child processes
-try {
-  const cp = require('child_process');
-  for (const method of ['exec', 'execSync', 'spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
-    if (cp[method]) {
-      cp[method] = function () {
-        throw new Error(`child_process.${method} blocked by UoPFuzz sandbox`);
-      };
-    }
-  }
-} catch { /* child_process not available */ }
 
 // ─── SECURITY: Sink interception ─────────────────────────────
 // Intercept dangerous sinks to detect when polluted values reach them.
@@ -161,7 +131,7 @@ async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, po
   }
 
   // Resolve the entry point function
-  const fn = resolveEntryPoint(targetModule, entryPoint);
+  const fn = resolveEntryPoint(targetModule, entryPoint, packageName);
   if (!fn) {
     return { error: `Entry point ${entryPoint} not found in ${packageName}`, output: null };
   }
@@ -376,7 +346,7 @@ function withTimeout(promise, ms) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function resolveEntryPoint(module, name) {
+function resolveEntryPoint(module, name, packageName) {
   if (name.includes('.')) {
     const parts = name.split('.');
     let current = module;
@@ -391,6 +361,13 @@ function resolveEntryPoint(module, name) {
   }
   if (typeof module[name] === 'function') return module[name];
   if (module.default && typeof module.default[name] === 'function') return module.default[name];
+  // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
+  // Only fall back to the module itself when `name` IS the package's own name —
+  // never as a catch-all for an unrelated or nonexistent entry point name.
+  if (name === packageName) {
+    if (typeof module === 'function') return module;
+    if (typeof module.default === 'function') return module.default;
+  }
   return null;
 }
 

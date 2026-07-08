@@ -112,22 +112,29 @@ describe('PP source detection (executeMergePPTest)', () => {
 // ─── Gadget detection (executeDifferential) ─────────────────────────────────
 
 describe('gadget detection (executeDifferential)', () => {
-  test('confirms a real read-to-sink gadget', async () => {
+  test('flags a real read-to-sink gadget as a reproduction candidate', async () => {
     // Reads options.command off the prototype chain and changes output.
+    // ZERO-FP contract: the discovery oracle NO LONGER "confirms" a behavioral
+    // gadget on its own (that was the Tier-3/4/5 false-positive class). It marks
+    // it a reproduction candidate ('rce'); only independent reproduction confirms.
     const gadget = (opts) => {
       const cmd = opts.command;
       return cmd ? `RUN:${cmd}` : 'noop';
     };
     const { diff } = await executeDifferential(gadget, [{}], { property: 'command', value: 'id' });
-    assert.equal(diff.isConfirmedGadget, true);
+    assert.equal(diff.isConfirmedGadget, false, 'behavioral gadget must NOT be confirmed by discovery alone');
+    assert.equal(diff.isCandidate, true, 'it must be a reproduction candidate');
+    assert.equal(diff.proofType, 'rce');
+    assert.equal(diff.reproducible, true);
     assert.equal(diff.pollutionWasRead, true);
   });
 
-  test('does not confirm a function that ignores the polluted property', async () => {
+  test('does not flag a function that ignores the polluted property', async () => {
     // Never reads `command`; output is invariant under pollution.
     const benign = (opts) => opts.name || 'anon';
     const { diff } = await executeDifferential(benign, [{}], { property: 'command', value: 'id' });
     assert.equal(diff.isConfirmedGadget, false);
+    assert.equal(diff.isCandidate, false);
     assert.equal(diff.pollutionWasRead, false);
   });
 

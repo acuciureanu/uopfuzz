@@ -8,6 +8,17 @@ import { InputGeneration } from '../input-generation/index.js';
 import { Instrumentation } from '../instrumentation/index.js';
 import { GadgetAnalysis } from '../gadget-analysis/index.js';
 import { generateSingleReport } from '../reporting/markdown-report.js';
+import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
+import { classifyFinding } from '../gadget-analysis/disclosure.js';
+import { fetchOsvVulns } from '../sources/osv.js';
+import {
+  loadDiscoveries,
+  appendDiscovery,
+  buildRecord,
+  DEFAULT_DISCOVERY_STORE_PATH,
+} from '../gadget-analysis/discovery-store.js';
+import { packageBaseName } from '../utils/package-name.js';
+import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -53,6 +64,16 @@ export class Orchestrator {
     try {
       this.results.startTime = new Date();
 
+      // Baseline snapshot for the run-end safety net in saveResults(). In-process
+      // differential modes (forced-branch, multi-property) install/restore traps
+      // around each individual call, but a run of many iterations against a
+      // library that itself touches Object.prototype (observed with ejs,
+      // handlebars, pug) can still leave residual own-properties behind by the
+      // time the run ends — which has crashed fs.writeFile with an internal
+      // Node assertion. This baseline lets saveResults() restore a clean state
+      // unconditionally before doing I/O, regardless of which call leaked.
+      this._startupPrototypeSnapshot = snapshotPrototype();
+
       logger.info('Loading configuration...');
       await this.loadConfiguration();
 
@@ -61,6 +82,15 @@ export class Orchestrator {
 
       logger.info('Setting up target environment...');
       await this.setupTarget();
+
+      // Enrich the disclosure-status classification with live OSV.dev advisories
+      // (once per run). Fail-safe: never throws; degrades to static-DB-only if unavailable.
+      await this.fetchOsvData();
+
+      // Load this tool's durable discovery store (once per run) so confirmed
+      // findings can be recognized as rediscoveries of bugs previously found.
+      // Same timing/defensive contract as fetchOsvData: never throws, [] on miss.
+      this.priorDiscoveries = loadDiscoveries(DEFAULT_DISCOVERY_STORE_PATH);
 
       logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
@@ -182,9 +212,15 @@ export class Orchestrator {
     const timeout = this.options.timeout * 1000;
     let consecutiveSaturatedIterations = 0;
 
-    // Track confirmed chains separately from candidates
+    // Track confirmed chains separately from candidates.
+    // confirmedChains → reproduction-PROVEN vulnerabilities only.
+    // candidateChains → discovery-oracle leads that did NOT reproduce
+    //                   independently (unproven; manual review, never "VULNERABLE").
     if (!this.results.confirmedChains) {
       this.results.confirmedChains = [];
+    }
+    if (!this.results.candidateChains) {
+      this.results.candidateChains = [];
     }
 
     for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -304,6 +340,177 @@ export class Orchestrator {
    * 2. Pollution Testing: For each candidate property × payload combination,
    *    run the differential oracle (clean vs polluted) and confirm gadgets.
    */
+  /**
+   * Fetch live OSV.dev advisories for the target package@version, once per run,
+   * to enrich the disclosure-status classification. Fail-safe: never throws; leaves `this.osvVulns`
+   * null (→ static-DB-only classification) when disabled, dry-run, or unreachable
+   * (offline / --network=none / egress-blocked). NOT gated on --allow-network:
+   * that flag governs the untrusted target's egress, whereas this is a trusted
+   * read-only metadata call from the orchestrator itself. Opt out with --no-osv.
+   */
+  async fetchOsvData() {
+    this.osvVulns = null;
+    if (this.options.dryRun || this.options.noOsv) return;
+    const pkg = this.config?.package;
+    const version = this.config?.version;
+    if (!pkg || !version) return;
+
+    const result = await fetchOsvVulns(pkg, version, { ecosystem: 'npm' }); // never throws
+    if (result.ok && result.vulns.length > 0) {
+      this.osvVulns = result.vulns;
+      logger.info(`OSV.dev: ${result.vulns.length} advisor${result.vulns.length !== 1 ? 'ies' : 'y'} for ${pkg}@${version}`);
+    } else if (!result.ok) {
+      logger.debug(`OSV.dev lookup unavailable for ${pkg}@${version}: ${result.error} (using static DB only)`);
+    }
+  }
+
+  /**
+   * The zero-false-positive gate. A discovery-oracle result becomes a reported
+   * vulnerability ONLY if it reproduces independently in fresh child processes
+   * (real prototype mutation for proofType 'pp', canary code execution for 'rce').
+   * Otherwise it is recorded as an unproven candidate — never "VULNERABLE".
+   *
+   * @returns {Promise<boolean>} true if a proven vulnerability was recorded.
+   */
+  /**
+   * Resolve this target's config.sequences entry (if any) for the entry point
+   * under test into plain-data { call, method?, args } steps the reproduction
+   * worker can replay over IPC — no functions cross the boundary. Needed
+   * because some gadgets (CVE-2022-29078: EJS's compile()) only execute when
+   * the function an entry point RETURNS is subsequently invoked; a single call
+   * to the entry point alone never reaches the sink, so reproduction must
+   * replay the same multi-step chain discovery used.
+   */
+  buildResolvedSequence(testInput) {
+    const seqDef = this.config.sequences?.find(s => s.entryPoint === testInput.entryPoint);
+    if (!seqDef) return null;
+    return {
+      steps: seqDef.steps.map(step => ({
+        call: step.call,
+        method: step.method,
+        args: this.instrumentation.buildCallArgs(step, testInput, this.config),
+      })),
+    };
+  }
+
+  async proveAndRecord(diffResult, testInput, descriptor, extra = {}) {
+    const diff = diffResult?.diff;
+    if (!diff) return false;
+    if (!this.results.candidateChains) this.results.candidateChains = [];
+
+    const pkg = this.config.package;
+    const version = this.config.version;
+    const entryPoint = testInput.entryPoint;
+    const proofType = diff.proofType || (diff.prototypePolluted ? 'pp' : 'rce');
+
+    // Without an installable/require-able package we cannot reproduce in a fresh
+    // process, so we cannot prove it → record as a candidate, never confirm.
+    let proof = null;
+    if (pkg && diff.reproducible !== false) {
+      try {
+        if (proofType === 'pp') {
+          proof = await reproduceProto(pkg, entryPoint,
+            { property: descriptor.property, value: descriptor.value },
+            { version, blockNetwork: this.options.blockNetwork !== false });
+        } else {
+          const gates = extra.gates
+            || diff.details?.forcedGatesFired
+            || (extra.coPolluteProperties || []).filter(p => p !== descriptor.property);
+          proof = await reproduceRce(pkg, entryPoint,
+            { property: descriptor.property, gates, minimalArgs: [testInput.value ?? {}], sequence: this.buildResolvedSequence(testInput) },
+            { version, blockNetwork: this.options.blockNetwork !== false });
+        }
+      } catch (err) {
+        logger.debug(`Reproduction error for ${descriptor.property} via ${entryPoint}: ${err.message}`);
+      }
+    }
+
+    if (proof?.verified) {
+      // Build the chain object, forcing analyzeDifferentialResult to emit it.
+      diff.isConfirmedGadget = true;
+      const chain = this.gadgetAnalysis.analyzeDifferentialResult(diffResult, testInput, this.config);
+      if (!chain) return false;
+
+      // Normalize the displayed property to the bare attacker-supplied key
+      // (merge/URL diffs carry a fully-qualified "Object.prototype.x" name).
+      if (chain.source) chain.source.property = descriptor.property;
+
+      chain.disclosure = classifyFinding(chain, {
+        package: pkg, version, proofType,
+        osvVulns: this.osvVulns,
+        priorDiscoveries: this.priorDiscoveries || [],
+      });
+
+      // Report-level dedup by BUG identity so one merge/source bug does not
+      // surface once per property name tried. A PP *source* is one bug per
+      // polluting function (the attacker property is irrelevant); an RCE gadget
+      // is identified by (entry point + property).
+      if (!this._reportedSignatures) this._reportedSignatures = new Set();
+      const repSig = proofType === 'pp'
+        ? `pp:${entryPoint}`
+        : `rce:${entryPoint}:${descriptor.property}`;
+      if (this._reportedSignatures.has(repSig)) {
+        this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+        return true; // same underlying bug already recorded
+      }
+      this._reportedSignatures.add(repSig);
+
+      chain.proof = {
+        type: proofType === 'pp' ? 'prototype-pollution' : 'code-execution',
+        verified: true,
+        runs: proof.runs,
+        newProps: proof.newProps || null,
+        canaryToken: proof.canary || null,
+        payloadType: proof.payloadType || null,
+        callConvention: proof.callConvention || null,
+      };
+      chain.standalonePoC = proof.standalonePoC || null;
+      chain.exploitVerified = proofType === 'rce';
+      Object.assign(chain, extra.chainMeta || {});
+
+      this.results.confirmedChains.push(chain);
+      this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
+      this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
+
+      // Persist every confirmed finding to the durable, append-only discovery
+      // store — the full audit trail of what this tool has reproduced (whether
+      // a known CVE, a regression suspect, a rediscovery, or a first-sighting
+      // undocumented vulnerability). Never throws; a write failure is logged
+      // and swallowed.
+      appendDiscovery(buildRecord(chain, { package: pkg, version, proofType }), DEFAULT_DISCOVERY_STORE_PATH);
+
+      const disclosureTag = chain.disclosure.label === 'known-cve'
+        ? `KNOWN CVE${chain.disclosure.cve ? ' ' + chain.disclosure.cve : ''}`
+        : chain.disclosure.label === 'previously-discovered'
+          ? `PREVIOUSLY DISCOVERED${chain.disclosure.priorSighting?.discoveredAt ? ' (first seen ' + chain.disclosure.priorSighting.discoveredAt : ''}${chain.disclosure.priorSighting?.version ? ' @ ' + chain.disclosure.priorSighting.version : ''}${chain.disclosure.priorSighting?.discoveredAt ? ')' : ''}`
+          : `UNDOCUMENTED VULNERABILITY${chain.disclosure.regressionSuspect ? ' (regression suspect)' : ''}`;
+      logger.warn(
+        `PROVEN ${chain.proof.type.toUpperCase()} [${disclosureTag}]: ` +
+        `Object.prototype.${descriptor.property} via ${entryPoint} ` +
+        `(reproduced ${proof.runs}× in fresh processes)`
+      );
+      return true;
+    }
+
+    // Not proven → unproven candidate (never counted as a vulnerability).
+    const candSig = `${proofType}:${descriptor.property}:${entryPoint}`;
+    if (!this.results.candidateChains.some(c => c.sig === candSig)) {
+      this.results.candidateChains.push({
+        sig: candSig,
+        property: descriptor.property,
+        entryPoint,
+        proofType,
+        confidence: diff.confidence || 0,
+        signal: diff.prototypePolluted ? 'prototype-mutation'
+          : diff.newSinkAccesses?.length ? 'new-sink'
+          : diff.outputChanged ? 'output-changed'
+          : diff.errorChanged ? 'error-changed' : 'property-read',
+        reason: pkg ? 'did-not-reproduce' : 'no-installable-package',
+      });
+    }
+    return false;
+  }
+
   async executeDifferentialPhase(inputs, iteration) {
     // UOP discovery: probe multiple diverse inputs to find property accesses.
     // Do this every 5 iterations, probing up to 3 different entry points.
@@ -354,13 +561,17 @@ export class Orchestrator {
     const urlSinkEPs = new Set(['ajax', 'post', 'getJSON', 'getScript', 'fetch', 'request', 'send']);
     const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
 
+    // A bare-function module (module.exports = fn, e.g. merge-deep) is registered
+    // under the package base name — treat that entry point as high-priority too.
+    const pkgBase = packageBaseName(this.config.package || '');
+
     // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
     // This is deterministic — not dependent on random input generation.
     if (this.config.entryPoints) {
       for (const ep of this.config.entryPoints) {
         if (testInputs.length >= 5) break;
         const base = getBaseName(ep.name);
-        if (!highPriorityEPs.has(base)) continue;
+        if (!highPriorityEPs.has(base) && ep.name !== pkgBase) continue;
         if (seenEP.has(ep.name)) continue;
         seenEP.add(ep.name);
         testInputs.push({
@@ -462,46 +673,11 @@ export class Orchestrator {
             logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: NULL result (fn not found or threw)`);
           }
           if (diffResult) {
-            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: confirmed=${diffResult.diff?.isConfirmedGadget} read=${diffResult.diff?.pollutionWasRead} outChanged=${diffResult.diff?.outputChanged} errChanged=${diffResult.diff?.errorChanged}`);            const confirmedChain = this.gadgetAnalysis.analyzeDifferentialResult(
-              diffResult, testInput, this.config
-            );
+            const d = diffResult.diff;
+            logger.debug(`Mode1 ${descriptor.property} via ${testInput.entryPoint}: proofType=${d?.proofType} reproducible=${d?.reproducible} read=${d?.pollutionWasRead} outChanged=${d?.outputChanged} errChanged=${d?.errorChanged}`);
 
-            if (confirmedChain) {
-              this._confirmedSignatures.add(sig);
-
-              // Attempt exploit verification for high-confidence gadgets
-              if (confirmedChain.confidence >= 0.75) {
-                try {
-                  const verification = await this.instrumentation.verifyGadgetExploit(
-                    testInput, this.config, descriptor.property
-                  );
-                  if (verification?.verified) {
-                    confirmedChain.exploitVerified = true;
-                    confirmedChain.exploitProof = verification.executionProof;
-                    confirmedChain.exploitPayloadType = verification.payloadType;
-                    confirmedChain.confidence = Math.min(1.0, confirmedChain.confidence + 0.10);
-                    logger.warn(`  EXPLOIT VERIFIED: ${verification.executionProof}`);
-                  }
-                } catch (err) {
-                  logger.debug(`Exploit verification error: ${err.message}`);
-                }
-              }
-
-              this.results.confirmedChains.push(confirmedChain);
-              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-              logger.warn(
-                `CONFIRMED GADGET: Object.prototype.${descriptor.property} = ${String(descriptor.value).substring(0, 50)} ` +
-                `-> ${confirmedChain.sink?.name || 'behavioral change'} ` +
-                `(confidence: ${(confirmedChain.confidence * 100).toFixed(0)}%)` +
-                `${confirmedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
-              );
-              confirmed = true;
-              break; // No need to try more entry points or modes for this descriptor
-            } else if (diffResult.diff?.isCandidate) {
-              // Property was read via Object.prototype but no observable behavior change.
-              // Store as candidate for manual review.
+            // Feed the co-pollution phase with read-but-unchanged candidates.
+            if (d?.isCandidate) {
               if (!this.results.candidateProperties) this.results.candidateProperties = [];
               const candidateSig = `${descriptor.property}:${testInput.entryPoint}`;
               if (!this.results.candidateProperties.some(c => c.sig === candidateSig)) {
@@ -509,10 +685,15 @@ export class Orchestrator {
                   sig: candidateSig,
                   property: descriptor.property,
                   entryPoint: testInput.entryPoint,
-                  confidence: diffResult.diff.confidence,
+                  confidence: d.confidence,
                 });
-                logger.debug(`CANDIDATE: Object.prototype.${descriptor.property} read via ${testInput.entryPoint} (no behavior change)`);
               }
+            }
+
+            // ZERO-FP GATE: only reproduction can confirm.
+            if (d && (d.isConfirmedGadget || (d.isCandidate && d.reproducible))) {
+              confirmed = await this.proveAndRecord(diffResult, testInput, descriptor);
+              if (confirmed) { this._confirmedSignatures.add(sig); break; }
             }
           }
 
@@ -521,25 +702,9 @@ export class Orchestrator {
             testInput, this.config, descriptor
           );
 
-          if (mergeResult) {
-            const mergeChain = this.gadgetAnalysis.analyzeDifferentialResult(
-              mergeResult, testInput, this.config
-            );
-
-            if (mergeChain) {
-              this._confirmedSignatures.add(sig);
-              this.results.confirmedChains.push(mergeChain);
-              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-              logger.warn(
-                `CONFIRMED PROTOTYPE POLLUTION: ${descriptor.property} via merge payload ` +
-                `-> ${mergeChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
-                `(confidence: ${(mergeChain.confidence * 100).toFixed(0)}%)`
-              );
-              confirmed = true;
-              break; // No need to try more entry points or modes for this descriptor
-            }
+          if (mergeResult?.diff) {
+            confirmed = await this.proveAndRecord(mergeResult, testInput, descriptor);
+            if (confirmed) { this._confirmedSignatures.add(sig); break; }
           }
 
           // Mode 3: URL gadget test (URL query string → parser → target function)
@@ -547,30 +712,11 @@ export class Orchestrator {
             testInput, this.config, descriptor
           );
 
-          if (urlResult) {
-            const urlChain = this.gadgetAnalysis.analyzeDifferentialResult(
-              urlResult, testInput, this.config
-            );
-
-            if (urlChain) {
-              this._confirmedSignatures.add(sig);
-              this.results.confirmedChains.push(urlChain);
-              this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-              this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-              const exploitURL = urlResult.diff?.details?.exploitURL || '';
-              logger.warn(
-                `CONFIRMED URL GADGET: ${descriptor.property} via ${testInput.entryPoint} ` +
-                `-> ${urlChain.differential?.pollutedProperties?.join(', ') || descriptor.property} ` +
-                `(confidence: ${(urlChain.confidence * 100).toFixed(0)}%)`
-              );
-              if (exploitURL) {
-                logger.warn(`  Exploit: ${exploitURL}`);
-              }
-              confirmed = true;
-              break;
-            }
+          if (urlResult?.diff) {
+            confirmed = await this.proveAndRecord(urlResult, testInput, descriptor);
+            if (confirmed) { this._confirmedSignatures.add(sig); break; }
           }
+
           // Mode 4: Forced branch execution (Dasty technique)
           // If standard differential didn't confirm, try forcing boolean gate
           // properties to true alongside the payload. This opens guarded code paths
@@ -579,43 +725,14 @@ export class Orchestrator {
             const forcedResult = await this.instrumentation.executeForcedBranchDifferentialTracing(
               testInput, this.config, descriptor
             );
-            if (forcedResult) {
-              const forcedChain = this.gadgetAnalysis.analyzeDifferentialResult(
-                forcedResult, testInput, this.config
-              );
-              if (forcedChain) {
-                this._confirmedSignatures.add(sig);
-                forcedChain.forcedBranch = true;
-                forcedChain.forcedGates = forcedResult.diff?.details?.forcedGatesFired || [];
-
-                // Verify exploit for forced-branch findings
-                if (forcedChain.confidence >= 0.75) {
-                  try {
-                    const verification = await this.instrumentation.verifyGadgetExploit(
-                      testInput, this.config, descriptor.property
-                    );
-                    if (verification?.verified) {
-                      forcedChain.exploitVerified = true;
-                      forcedChain.exploitProof = verification.executionProof;
-                      forcedChain.confidence = Math.min(1.0, forcedChain.confidence + 0.10);
-                    }
-                  } catch { /* verification optional */ }
-                }
-
-                this.results.confirmedChains.push(forcedChain);
-                this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
-                this.inputGeneration.updatePropertyFeedback(descriptor.property, true);
-
-                logger.warn(
-                  `CONFIRMED GADGET (FORCED BRANCH): Object.prototype.${descriptor.property} ` +
-                  `-> ${forcedChain.sink?.name || 'behavioral change'} ` +
-                  `(gates: ${forcedChain.forcedGates.join(',') || 'none'}, ` +
-                  `confidence: ${(forcedChain.confidence * 100).toFixed(0)}%)` +
-                  `${forcedChain.exploitVerified ? ' [EXPLOIT VERIFIED]' : ''}`
-                );
-                confirmed = true;
-                break;
-              }
+            const fd = forcedResult?.diff;
+            if (fd && (fd.isConfirmedGadget || (fd.isCandidate && fd.reproducible))) {
+              const gates = fd.details?.forcedGatesFired || [];
+              confirmed = await this.proveAndRecord(forcedResult, testInput, descriptor, {
+                gates,
+                chainMeta: { forcedBranch: true, forcedGates: gates },
+              });
+              if (confirmed) { this._confirmedSignatures.add(sig); break; }
             }
           }
         } catch (error) {
@@ -669,24 +786,21 @@ export class Orchestrator {
                 coTestInput, this.config, pairDescriptors
               );
 
-              if (multiResult?.diff?.isConfirmedGadget) {
-                const firedProps = multiResult.diff.details?.firedProperties || [];
+              const md = multiResult?.diff;
+              if (md && (md.isConfirmedGadget || (md.isCandidate && md.reproducible))) {
                 const combinedName = pairDescriptors.map(d => d.property).join('+');
                 const sig = `multi:${combinedName}`;
                 if (!this._confirmedSignatures.has(sig)) {
-                  this._confirmedSignatures.add(sig);
-                  const chain = this.gadgetAnalysis.analyzeDifferentialResult(
-                    multiResult, coTestInput, this.config
-                  );
-                  if (chain) {
-                    chain.multiProperty = true;
-                    chain.coPolluteProperties = pairDescriptors.map(d => d.property);
-                    this.results.confirmedChains.push(chain);
-                    logger.warn(
-                      `CONFIRMED MULTI-PROPERTY GADGET: ${combinedName} ` +
-                      `(fired: ${firedProps.join(', ')}, confidence: ${(chain.confidence * 100).toFixed(0)}%)`
-                    );
-                  }
+                  // Reproduce the conjunctive gadget: the second descriptor is the
+                  // payload property; the first is the gate (forced true).
+                  const payloadDesc = pairDescriptors[1];
+                  const gateProp = pairDescriptors[0].property;
+                  const proven = await this.proveAndRecord(multiResult, coTestInput, payloadDesc, {
+                    gates: [gateProp],
+                    coPolluteProperties: pairDescriptors.map(d => d.property),
+                    chainMeta: { multiProperty: true, coPolluteProperties: pairDescriptors.map(d => d.property) },
+                  });
+                  if (proven) this._confirmedSignatures.add(sig);
                 }
               }
             } catch (error) {
@@ -849,6 +963,15 @@ export class Orchestrator {
   }
 
   async saveResults() {
+    // Defensive cleanup net: restore Object.prototype to its run-start baseline
+    // before any I/O. See the comment on _startupPrototypeSnapshot in run().
+    if (this._startupPrototypeSnapshot) {
+      const detection = detectAndRestorePrototype(this._startupPrototypeSnapshot);
+      if (detection.polluted) {
+        logger.debug(`saveResults: cleaned up ${detection.newProps.length} residual prototype propert${detection.newProps.length === 1 ? 'y' : 'ies'} before writing output: ${detection.newProps.join(', ')}`);
+      }
+    }
+
     const outputDir = path.resolve(this.options.outputDir);
     await fs.mkdir(outputDir, { recursive: true });
 
@@ -910,7 +1033,9 @@ export class Orchestrator {
 
         report += 'PROOF OF CONCEPT\n';
         report += '=================\n';
-        if (poc?.exploit?.code) {
+        if (chain.standalonePoC) {
+          report += '\n' + chain.standalonePoC + '\n';
+        } else if (poc?.exploit?.code) {
           report += '\n' + poc.exploit.code + '\n';
         }
 

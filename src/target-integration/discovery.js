@@ -264,6 +264,14 @@ function discoverExports(targetModule, packageName) {
   // Walk top-level exports
   walk(targetModule, '', 0);
 
+  // The module may itself BE a callable (module.exports = fn) — the common shape
+  // for merge/extend utilities like merge-deep, deep-extend, deepmerge. Register
+  // it as an entry point so its prototype-pollution surface is probed.
+  if (typeof targetModule === 'function' && !seen.has(packageName)) {
+    seen.add(packageName);
+    exports.push({ name: packageName, fn: targetModule });
+  }
+
   // Walk default export (very common in ESM)
   if (targetModule.default) {
     if (typeof targetModule.default === 'function') {

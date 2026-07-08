@@ -230,59 +230,71 @@ function diffResults(cleanResult, pollutedResult, pollutionDescriptor) {
                           !cleanOutput?.includes(payloadStr);
   diff.details.payloadReachedOutput = payloadInOutput;
 
-  // Tier 0: Actual Object.prototype was modified = confirmed pollution source
-  if (diff.prototypePolluted) {
-    diff.isConfirmedGadget = true;
-    diff.confidence = Math.max(diff.confidence, 0.85);
-  }
+  // ── Tiering ──────────────────────────────────────────────────────────────
+  //
+  // The discovery oracle NO LONGER asserts a vulnerability from a behavioral
+  // diff. It only proposes *reproduction candidates* with a `proofType` hint and
+  // a `reproducible` flag; the independent reproduction harness
+  // (src/verification/reproduce.js) is the sole confirmer. This kills the entire
+  // Tier 3/4/5 false-positive class — reading a property, or output/error merely
+  // changing, no longer flips a library to "VULNERABLE".
+  //
+  //   proofType 'pp'  → try to reproduce real Object.prototype mutation
+  //   proofType 'rce' → try to reproduce real code execution (canary)
+  //
+  // Only Tier 0 (an actual prototype mutation observed in-run) is left as a
+  // pre-confirmed pollution candidate; everything else is a candidate pending
+  // reproduction. `confidence` is retained for ranking/effort ordering only.
+  diff.isConfirmedGadget = false;
+  diff.isCandidate = false;
+  diff.proofType = null;
+  diff.reproducible = false;
 
-  // Tier 1: New sink access caused by pollution = high confidence
-  if (diff.newSinkAccesses.length > 0 && diff.pollutionWasRead) {
-    diff.isConfirmedGadget = true;
+  if (diff.prototypePolluted) {
+    // Tier 0: the target actually added a property to a monitored prototype.
+    diff.isConfirmedGadget = true; // pollution candidate — still gated on reproduction
+    diff.proofType = 'pp';
+    diff.reproducible = true;
+    diff.confidence = Math.max(diff.confidence, 0.85);
+  } else if (diff.newSinkAccesses.length > 0 && diff.pollutionWasRead) {
+    // Tier 1: a code sink fired while the polluted property was read.
+    diff.isCandidate = true;
+    diff.proofType = 'rce';
+    diff.reproducible = true;
     diff.confidence = Math.max(diff.confidence, 0.95);
-  }
-  // Tier 2: Payload reached output = confirmed data flow
-  else if (payloadInOutput && diff.pollutionWasRead) {
-    diff.isConfirmedGadget = true;
+  } else if (payloadInOutput && diff.pollutionWasRead) {
+    // Tier 2: the payload reached output (injection) — try code execution.
+    diff.isCandidate = true;
+    diff.proofType = 'rce';
+    diff.reproducible = true;
     diff.confidence = Math.max(diff.confidence, 0.90);
-  }
-  // Tier 3: Output changed and property was read = likely gadget
-  else if (diff.outputChanged && diff.pollutionWasRead) {
-    diff.isConfirmedGadget = true;
+  } else if (diff.outputChanged && diff.pollutionWasRead) {
+    diff.isCandidate = true;
+    diff.proofType = 'rce';
+    diff.reproducible = true;
     diff.confidence = Math.max(diff.confidence, 0.75);
-  }
-  // Tier 4: Error changed and property was read = possible gadget
-  else if (diff.errorChanged && diff.pollutionWasRead) {
-    diff.isConfirmedGadget = true;
+  } else if (diff.errorChanged && diff.pollutionWasRead) {
+    diff.isCandidate = true;
+    diff.proofType = 'rce';
+    diff.reproducible = true;
     diff.confidence = Math.max(diff.confidence, 0.60);
-  }
-  // Tier 5: Active trap fired — property was definitively read via Object.prototype.
-  // However, reading alone does NOT confirm exploitability. Many libraries speculatively
-  // read properties (e.g., `if (opts.debug) ...`) without dangerous consequences.
-  // Only confirm if the property name is in a high-risk category (sink-adjacent).
-  // Otherwise, mark as candidate for manual review.
-  else if (pollutedResult.pollutionWasRead) {
+  } else if (pollutedResult.pollutionWasRead) {
+    // Tier 5: the property was read but nothing observable changed. High-risk
+    // (sink-adjacent) names are still worth a reproduction attempt; the rest are
+    // low-value leads kept only for manual review (no reproduction attempt).
     const HIGH_RISK_PROPS = new Set([
-      // Code execution sinks
       'template', 'code', 'script', 'eval', 'command', 'shell', 'exec',
       'source', 'expression', 'compile', 'render', 'Function',
-      // URL/network sinks (SSRF)
       'url', 'href', 'src', 'action', 'baseURL', 'endpoint', 'proxy',
-      // DOM sinks (XSS)
       'innerHTML', 'outerHTML', 'textContent', 'onclick', 'onerror',
-      // Config that enables dangerous behavior
       'compileDebug', 'debug', 'self', 'constructor', 'allowDots',
       'allowPrototypes', 'outputFunctionName', 'localsName', 'destructuredLocals',
       'escape', 'client', 'globals', 'filename',
     ]);
-    if (HIGH_RISK_PROPS.has(pollutionDescriptor.property)) {
-      diff.isConfirmedGadget = true;
-      diff.confidence = Math.max(diff.confidence, 0.50);
-    } else {
-      diff.isConfirmedGadget = false;
-      diff.confidence = Math.max(diff.confidence, 0.30);
-      diff.isCandidate = true;
-    }
+    diff.isCandidate = true;
+    diff.proofType = 'rce';
+    diff.reproducible = HIGH_RISK_PROPS.has(pollutionDescriptor.property);
+    diff.confidence = Math.max(diff.confidence, diff.reproducible ? 0.50 : 0.30);
   }
 
   return diff;
@@ -379,6 +391,8 @@ export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 50
           property: detection.newProps[0] || prop,
           payload: val,
           isConfirmedGadget: true,
+          proofType: 'pp',
+          reproducible: true,
           confidence: 0.95,
           prototypePolluted: true,
           pollutedProperties: detection.newProps,
@@ -426,6 +440,8 @@ export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 50
           property: detection.newProps[0] || prop,
           payload: val,
           isConfirmedGadget: true,
+          proofType: 'pp',
+          reproducible: true,
           confidence: 0.95,
           prototypePolluted: true,
           pollutedProperties: detection.newProps,
@@ -521,6 +537,8 @@ export async function executeURLGadgetTest(fn, prop, val, timeoutMs = 5000) {
           property: detection.newProps[0] || prop,
           payload: val,
           isConfirmedGadget: true,
+          proofType: 'pp',
+          reproducible: true,
           confidence: 0.95,
           prototypePolluted: true,
           pollutedProperties: detection.newProps,

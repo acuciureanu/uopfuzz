@@ -29,7 +29,8 @@ program
   .option('--skip-integrity-check', 'Skip package integrity verification')
   .option('--sandbox', 'Run target code in isolated child process (recommended)', true)
   .option('--no-sandbox', 'Disable child process isolation (faster, less safe)')
-  .option('--allow-network', 'Allow network access during target execution');
+  .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only). Note: an OSV query reveals the analyzed package@version to a third party');
 
 program.action(async (options) => {
   try {
@@ -62,11 +63,17 @@ program.action(async (options) => {
       logger.warn(chalk.yellow('⚠ --allow-network: target code can make outbound connections'));
     }
 
-    if (!process.env.UOPFUZZ_CONTAINER && !options.dryRun) {
+    if (!options.dryRun) {
       logger.info(chalk.yellow(
-        'Tip: Run inside the dev container for maximum isolation:\n' +
-        '  devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . node src/cli.js --target <pkg>'
+        'Only analyze packages you are authorized to test. Target code IS executed — ' +
+        'run untrusted packages inside the dev container (the real isolation boundary). See the Safety model in README.md.'
       ));
+      if (!process.env.UOPFUZZ_CONTAINER) {
+        logger.info(chalk.yellow(
+          'Tip: Run inside the dev container for isolation:\n' +
+          '  devcontainer up --workspace-folder . && devcontainer exec --workspace-folder . node src/cli.js --target <pkg>'
+        ));
+      }
     }
 
     const orchestratorOpts = {
@@ -84,6 +91,7 @@ program.action(async (options) => {
       skipIntegrityCheck: options.skipIntegrityCheck || false,
       sandbox: options.sandbox !== false,
       blockNetwork: !options.allowNetwork,
+      noOsv: options.osv === false,
     };
 
     const orchestrator = new Orchestrator(orchestratorOpts);
@@ -92,17 +100,34 @@ program.action(async (options) => {
     logger.info(chalk.green.bold('Fuzzing session completed'));
     logger.info(`Results saved to: ${options.output}`);
 
-    const confirmed = results.confirmedChains?.length || 0;
-    const candidates = results.potentialChains?.length || 0;
+    const confirmedChains = results.confirmedChains || [];
+    const confirmed = confirmedChains.length;
+    const undocumented = confirmedChains.filter(c => c.disclosure?.label === 'undocumented-vulnerability').length;
+    const rediscovered = confirmedChains.filter(c => c.disclosure?.label === 'previously-discovered').length;
+    const knownCves = confirmedChains.filter(c => c.disclosure?.label === 'known-cve').length;
+    const unproven = (results.candidateChains?.length || 0);
 
     if (confirmed > 0) {
-      logger.warn(chalk.red.bold(`${confirmed} CONFIRMED gadget chains found`));
+      logger.warn(chalk.red.bold(
+        `${confirmed} PROVEN vulnerabilit${confirmed !== 1 ? 'ies' : 'y'} ` +
+        `(${undocumented} undocumented, ${rediscovered} previously discovered, ${knownCves} known CVE) — reproduced in fresh processes`
+      ));
+      for (const c of confirmedChains) {
+        const srcTag = c.disclosure?.source === 'osv' ? ' via OSV.dev'
+          : c.disclosure?.source === 'static+osv' ? ' (built-in DB + OSV.dev)' : '';
+        const tag = c.disclosure?.label === 'known-cve'
+          ? chalk.yellow(`known CVE${c.disclosure?.cve ? ' ' + c.disclosure.cve : ''}${srcTag}`)
+          : c.disclosure?.label === 'previously-discovered'
+            ? chalk.blue(`previously discovered${c.disclosure?.priorSighting?.discoveredAt ? ' (first seen ' + c.disclosure.priorSighting.discoveredAt + ')' : ''}`)
+            : chalk.red.bold(`UNDOCUMENTED VULNERABILITY${c.disclosure?.regressionSuspect ? ' (regression suspect)' : ''}`);
+        logger.warn(`  • ${tag}: Object.prototype.${c.source?.property} via ${c.input?.entryPoint} [${c.proof?.type}]`);
+      }
     }
-    if (candidates > 0) {
-      logger.info(`${candidates} unconfirmed candidates`);
+    if (unproven > 0) {
+      logger.info(`${unproven} unproven lead${unproven !== 1 ? 's' : ''} (did not reproduce — NOT vulnerabilities; see report)`);
     }
-    if (confirmed === 0 && candidates === 0) {
-      logger.info('No gadget chains found');
+    if (confirmed === 0) {
+      logger.info('No vulnerabilities reproduced');
     }
 
   } catch (error) {
@@ -135,6 +160,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only)')
   .action(async (options) => {
     try {
       if (options.verbose) logger.level = 'debug';
@@ -152,6 +178,7 @@ program
         skipIntegrityCheck: options.skipIntegrityCheck || false,
         sandbox: options.sandbox !== false,
         blockNetwork: !options.allowNetwork,
+        noOsv: options.osv === false,
       };
 
       const runner = new MassRunner({
@@ -198,6 +225,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only)')
   .action(async (options) => {
     try {
       if (options.verbose) logger.level = 'debug';
@@ -232,6 +260,7 @@ program
         skipIntegrityCheck: options.skipIntegrityCheck || false,
         sandbox: options.sandbox !== false,
         blockNetwork: !options.allowNetwork,
+        noOsv: options.osv === false,
       };
 
       const runner = new VersionRunner({
