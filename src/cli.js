@@ -30,7 +30,7 @@ program
   .option('--sandbox', 'Run target code in isolated child process (recommended)', true)
   .option('--no-sandbox', 'Disable child process isolation (faster, less safe)')
   .option('--allow-network', 'Allow network access during target execution')
-  .option('--no-osv', 'Disable live OSV.dev advisory lookups (novelty labels use the built-in DB only). Note: an OSV query reveals the analyzed package@version to a third party');
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only). Note: an OSV query reveals the analyzed package@version to a third party');
 
 program.action(async (options) => {
   try {
@@ -96,9 +96,9 @@ program.action(async (options) => {
 
     const confirmedChains = results.confirmedChains || [];
     const confirmed = confirmedChains.length;
-    const undocumented = confirmedChains.filter(c => c.novelty?.label === 'undocumented-vulnerability').length;
-    const rediscovered = confirmedChains.filter(c => c.novelty?.label === 'previously-discovered').length;
-    const knownCves = confirmedChains.filter(c => c.novelty?.label === 'known-cve').length;
+    const undocumented = confirmedChains.filter(c => c.disclosure?.label === 'undocumented-vulnerability').length;
+    const rediscovered = confirmedChains.filter(c => c.disclosure?.label === 'previously-discovered').length;
+    const knownCves = confirmedChains.filter(c => c.disclosure?.label === 'known-cve').length;
     const unproven = (results.candidateChains?.length || 0);
 
     if (confirmed > 0) {
@@ -107,13 +107,13 @@ program.action(async (options) => {
         `(${undocumented} undocumented, ${rediscovered} previously discovered, ${knownCves} known CVE) — reproduced in fresh processes`
       ));
       for (const c of confirmedChains) {
-        const srcTag = c.novelty?.source === 'osv' ? ' via OSV.dev'
-          : c.novelty?.source === 'static+osv' ? ' (built-in DB + OSV.dev)' : '';
-        const tag = c.novelty?.label === 'known-cve'
-          ? chalk.yellow(`known CVE${c.novelty?.cve ? ' ' + c.novelty.cve : ''}${srcTag}`)
-          : c.novelty?.label === 'previously-discovered'
-            ? chalk.blue(`previously discovered${c.novelty?.priorSighting?.discoveredAt ? ' (first seen ' + c.novelty.priorSighting.discoveredAt + ')' : ''}`)
-            : chalk.red.bold(`UNDOCUMENTED VULNERABILITY${c.novelty?.regressionSuspect ? ' (regression suspect)' : ''}`);
+        const srcTag = c.disclosure?.source === 'osv' ? ' via OSV.dev'
+          : c.disclosure?.source === 'static+osv' ? ' (built-in DB + OSV.dev)' : '';
+        const tag = c.disclosure?.label === 'known-cve'
+          ? chalk.yellow(`known CVE${c.disclosure?.cve ? ' ' + c.disclosure.cve : ''}${srcTag}`)
+          : c.disclosure?.label === 'previously-discovered'
+            ? chalk.blue(`previously discovered${c.disclosure?.priorSighting?.discoveredAt ? ' (first seen ' + c.disclosure.priorSighting.discoveredAt + ')' : ''}`)
+            : chalk.red.bold(`UNDOCUMENTED VULNERABILITY${c.disclosure?.regressionSuspect ? ' (regression suspect)' : ''}`);
         logger.warn(`  • ${tag}: Object.prototype.${c.source?.property} via ${c.input?.entryPoint} [${c.proof?.type}]`);
       }
     }
@@ -154,7 +154,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
-  .option('--no-osv', 'Disable live OSV.dev advisory lookups (novelty labels use the built-in DB only)')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only)')
   .action(async (options) => {
     try {
       if (options.verbose) logger.level = 'debug';
@@ -219,7 +219,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
-  .option('--no-osv', 'Disable live OSV.dev advisory lookups (novelty labels use the built-in DB only)')
+  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only)')
   .action(async (options) => {
     try {
       if (options.verbose) logger.level = 'debug';

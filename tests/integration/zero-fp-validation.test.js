@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 import { reproduceProto, reproduceRce } from '../../src/verification/reproduce.js';
-import { versionInRange, classifyFinding } from '../../src/gadget-analysis/novelty.js';
+import { versionInRange, classifyFinding } from '../../src/gadget-analysis/disclosure.js';
 import { executeDifferential, executeMergePPTest } from '../../src/instrumentation/differential.js';
 import {
   loadDiscoveries,
@@ -109,8 +109,8 @@ describe('discovery oracle demotes behavioral signals (offline)', () => {
   });
 });
 
-// ─── Novelty / undocumented-vulnerability classifier (offline) ───────────────
-describe('novelty classifier (offline)', () => {
+// ─── Disclosure-status classifier (offline) ───────────────────────────────────
+describe('disclosure classifier (offline)', () => {
   test('versionInRange handles the DB range forms', () => {
     assert.equal(versionInRange('4.17.4', '<4.17.5'), true);
     assert.equal(versionInRange('4.17.21', '<4.17.5'), false);
@@ -160,7 +160,7 @@ describe('novelty classifier (offline)', () => {
 });
 
 // ─── OSV.dev augmentation (synthetic vulns, no network) ──────────────────────
-describe('novelty classifier + OSV.dev (offline, synthetic osvVulns)', () => {
+describe('disclosure classifier + OSV.dev (offline, synthetic osvVulns)', () => {
   const ppOsvVuln = (introduced, fixed) => ({
     id: 'GHSA-test-pp', summary: 'Prototype Pollution in x', aliases: ['CVE-2099-0001'],
     database_specific: { cwe_ids: ['CWE-1321'] },
@@ -280,7 +280,7 @@ describe('discovery store — durable memory across runs (offline)', () => {
 });
 
 // ─── Rediscovery recognition (offline, synthetic priorDiscoveries) ───────────
-describe('novelty classifier + prior discoveries (offline)', () => {
+describe('disclosure classifier + prior discoveries (offline)', () => {
   test('a first sighting with no prior record is undocumented-vulnerability', () => {
     const finding = { source: { property: 'escapeFunction' }, input: { entryPoint: 'compile' } };
     const c = classifyFinding(finding, {
@@ -357,17 +357,17 @@ describe('novelty classifier + prior discoveries (offline)', () => {
     assert.equal(a.label, 'undocumented-vulnerability');
   });
 
-  test('buildRecord collapses the novelty verdict into a store label', () => {
+  test('buildRecord collapses the disclosure verdict into a store label', () => {
     const baseChain = {
       source: { property: 'escapeFunction' }, input: { entryPoint: 'compile' },
       riskLevel: 7.5, standalonePoC: '// poc', metadata: { cvssVector: 'AV:N/AC:L' },
     };
-    assert.equal(buildRecord({ ...baseChain, novelty: { label: 'known-cve' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'known-cve');
-    assert.equal(buildRecord({ ...baseChain, novelty: { label: 'previously-discovered' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'previously-discovered');
-    assert.equal(buildRecord({ ...baseChain, novelty: { label: 'undocumented-vulnerability', regressionSuspect: true } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'regression-suspect');
-    assert.equal(buildRecord({ ...baseChain, novelty: { label: 'undocumented-vulnerability' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'undocumented-vulnerability');
+    assert.equal(buildRecord({ ...baseChain, disclosure: { label: 'known-cve' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'known-cve');
+    assert.equal(buildRecord({ ...baseChain, disclosure: { label: 'previously-discovered' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'previously-discovered');
+    assert.equal(buildRecord({ ...baseChain, disclosure: { label: 'undocumented-vulnerability', regressionSuspect: true } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'regression-suspect');
+    assert.equal(buildRecord({ ...baseChain, disclosure: { label: 'undocumented-vulnerability' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' }).label, 'undocumented-vulnerability');
 
-    const rec = buildRecord({ ...baseChain, novelty: { label: 'undocumented-vulnerability' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' });
+    const rec = buildRecord({ ...baseChain, disclosure: { label: 'undocumented-vulnerability' } }, { package: 'ejs', version: '3.1.6', proofType: 'rce' });
     assert.equal(rec.package, 'ejs');
     assert.equal(rec.entryPoint, 'compile');
     assert.equal(rec.property, 'escapeFunction');
@@ -386,7 +386,7 @@ describe('novelty classifier + prior discoveries (offline)', () => {
     // Run 1: no memory → first sighting.
     const c1 = classifyFinding(finding, { ...ctx, priorDiscoveries: loadDiscoveries(store) });
     assert.equal(c1.label, 'undocumented-vulnerability');
-    appendDiscovery(buildRecord({ ...finding, novelty: c1, riskLevel: 8.0 }, ctx), store);
+    appendDiscovery(buildRecord({ ...finding, disclosure: c1, riskLevel: 8.0 }, ctx), store);
 
     // Run 2: the store now remembers → rediscovered.
     const c2 = classifyFinding(finding, { ...ctx, priorDiscoveries: loadDiscoveries(store) });

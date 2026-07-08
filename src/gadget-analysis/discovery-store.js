@@ -89,7 +89,7 @@ export function appendDiscovery(record, filePath = DEFAULT_DISCOVERY_STORE_PATH)
  * Identity key (version-agnostic): `package + entryPoint + property`. If
  * `property` is omitted/empty, the match is property-agnostic (used for PP
  * *source* bugs, where the attacker property is arbitrary and the bug is tied
- * to the polluting function — same model the novelty classifier already uses
+ * to the polluting function — same model the disclosure classifier already uses
  * for PP sources). Returns the earliest matching record by `discoveredAt`, or
  * `null` if none.
  *
@@ -118,23 +118,23 @@ export function findPriorSighting(discoveries, key) {
 
 /**
  * Build a store record from a confirmed chain. The store label collapses the
- * novelty verdict into the distinct audit-trail buckets the store tracks:
+ * disclosure-status verdict into the distinct audit-trail buckets the store tracks:
  * `known-cve`, `regression-suspect`, `previously-discovered`, or
  * `undocumented-vulnerability`. (A regression-suspect is recorded as such, not
  * as an undocumented-vulnerability, so the audit trail can distinguish them.)
  *
- * @param {object} chain - a confirmed chain (carries `chain.novelty`)
+ * @param {object} chain - a confirmed chain (carries `chain.disclosure`)
  * @param {{ package: string, version: string, proofType?: string }} ctx
  * @returns {object}
  */
 export function buildRecord(chain, ctx) {
-  const nov = chain.novelty || {};
+  const disc = chain.disclosure || {};
   let label;
-  if (nov.label === 'known-cve') {
+  if (disc.label === 'known-cve') {
     label = 'known-cve';
-  } else if (nov.label === 'previously-discovered') {
+  } else if (disc.label === 'previously-discovered') {
     label = 'previously-discovered';
-  } else if (nov.regressionSuspect) {
+  } else if (disc.regressionSuspect) {
     label = 'regression-suspect';
   } else {
     label = 'undocumented-vulnerability';

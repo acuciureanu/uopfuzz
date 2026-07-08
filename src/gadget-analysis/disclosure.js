@@ -5,7 +5,7 @@ import { findPriorSighting } from './discovery-store.js';
 import { packageBaseName } from '../utils/package-name.js';
 
 /**
- * Novelty / undocumented-vulnerability classifier.
+ * Disclosure-status classifier.
  *
  * "Undocumented" means no public advisory (static DB or OSV.dev) covers this
  * finding. A tool that re-discovers a documented CVE has not found anything
@@ -165,7 +165,7 @@ export function classifyFinding(finding, ctx) {
   // ── PP SOURCE bugs (proofType 'pp') ────────────────────────────────────────
   // A prototype-pollution *source* (a merge/clone/set function that writes an
   // attacker-chosen key onto a prototype) is ONE bug regardless of which property
-  // demonstrates it. Novelty keys on package + version, not the arbitrary property.
+  // demonstrates it. Disclosure status keys on package + version, not the arbitrary property.
   let verdict;
   if (ctx.proofType === 'pp') {
     const pkgSources = PP_SOURCES.filter(s => s.package === pkg);

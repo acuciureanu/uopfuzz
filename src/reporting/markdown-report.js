@@ -78,10 +78,10 @@ export function generateSingleReport(results, config) {
   const candidates = potentialChains.length;
   const errors = (results.errors || []).length;
 
-  // Novelty split — every confirmed chain carries a proof + novelty label.
-  const undocumented = confirmedChains.filter(c => c.novelty?.label === 'undocumented-vulnerability');
-  const rediscovered = confirmedChains.filter(c => c.novelty?.label === 'previously-discovered');
-  const knownCves = confirmedChains.filter(c => c.novelty?.label === 'known-cve');
+  // Disclosure-status split — every confirmed chain carries a proof + disclosure label.
+  const undocumented = confirmedChains.filter(c => c.disclosure?.label === 'undocumented-vulnerability');
+  const rediscovered = confirmedChains.filter(c => c.disclosure?.label === 'previously-discovered');
+  const knownCves = confirmedChains.filter(c => c.disclosure?.label === 'known-cve');
   const unprovenLeads = (results.candidateChains || []).length;
 
   if (confirmed > 0) {
@@ -124,18 +124,18 @@ export function generateSingleReport(results, config) {
       const poc = chain.poc || {};
       const isURL = poc.type === 'url_gadget';
       const score = parseFloat(chain.riskLevel) || 0;
-      const nov = chain.novelty || {};
-      const srcTag = nov.source === 'osv' ? ' (OSV.dev)'
-        : nov.source === 'static+osv' ? ' (built-in DB + OSV.dev)'
-        : nov.source === 'static' ? ' (built-in DB)' : '';
-      const novLabel = nov.label === 'known-cve'
-        ? `KNOWN CVE${nov.cve ? ' — ' + nov.cve : ''}${srcTag}`
-        : nov.label === 'previously-discovered'
+      const disc = chain.disclosure || {};
+      const srcTag = disc.source === 'osv' ? ' (OSV.dev)'
+        : disc.source === 'static+osv' ? ' (built-in DB + OSV.dev)'
+        : disc.source === 'static' ? ' (built-in DB)' : '';
+      const discLabel = disc.label === 'known-cve'
+        ? `KNOWN CVE${disc.cve ? ' — ' + disc.cve : ''}${srcTag}`
+        : disc.label === 'previously-discovered'
           ? `PREVIOUSLY DISCOVERED`
-          : `UNDOCUMENTED VULNERABILITY${nov.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
+          : `UNDOCUMENTED VULNERABILITY${disc.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
       const proof = chain.proof || {};
 
-      md += `### Finding #${i + 1} — ${novLabel} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
+      md += `### Finding #${i + 1} — ${discLabel} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
       md += `| Field | Value |\n|-------|-------|\n`;
       md += `| Library | \`${libName}@${libVersion}\` |\n`;
       md += `| Entry point | \`${escMd(chain.input?.entryPoint)}\` |\n`;
@@ -148,7 +148,7 @@ export function generateSingleReport(results, config) {
       if (proof.payloadType) {
         md += `| Execution payload | \`${escMd(proof.payloadType)}\` |\n`;
       }
-      md += `| Novelty | ${novLabel} |\n`;
+      md += `| Disclosure | ${discLabel} |\n`;
       if (chain.metadata?.cvssVector) {
         md += `| CVSS vector | \`${chain.metadata.cvssVector}\` |\n`;
       }
@@ -158,19 +158,19 @@ export function generateSingleReport(results, config) {
       }
       md += '\n';
 
-      if (nov.regressionSuspect && nov.note) {
-        md += `> ⚠ **Regression suspect:** ${nov.note}\n\n`;
-      } else if (nov.label === 'previously-discovered' && nov.priorSighting) {
-        const ps = nov.priorSighting;
+      if (disc.regressionSuspect && disc.note) {
+        md += `> ⚠ **Regression suspect:** ${disc.note}\n\n`;
+      } else if (disc.label === 'previously-discovered' && disc.priorSighting) {
+        const ps = disc.priorSighting;
         md += `> ℹ Previously discovered by this tool`;
         if (ps.discoveredAt) md += ` on \`${ps.discoveredAt}\``;
         if (ps.version) md += ` at \`${libName}@${ps.version}\``;
         md += ` — no public CVE.\n\n`;
-      } else if (nov.source === 'osv' && nov.note) {
-        md += `> ℹ ${nov.note}\n\n`;
+      } else if (disc.source === 'osv' && disc.note) {
+        md += `> ℹ ${disc.note}\n\n`;
       }
-      if (nov.osvNote) {
-        md += `> ℹ ${nov.osvNote}\n\n`;
+      if (disc.osvNote) {
+        md += `> ℹ ${disc.osvNote}\n\n`;
       }
 
       if (chain.standalonePoC) {

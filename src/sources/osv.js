@@ -4,8 +4,8 @@ import { compareVersions } from './version-scanner.js';
  * OSV.dev API client — live known-vulnerability lookups.
  *
  * OSV (https://osv.dev, Google's Open Source Vulnerabilities database) aggregates
- * GHSA + CVE + many ecosystem advisory sources. We use it to back the novelty
- * gate so "known-cve" reflects the live advisory ecosystem, not just the
+ * GHSA + CVE + many ecosystem advisory sources. We use it to back the disclosure-status
+ * classification so "known-cve" reflects the live advisory ecosystem, not just the
  * hand-curated snapshot in known-gadgets.js.
  *
  * Mirrors src/sources/cdnjs.js conventions (rate limit, retry/backoff, headers)
@@ -151,7 +151,7 @@ function _rangeContains(events, version) {
  * Is this OSV vuln a prototype-pollution-class advisory?
  *
  * OSV answers at package@version granularity and returns EVERY advisory for that
- * version. Only PP-class advisories may flip a finding's novelty to known-cve —
+ * version. Only PP-class advisories may flip a finding's disclosure status to known-cve —
  * otherwise an unrelated CVE (ReDoS, path traversal…) at the same version would
  * bury a genuine undocumented PP vulnerability. Matches on CWE-1321 or PP keywords.
  */
@@ -206,7 +206,7 @@ export function describeMatchedRange(vuln, version) {
 
 /**
  * First PP-class OSV advisory covering `version`, or null.
- * The single decision primitive the novelty classifier consumes.
+ * The single decision primitive the disclosure classifier consumes.
  *
  * @returns {{ cve: string, matchedRange: string|null, vuln: object } | null}
  */

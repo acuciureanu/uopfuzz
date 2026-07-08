@@ -9,7 +9,7 @@ import { Instrumentation } from '../instrumentation/index.js';
 import { GadgetAnalysis } from '../gadget-analysis/index.js';
 import { generateSingleReport } from '../reporting/markdown-report.js';
 import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
-import { classifyFinding } from '../gadget-analysis/novelty.js';
+import { classifyFinding } from '../gadget-analysis/disclosure.js';
 import { fetchOsvVulns } from '../sources/osv.js';
 import {
   loadDiscoveries,
@@ -83,8 +83,8 @@ export class Orchestrator {
       logger.info('Setting up target environment...');
       await this.setupTarget();
 
-      // Enrich the novelty gate with live OSV.dev advisories (once per run).
-      // Fail-safe: never throws; degrades to static-DB-only if unavailable.
+      // Enrich the disclosure-status classification with live OSV.dev advisories
+      // (once per run). Fail-safe: never throws; degrades to static-DB-only if unavailable.
       await this.fetchOsvData();
 
       // Load this tool's durable discovery store (once per run) so confirmed
@@ -342,7 +342,7 @@ export class Orchestrator {
    */
   /**
    * Fetch live OSV.dev advisories for the target package@version, once per run,
-   * to enrich the novelty gate. Fail-safe: never throws; leaves `this.osvVulns`
+   * to enrich the disclosure-status classification. Fail-safe: never throws; leaves `this.osvVulns`
    * null (→ static-DB-only classification) when disabled, dry-run, or unreachable
    * (offline / --network=none / egress-blocked). NOT gated on --allow-network:
    * that flag governs the untrusted target's egress, whereas this is a trusted
@@ -435,7 +435,7 @@ export class Orchestrator {
       // (merge/URL diffs carry a fully-qualified "Object.prototype.x" name).
       if (chain.source) chain.source.property = descriptor.property;
 
-      chain.novelty = classifyFinding(chain, {
+      chain.disclosure = classifyFinding(chain, {
         package: pkg, version, proofType,
         osvVulns: this.osvVulns,
         priorDiscoveries: this.priorDiscoveries || [],
@@ -479,13 +479,13 @@ export class Orchestrator {
       // and swallowed.
       appendDiscovery(buildRecord(chain, { package: pkg, version, proofType }), DEFAULT_DISCOVERY_STORE_PATH);
 
-      const noveltyTag = chain.novelty.label === 'known-cve'
-        ? `KNOWN CVE${chain.novelty.cve ? ' ' + chain.novelty.cve : ''}`
-        : chain.novelty.label === 'previously-discovered'
-          ? `PREVIOUSLY DISCOVERED${chain.novelty.priorSighting?.discoveredAt ? ' (first seen ' + chain.novelty.priorSighting.discoveredAt : ''}${chain.novelty.priorSighting?.version ? ' @ ' + chain.novelty.priorSighting.version : ''}${chain.novelty.priorSighting?.discoveredAt ? ')' : ''}`
-          : `UNDOCUMENTED VULNERABILITY${chain.novelty.regressionSuspect ? ' (regression suspect)' : ''}`;
+      const disclosureTag = chain.disclosure.label === 'known-cve'
+        ? `KNOWN CVE${chain.disclosure.cve ? ' ' + chain.disclosure.cve : ''}`
+        : chain.disclosure.label === 'previously-discovered'
+          ? `PREVIOUSLY DISCOVERED${chain.disclosure.priorSighting?.discoveredAt ? ' (first seen ' + chain.disclosure.priorSighting.discoveredAt : ''}${chain.disclosure.priorSighting?.version ? ' @ ' + chain.disclosure.priorSighting.version : ''}${chain.disclosure.priorSighting?.discoveredAt ? ')' : ''}`
+          : `UNDOCUMENTED VULNERABILITY${chain.disclosure.regressionSuspect ? ' (regression suspect)' : ''}`;
       logger.warn(
-        `PROVEN ${chain.proof.type.toUpperCase()} [${noveltyTag}]: ` +
+        `PROVEN ${chain.proof.type.toUpperCase()} [${disclosureTag}]: ` +
         `Object.prototype.${descriptor.property} via ${entryPoint} ` +
         `(reproduced ${proof.runs}× in fresh processes)`
       );
