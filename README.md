@@ -27,11 +27,17 @@ A finding is only reported as a **vulnerability** when it is *independently repr
 
 ```bash
 npm install
-# Single-threaded execution
+# Auto-discovery: point it at a package@version — installs it, finds and verifies gadgets
+node src/cli.js --target lodash@4.17.4
+# Config-driven: use a YAML target spec
 node src/cli.js --config config/targets/pug.yaml --output results/
 # Multi-threaded execution for better performance
 node src/cli.js --config config/targets/pug.yaml --parallel 4 --output results/
 ```
+
+`--target` installs the package from npm and executes its code — run untrusted
+targets inside the dev container (see the **Safety model** below). Full flag
+reference and the container invocation are in [`docs/usage.md`](docs/usage.md).
 
 ## Architecture
 

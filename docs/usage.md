@@ -1,155 +1,145 @@
-# UoPFuzz Usage Examples
+# UoPFuzz Usage
 
-## Basic Usage
+## Running the CLI
 
-### Quick Start
+From a clone of this repo, run the CLI directly with Node:
+
 ```bash
-# Test pug template engine with 100 iterations
-uopfuzz --config config/targets/pug.yaml --max-iterations 100
-
-# Dry run to test configuration
-uopfuzz --config config/targets/pug.yaml --dry-run --verbose
-
-# Save results to specific directory
-uopfuzz --config config/targets/squirrelly.yaml --output ./my-results
+npm install                       # once, to install dependencies
+node src/cli.js --target pug@3.0.2
 ```
 
-### Advanced Options
+The `uopfuzz` command shown in some examples below only exists after you install
+the package globally or link it:
+
 ```bash
-# Long-running fuzzing session with custom timeout
-uopfuzz --config config/targets/pug.yaml \
-        --max-iterations 10000 \
-        --timeout 120 \
-        --output ./pug-analysis \
-        --verbose
-
-# Quick validation with minimal iterations
-uopfuzz --config config/targets/hogan.yaml \
-        --max-iterations 50 \
-        --timeout 30
-
-# Parallel fuzzing with multiple workers for better performance
-uopfuzz --config config/targets/pug.yaml \
-        --max-iterations 1000 \
-        --parallel 4 \
-        --output ./parallel-results
+npm link            # makes `uopfuzz` available on your PATH (dev convenience)
+uopfuzz --target pug@3.0.2
+# equivalently, without linking:
+node src/cli.js --target pug@3.0.2
+npm start -- --target pug@3.0.2   # `--` forwards args through npm
 ```
 
-## Interpreting Results
+You must pass **either** `--target <package@version>` **or** `--config <path>`;
+with neither, the CLI prints usage help and exits.
 
-### Report File
-Each run generates a human-readable report:
-```
-UoPFuzz Analysis Report
-======================
+> **This installs the target from npm and executes its code.** `--target` needs
+> network + npm access, and third-party code runs during discovery. Fuzz
+> untrusted packages **inside the dev container** — the real isolation boundary
+> (see the Safety model in `README.md`).
 
-Target: pug
-Duration: 45s
-Iterations: 1000
-Inputs Generated: 5000
-Potential Chains: 3
-Errors: 2
+## Two ways to choose a target
 
-Potential Gadget Chains:
-------------------------
-1. Direct prototype pollution chain: template -> eval
-   Risk Level: 9
-   Source: __proto__.template
-   Sink: eval
+### 1. Auto-discovery (recommended): `--target`
 
-2. Multi-step gadget chain: pollution -> cache -> Function
-   Risk Level: 7
-   Source: constructor.prototype.cache
-   Sink: Function
-```
+Point it at a package and version; it installs the package, auto-generates a
+target config (entry points, sequences), hunts sources and gadgets, and verifies
+every finding in fresh processes.
 
-### JSON Results
-Detailed technical data includes:
-- Complete input/output traces
-- Temporal chain analysis
-- Property access patterns
-- Function call sequences
-
-### Risk Levels
-- **9-10**: Critical - Direct path to RCE
-- **7-8**: High - Multi-step exploitation possible
-- **5-6**: Medium - Requires additional conditions
-- **1-4**: Low - Theoretical or limited impact
-
-## Common Patterns
-
-### Template Engine Testing
-Template engines are prime targets for UOP attacks:
 ```bash
-# Test major template engines
-uopfuzz --config config/targets/pug.yaml --max-iterations 1000
-uopfuzz --config config/targets/squirrelly.yaml --max-iterations 500
-uopfuzz --config config/targets/hogan.yaml --max-iterations 500
+node src/cli.js --target pug@3.0.2
+node src/cli.js --target squirrelly@8.0.8 --max-iterations 500
+node src/cli.js --target lodash@4.17.4 --max-iterations 50   # known PP source
 ```
 
-### Batch Testing
-Test multiple targets in sequence:
+### 2. Config-driven: `--config`
+
+Use a hand-written YAML target spec (see `config/targets/*.yaml` and
+`examples/target-template.yaml`).
+
 ```bash
-#!/bin/bash
+node src/cli.js --config config/targets/pug.yaml --max-iterations 100
+node src/cli.js --config config/targets/squirrelly.yaml --output ./my-results
+```
+
+## Running in the dev container (recommended for untrusted targets)
+
+The dev container (`.devcontainer/`) is the actual isolation boundary: no secrets
+in its environment, egress governed by the network policy, ephemeral filesystem.
+
+```bash
+devcontainer up --workspace-folder .
+devcontainer exec --workspace-folder . node src/cli.js --target <pkg@version>
+```
+
+## Options
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-c, --config <path>` | — | Target configuration file (YAML) |
+| `--target <pkg@version>` | — | Target package; auto-discovers everything |
+| `-o, --output <dir>` | `./results` | Output directory for results |
+| `-t, --timeout <seconds>` | `60` | Timeout per iteration |
+| `--max-iterations <num>` | `1000` | Maximum fuzzing iterations |
+| `--parallel <num>` | `1` | Number of parallel workers |
+| `-v, --verbose` | off | Debug logging |
+| `--dry-run` | off | Validate config/plumbing without executing target code |
+| `--sandbox` / `--no-sandbox` | `--sandbox` | Run target code in an isolated child process (default on) |
+| `--allow-network` | off | Permit outbound network from target code |
+| `--allow-scripts` | off | Allow npm lifecycle scripts during install (**DANGEROUS**) |
+| `--allow-suspicious` | off | Install packages with suspicious install scripts (**DANGEROUS**) |
+| `--skip-integrity-check` | off | Skip package integrity verification |
+| `--no-osv` | OSV on | Disable live OSV.dev lookups (an OSV query reveals the analyzed `package@version` to a third party) |
+
+The guardrail-lowering flags (`--no-sandbox`, `--allow-scripts`,
+`--allow-suspicious`, `--allow-network`) are opt-in and print a warning.
+
+## Interpreting results
+
+A run writes a JSON results file and a human-readable report to `--output`.
+
+### What "confirmed" means
+
+A finding is reported as a **proven vulnerability** only after the independent
+reproduction oracle reproduces it in **two fresh child processes** — a real
+prototype mutation, or real code execution via a canary token. Everything else is
+kept as a clearly-labeled **unproven lead** for manual review, never as a
+vulnerability. Each proven finding is labeled **KNOWN CVE**, **PREVIOUSLY
+DISCOVERED**, or **UNDOCUMENTED VULNERABILITY** and ships with a standalone,
+runnable PoC. See `src/verification/reproduce.js`.
+
+### Console summary
+
+At the end of a run the CLI prints, in red, the count of proven vulnerabilities
+(broken down as undocumented / previously discovered / known CVE) and, separately,
+the count of unproven leads. Proven findings include their disclosure label and,
+where available, the CVE id and whether it was matched via the built-in DB or
+OSV.dev.
+
+## Batch testing
+
+```bash
+# Every YAML target config in sequence
 for config in config/targets/*.yaml; do
-    echo "Testing $(basename $config)"
-    uopfuzz --config $config --max-iterations 100 --output results/$(basename $config .yaml)
+  echo "Testing $(basename "$config")"
+  node src/cli.js --config "$config" --max-iterations 100 \
+    --output "results/$(basename "$config" .yaml)"
 done
 ```
 
-## Docker Usage
+## Performance tips
 
-Run UoPFuzz in an isolated container:
-```dockerfile
-FROM node:18-alpine
-WORKDIR /app
-COPY . .
-RUN npm install
-CMD ["node", "src/cli.js"]
-```
+1. **Start small**: `--max-iterations 10` for a first pass on a new target.
+2. **Dry run first**: `--dry-run --verbose` validates config without executing code.
+3. **Timeout tuning**: raise `--timeout` for heavy targets (template compilers).
+4. **Parallelism**: `--parallel $(nproc)` to use all cores.
 
 ```bash
-# Build and run
-docker build -t uopfuzz .
-docker run -v $(pwd)/results:/app/results uopfuzz \
-    --config config/targets/pug.yaml --max-iterations 100
-```
-
-## Performance Tips
-
-1. **Start Small**: Use `--max-iterations 10` for initial testing
-2. **Use Dry Run**: Test configurations with `--dry-run` first
-3. **Monitor Resources**: Large iteration counts may consume significant memory
-4. **Timeout Tuning**: Adjust `--timeout` based on target complexity
-5. **Parallel Processing**: Use `--parallel N` to utilize multiple CPU cores for better performance
-6. **Worker Scaling**: Set `--parallel` to match your CPU core count for optimal resource utilization
-
-### Parallel Execution
-```bash
-# Use 4 workers for quad-core systems
-uopfuzz --config config/targets/pug.yaml --parallel 4 --max-iterations 1000
-
-# Scale up for high-core systems
-uopfuzz --config config/targets/pug.yaml --parallel 8 --max-iterations 2000
-
-# Combine with other options
-uopfuzz --config config/targets/squirrelly.yaml \
-        --parallel $(nproc) \
-        --max-iterations 5000 \
-        --timeout 30 \
-        --output ./results
+node src/cli.js --config config/targets/pug.yaml \
+  --parallel "$(nproc)" --max-iterations 5000 --timeout 30 --output ./results
 ```
 
 ## Troubleshooting
 
-### Common Issues
-- **Module Not Found**: Ensure target package can be installed via npm
-- **Permission Errors**: Run with appropriate npm permissions
-- **Memory Issues**: Reduce `--max-iterations` or increase system memory
-- **Timeout Errors**: Increase `--timeout` for complex targets
+- **Cannot install / resolve target**: the `package@version` must be installable
+  from your npm registry; check network and that the version exists.
+- **Everything times out**: raise `--timeout`, or lower `--max-iterations`.
+- **Nothing found on a known-vulnerable package**: recall is partial; confirm the
+  entry point/calling convention matches how the gadget actually fires, or try
+  `--config` with an explicit target spec.
+- **Debugging a config**: `node src/cli.js --config your-target.yaml --dry-run --verbose`.
 
-### Debug Mode
-```bash
-# Enable verbose logging for debugging
-uopfuzz --config your-target.yaml --verbose --dry-run
-```
+## Requirements
+
+Node.js ≥ 18 (`package.json` `engines`). Target packages are installed via npm at
+run time, so npm and network access are required for `--target`.
