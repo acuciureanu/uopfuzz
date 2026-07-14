@@ -72,7 +72,10 @@ will run on your machine.
   off, and known secret-bearing environment variables are stripped from the
   child. These are speed bumps against low-effort/accidental bad behavior — **not
   a sandbox** against a targeted exploit, which shares the process uid,
-  filesystem, and network namespace.
+  filesystem, and network namespace. Browser-only libraries (jQuery, Backbone, …)
+  load under a jsdom DOM *inside* that child too, so their fuzzed pollution — and
+  any network their DOM attempts (blocked here) — stays contained rather than
+  corrupting the fuzzer's own Node internals.
 - Two caveats keep this honest. First, the target module is still
   **`import()`ed in the fuzzer's own process** to auto-generate its config and
   entry points, so a package's *module-load-time* code runs unsandboxed — another

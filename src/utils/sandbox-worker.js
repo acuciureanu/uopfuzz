@@ -16,6 +16,7 @@ import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 import { hardenWorkerProcess } from './worker-hardening.js';
 import { GATE_PROPERTIES } from '../instrumentation/gate-properties.js';
+import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with repro-worker.js) ───────────────
@@ -93,16 +94,19 @@ try {
 
 // ─── MESSAGE HANDLER ─────────────────────────────────────────
 process.on('message', async (msg) => {
-  const { mode, packageName, entryPoint, args, timeoutMs, pollution } = msg;
+  const { mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv } = msg;
 
-  // Self-enforced timeout as backup
+  // Self-enforced timeout as backup. Browser-only targets get extra time to
+  // stand up jsdom before the operation timeout applies (kept in sync with the
+  // parent's allowance in sandbox.js).
+  const startupAllowance = browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
   const killTimer = setTimeout(() => {
     process.send?.({ error: 'Self-timeout reached', output: null, timedOut: true });
     process.exit(0);
-  }, (timeoutMs || 5000) + 500);
+  }, (timeoutMs || 5000) + startupAllowance + 500);
 
   try {
-    const result = await executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution);
+    const result = await executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv);
     clearTimeout(killTimer);
     process.send?.(result);
   } catch (error) {
@@ -118,16 +122,28 @@ process.on('message', async (msg) => {
   process.exit(0);
 });
 
-async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution) {
-  // Load the target package
+async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv) {
+  // Load the target package. Browser-only packages (jQuery, …) need a jsdom DOM
+  // in place at load time; we stand one up in this isolated child so their
+  // fuzzed pollution — and any network the DOM's XHR attempts (blocked here) —
+  // stays contained instead of corrupting the fuzzer's own process.
   let targetModule;
-  try {
-    targetModule = await import(packageName);
-  } catch {
+  if (browserEnv) {
     try {
-      targetModule = require(packageName);
+      const dom = await setupJsdomGlobals();
+      targetModule = loadBrowserModule(require, packageName, dom);
     } catch (err) {
-      return { error: `Cannot load package ${packageName}: ${err.message}`, output: null };
+      return { error: `Cannot load browser-only package ${packageName}: ${err.message}`, output: null };
+    }
+  } else {
+    try {
+      targetModule = await import(packageName);
+    } catch {
+      try {
+        targetModule = require(packageName);
+      } catch (err) {
+        return { error: `Cannot load package ${packageName}: ${err.message}`, output: null };
+      }
     }
   }
 

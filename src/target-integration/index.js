@@ -9,6 +9,7 @@ import YAML from 'yaml';
 import { logger } from '../utils/logger.js';
 import { discoverTarget } from './discovery.js';
 import { verifyPackageIntegrity } from '../utils/package-safety.js';
+import { BROWSER_ONLY_PACKAGES } from '../utils/browser-env.js';
 
 const require = createRequire(import.meta.url);
 
@@ -281,8 +282,7 @@ export class TargetIntegration {
     // Known browser-only packages that export a factory requiring window/document.
     // These may import() successfully but return a useless factory without DOM globals.
     // Go straight to jsdom for these to get a fully-initialized module.
-    const browserOnlyPackages = ['jquery', 'jquery-ui', 'backbone', 'underscore'];
-    const isLikelyBrowserOnly = browserOnlyPackages.some(pkg => name === pkg || name.startsWith(pkg + '@'));
+    const isLikelyBrowserOnly = [...BROWSER_ONLY_PACKAGES].some(pkg => name === pkg || name.startsWith(pkg + '@'));
 
     if (isLikelyBrowserOnly) {
       logger.info(`${name} is a known browser-only package — loading with jsdom`);

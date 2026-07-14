@@ -2,6 +2,7 @@ import { fork } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { logger } from './logger.js';
+import { JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -49,6 +50,9 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
     blockNetwork = true,
     pollution = null,
     mode = 'execute', // 'execute'|'differential'|'forced_branch'|'multi_property'|'discover_uop'|'merge_pp'
+    // Set for browser-only packages (jQuery, Backbone, …): the worker stands up
+    // a jsdom DOM before loading the target so window/document exist at load time.
+    browserEnv = false,
     // Optional: run a different worker script (e.g. the independent reproduction
     // worker) instead of the default sandbox worker. Kept as a passthrough so the
     // fork/timeout/env-scrub plumbing is shared, without coupling the verdict
@@ -103,6 +107,9 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
 
     let settled = false;
 
+    // Browser-only targets get extra wall-clock to boot jsdom before the
+    // operation timeout applies (see JSDOM_STARTUP_ALLOWANCE_MS).
+    const startupAllowance = browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
     const timer = setTimeout(() => {
       if (!settled) {
         settled = true;
@@ -113,7 +120,7 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
           output: null,
         });
       }
-    }, timeoutMs + 1000); // +1s grace for IPC overhead
+    }, timeoutMs + startupAllowance + 1000); // +1s grace for IPC overhead
 
     child.on('message', (msg) => {
       if (settled) return;
@@ -149,6 +156,7 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
       args: serializeArgs(args),
       timeoutMs,
       pollution,
+      browserEnv,
       ...(extra || {}),
     });
   });

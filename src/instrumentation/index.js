@@ -6,16 +6,15 @@ import { executeDifferential, executeMultiPropertyDifferential, executeForcedBra
 import { classifyDiff } from './classify-diff.js';
 import { executeInSandbox } from '../utils/sandbox.js';
 import { packageBaseName } from '../utils/package-name.js';
+import { isBrowserOnly } from '../utils/browser-env.js';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 let childProcessModule;
 try { childProcessModule = require('child_process'); } catch { childProcessModule = null; }
 
-// Packages that require a browser DOM environment (jsdom) to load.
-// The sandbox child process has no jsdom, so require('jquery') throws.
-// For these we skip sandbox and run differential tests in-process using
-// the already-loaded jsdom target module.
-const BROWSER_ONLY_PACKAGES = new Set(['jquery', 'jquery-ui', 'backbone', 'underscore']);
+// Browser-only packages (jQuery, Backbone, …) need a jsdom DOM at load time.
+// The sandbox worker now stands one up on demand (browserEnv flag), so these run
+// in the isolated child like everything else — see ../utils/browser-env.js.
 
 // Per-call timeout for differential tests. Must be short: in-process library
 // calls complete in <10ms; anything longer is an infinite loop or hung I/O.
@@ -315,8 +314,7 @@ export class Instrumentation {
     // Sandboxed execution: run in child process.
     // Skip sandbox for browser-only packages — they require jsdom which
     // the sandbox child process doesn't have.
-    const pkgBase = packageBaseName(config.package || '');
-    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    const canSandbox = this.options.sandbox && config.package;
     if (canSandbox) {
       return this._sandboxedDifferential(config.package, input, pollutionDescriptor, timeoutMs);
     }
@@ -366,6 +364,7 @@ export class Instrumentation {
         blockNetwork: this.options.blockNetwork !== false,
         pollution: safeDescriptor,
         mode: 'differential',
+        browserEnv: isBrowserOnly(packageBaseName(packageName)),
       });
 
       if (result.error && !result.outputChanged && !result.prototypePolluted) {
@@ -466,8 +465,7 @@ export class Instrumentation {
   async executeForcedBranchDifferentialTracing(input, config, pollutionDescriptor) {
     if (this.options.dryRun) return null;
 
-    const pkgBase = packageBaseName(config.package || '');
-    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    const canSandbox = this.options.sandbox && config.package;
     if (canSandbox) {
       return this._sandboxedForcedBranch(config.package, input, pollutionDescriptor, DIFF_CALL_TIMEOUT_MS);
     }
@@ -508,6 +506,7 @@ export class Instrumentation {
         blockNetwork: this.options.blockNetwork !== false,
         pollution: safeDescriptor,
         mode: 'forced_branch',
+        browserEnv: isBrowserOnly(packageBaseName(packageName)),
       });
       if (result?.error && !result.outputChanged && !result.prototypePolluted && !result.pollutionWasRead) {
         logger.debug(`Sandboxed forced-branch failed: ${result.error}`);
@@ -555,8 +554,7 @@ export class Instrumentation {
   async executeMultiPropertyDifferentialTracing(input, config, descriptors) {
     if (this.options.dryRun) return null;
 
-    const pkgBase = packageBaseName(config.package || '');
-    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    const canSandbox = this.options.sandbox && config.package;
     if (canSandbox) {
       return this._sandboxedMultiProperty(config.package, input, descriptors, DIFF_CALL_TIMEOUT_MS);
     }
@@ -596,6 +594,7 @@ export class Instrumentation {
         blockNetwork: this.options.blockNetwork !== false,
         pollution: { descriptors: safeDescriptors },
         mode: 'multi_property',
+        browserEnv: isBrowserOnly(packageBaseName(packageName)),
       });
       if (result?.error && !result.outputChanged && !result.prototypePolluted && !result.pollutionWasRead) {
         logger.debug(`Sandboxed multi-property failed: ${result.error}`);
@@ -619,8 +618,7 @@ export class Instrumentation {
     if (this.options.dryRun) return null;
 
     const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
-    const pkgBase = packageBaseName(config.package || '');
-    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    const canSandbox = this.options.sandbox && config.package;
 
     const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
@@ -664,6 +662,7 @@ export class Instrumentation {
         blockNetwork: this.options.blockNetwork !== false,
         pollution: safeDescriptor,
         mode: 'merge_pp',
+        browserEnv: isBrowserOnly(packageBaseName(packageName)),
       });
 
       if (!result?.pollutionDetected) return null;
@@ -705,8 +704,7 @@ export class Instrumentation {
     if (this.options.dryRun) return null;
 
     const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
-    const pkgBase = packageBaseName(config.package || '');
-    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    const canSandbox = this.options.sandbox && config.package;
 
     if (canSandbox) {
       const urlInput = {
@@ -775,8 +773,7 @@ export class Instrumentation {
     if (this.options.dryRun) return [];
 
     const timeoutMs = (this.options.timeout || 5) * 1000;
-    const pkgBase = packageBaseName(config.package || '');
-    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    const canSandbox = this.options.sandbox && config.package;
     if (canSandbox) {
       try {
         const args = input.type === 'template' ? [input.value] : [input.value];
@@ -784,6 +781,7 @@ export class Instrumentation {
           timeoutMs,
           blockNetwork: this.options.blockNetwork !== false,
           mode: 'discover_uop',
+          browserEnv: isBrowserOnly(packageBaseName(config.package)),
         });
         return Array.isArray(result?.uopProperties) ? result.uopProperties : [];
       } catch (error) {
