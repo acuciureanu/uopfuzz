@@ -373,77 +373,89 @@ export class Instrumentation {
         return null;
       }
 
-      // Translate sandbox result to the format gadget-analysis expects.
-      //
-      // The tier verdict is computed by the SHARED classifyDiff() — the same
-      // ladder the in-process oracle uses — fed the sandbox worker's REAL facts.
-      // This closes the drift that invariant #4 forbids: the sandbox worker
-      // already computes pollutionWasRead (getter-trap fired) and newSinkAccesses
-      // (eval/Function/vm hooks), which this reconciliation used to discard —
-      // hardcoding pollutionWasRead=true and dropping every sink access, so Tier 1
-      // was unreachable in the default (sandboxed) mode. Now those facts flow
-      // through untouched.
-      //
-      // ZERO-FP: classifyDiff only PROPOSES candidates. Only a real prototype
-      // mutation (Tier 0) is pre-confirmed; every behavioral diff is a
-      // reproduction candidate that must survive independent reproduction before
-      // it is ever reported as a vulnerability.
-      const newSinkAccesses = result.newSinkAccesses || [];
-      const pollutionWasRead = !!result.pollutionWasRead;
-      const isPP = !!result.prototypePolluted;
-      if (result.outputChanged || result.errorChanged || isPP ||
-          newSinkAccesses.length > 0 || pollutionWasRead) {
-        const payloadReachedOutput = !!(result.polluted?.output?.includes?.(String(descriptor.value)) &&
-          !result.clean?.output?.includes?.(String(descriptor.value)));
-        const verdict = classifyDiff({
-          property: descriptor.property,
-          prototypePolluted: isPP,
-          pollutionWasRead,
-          newSinkAccesses,
-          payloadInOutput: payloadReachedOutput,
-          outputChanged: result.outputChanged || false,
-          errorChanged: result.errorChanged || false,
-        });
-        // Nothing actionable — not even a manual-review lead. Drop it.
-        if (!verdict.isConfirmedGadget && !verdict.isCandidate) return null;
-        return {
-          clean: { output: result.clean?.output, error: result.clean?.error, sinkAccesses: [], taintLog: [] },
-          polluted: {
-            output: result.polluted?.output,
-            error: result.polluted?.error,
-            sinkAccesses: newSinkAccesses,
-            taintLog: [],
-            pollutionWasRead,
-            prototypePolluted: isPP,
-            pollutedProperties: result.pollutedProperties || [],
-          },
-          diff: {
-            property: descriptor.property,
-            payload: descriptor.value,
-            outputChanged: result.outputChanged || false,
-            errorChanged: result.errorChanged || false,
-            newSinkAccesses,
-            pollutionWasRead,
-            prototypePolluted: isPP,
-            pollutedProperties: result.pollutedProperties || [],
-            ...verdict,
-            details: {
-              cleanOutput: result.clean?.output?.substring?.(0, 500),
-              pollutedOutput: result.polluted?.output?.substring?.(0, 500),
-              cleanError: result.clean?.error,
-              pollutedError: result.polluted?.error,
-              payloadReachedOutput,
-              sandboxed: true,
-            },
-          },
-        };
-      }
-
-      return null;
+      return this._reconcileSandboxDiff(descriptor, result);
     } catch (error) {
       logger.debug(`Sandboxed differential error: ${error.message}`);
       return null;
     }
+  }
+
+  /**
+   * Translate a sandbox worker's raw FACTS into the diff shape gadget-analysis
+   * expects, with the tier verdict computed by the SHARED classifyDiff() — the
+   * same ladder the in-process oracle uses. This is the single reconciliation
+   * point for every sandboxed differential-style mode (single-property, forced
+   * branch, multi-property), so none of them can drift on tiering (invariant #4).
+   *
+   * The sandbox worker already computes pollutionWasRead (getter-trap fired) and
+   * newSinkAccesses (eval/Function/vm hooks); those real facts flow straight
+   * through. ZERO-FP: classifyDiff only PROPOSES candidates — only a real
+   * prototype mutation (Tier 0) is pre-confirmed; every behavioral diff must
+   * survive independent reproduction before it is reported.
+   *
+   * @param {{property:string,value:any}} descriptor - the primary payload descriptor.
+   * @param {object} result - raw worker facts.
+   * @param {object} [extraDetails] - mode-specific details merged into diff.details
+   *   (e.g. { forcedBranch, forcedGates, forcedGatesFired } or { firedProperties }).
+   * @param {string} [displayProperty] - property label for the diff (defaults to descriptor.property).
+   * @returns {object|null} diffResult, or null when nothing actionable was observed.
+   */
+  _reconcileSandboxDiff(descriptor, result, extraDetails = {}, displayProperty = null) {
+    const newSinkAccesses = result.newSinkAccesses || [];
+    const pollutionWasRead = !!result.pollutionWasRead;
+    const isPP = !!result.prototypePolluted;
+    if (!(result.outputChanged || result.errorChanged || isPP ||
+          newSinkAccesses.length > 0 || pollutionWasRead)) {
+      return null;
+    }
+    const property = displayProperty || descriptor.property;
+    const payloadReachedOutput = !!(result.polluted?.output?.includes?.(String(descriptor.value)) &&
+      !result.clean?.output?.includes?.(String(descriptor.value)));
+    const verdict = classifyDiff({
+      // Tier ordering keys off the PRIMARY payload property, not the combined
+      // label, so a high-risk primary is still recognised in multi-property mode.
+      property: descriptor.property,
+      prototypePolluted: isPP,
+      pollutionWasRead,
+      newSinkAccesses,
+      payloadInOutput: payloadReachedOutput,
+      outputChanged: result.outputChanged || false,
+      errorChanged: result.errorChanged || false,
+    });
+    // Nothing actionable — not even a manual-review lead. Drop it.
+    if (!verdict.isConfirmedGadget && !verdict.isCandidate) return null;
+    return {
+      clean: { output: result.clean?.output, error: result.clean?.error, sinkAccesses: [], taintLog: [] },
+      polluted: {
+        output: result.polluted?.output,
+        error: result.polluted?.error,
+        sinkAccesses: newSinkAccesses,
+        taintLog: [],
+        pollutionWasRead,
+        prototypePolluted: isPP,
+        pollutedProperties: result.pollutedProperties || [],
+      },
+      diff: {
+        property,
+        payload: descriptor.value,
+        outputChanged: result.outputChanged || false,
+        errorChanged: result.errorChanged || false,
+        newSinkAccesses,
+        pollutionWasRead,
+        prototypePolluted: isPP,
+        pollutedProperties: result.pollutedProperties || [],
+        ...verdict,
+        details: {
+          cleanOutput: result.clean?.output?.substring?.(0, 500),
+          pollutedOutput: result.polluted?.output?.substring?.(0, 500),
+          cleanError: result.clean?.error,
+          pollutedError: result.polluted?.error,
+          payloadReachedOutput,
+          sandboxed: true,
+          ...extraDetails,
+        },
+      },
+    };
   }
 
   /**
@@ -453,6 +465,13 @@ export class Instrumentation {
    */
   async executeForcedBranchDifferentialTracing(input, config, pollutionDescriptor) {
     if (this.options.dryRun) return null;
+
+    const pkgBase = packageBaseName(config.package || '');
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    if (canSandbox) {
+      return this._sandboxedForcedBranch(config.package, input, pollutionDescriptor, DIFF_CALL_TIMEOUT_MS);
+    }
+
     if (!this.targetModule) return null;
 
     const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
@@ -467,6 +486,40 @@ export class Instrumentation {
       return await executeForcedBranchDifferential(fn, args, pollutionDescriptor, DIFF_CALL_TIMEOUT_MS);
     } catch (error) {
       logger.debug(`Forced branch differential failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Sandboxed forced-branch execution via the worker's 'forced_branch' mode.
+   * The child co-pollutes the payload property AND every boolean gate property,
+   * so guarded sinks (`if (opts.debug) eval(opts.template)`) open in a fresh,
+   * isolated process rather than in-process with the fuzzer's privileges.
+   */
+  async _sandboxedForcedBranch(packageName, input, descriptor, timeoutMs) {
+    try {
+      const safeDescriptor = {
+        property: descriptor.property,
+        value: typeof descriptor.value === 'function' ? '__UOPFUZZ_MARKER_7f3a__' : descriptor.value,
+      };
+      const args = input.type === 'template' ? [input.value] : [input.value];
+      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+        timeoutMs,
+        blockNetwork: this.options.blockNetwork !== false,
+        pollution: safeDescriptor,
+        mode: 'forced_branch',
+      });
+      if (result?.error && !result.outputChanged && !result.prototypePolluted && !result.pollutionWasRead) {
+        logger.debug(`Sandboxed forced-branch failed: ${result.error}`);
+        return null;
+      }
+      return this._reconcileSandboxDiff(descriptor, result, {
+        forcedBranch: true,
+        forcedGates: result.forcedGates || [],
+        forcedGatesFired: result.forcedGatesFired || [],
+      });
+    } catch (error) {
+      logger.debug(`Sandboxed forced-branch error: ${error.message}`);
       return null;
     }
   }
@@ -501,7 +554,13 @@ export class Instrumentation {
    */
   async executeMultiPropertyDifferentialTracing(input, config, descriptors) {
     if (this.options.dryRun) return null;
-    // Multi-property only works in-process (not sandboxed) for now
+
+    const pkgBase = packageBaseName(config.package || '');
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    if (canSandbox) {
+      return this._sandboxedMultiProperty(config.package, input, descriptors, DIFF_CALL_TIMEOUT_MS);
+    }
+
     if (!this.targetModule) return null;
 
     const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
@@ -516,6 +575,42 @@ export class Instrumentation {
       return await executeMultiPropertyDifferential(fn, args, descriptors, DIFF_CALL_TIMEOUT_MS);
     } catch (error) {
       logger.debug(`Multi-property differential failed: ${error.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Sandboxed multi-property co-pollution via the worker's 'multi_property' mode.
+   * Co-pollutes every descriptor at once in a fresh isolated process to catch
+   * conjunctive gadgets (two properties that only reach a sink together).
+   */
+  async _sandboxedMultiProperty(packageName, input, descriptors, timeoutMs) {
+    try {
+      const safeDescriptors = descriptors.map(d => ({
+        property: d.property,
+        value: typeof d.value === 'function' ? '__UOPFUZZ_MARKER_7f3a__' : d.value,
+      }));
+      const args = input.type === 'template' ? [input.value] : [input.value];
+      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+        timeoutMs,
+        blockNetwork: this.options.blockNetwork !== false,
+        pollution: { descriptors: safeDescriptors },
+        mode: 'multi_property',
+      });
+      if (result?.error && !result.outputChanged && !result.prototypePolluted && !result.pollutionWasRead) {
+        logger.debug(`Sandboxed multi-property failed: ${result.error}`);
+        return null;
+      }
+      // Primary descriptor drives tier ordering; the combined label is display-only.
+      const primary = descriptors[0] || { property: '', value: undefined };
+      const combinedName = descriptors.map(d => d.property).join('+');
+      return this._reconcileSandboxDiff(
+        primary, result,
+        { firedProperties: result.firedProperties || [], coPolluteCount: descriptors.length },
+        combinedName,
+      );
+    } catch (error) {
+      logger.debug(`Sandboxed multi-property error: ${error.message}`);
       return null;
     }
   }
@@ -677,7 +772,27 @@ export class Instrumentation {
    * Returns property names the library tries to read but finds undefined.
    */
   async discoverUOPCandidates(input, config) {
-    if (!this.targetModule || this.options.dryRun) return [];
+    if (this.options.dryRun) return [];
+
+    const timeoutMs = (this.options.timeout || 5) * 1000;
+    const pkgBase = packageBaseName(config.package || '');
+    const canSandbox = this.options.sandbox && config.package && !BROWSER_ONLY_PACKAGES.has(pkgBase);
+    if (canSandbox) {
+      try {
+        const args = input.type === 'template' ? [input.value] : [input.value];
+        const result = await executeInSandbox(config.package, input.entryPoint, args, {
+          timeoutMs,
+          blockNetwork: this.options.blockNetwork !== false,
+          mode: 'discover_uop',
+        });
+        return Array.isArray(result?.uopProperties) ? result.uopProperties : [];
+      } catch (error) {
+        logger.debug(`Sandboxed UOP discovery failed: ${error.message}`);
+        return [];
+      }
+    }
+
+    if (!this.targetModule) return [];
 
     const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
@@ -688,7 +803,7 @@ export class Instrumentation {
       : (input.type === 'template' ? [input.value] : [input.value]);
 
     try {
-      return await discoverUOPProperties(fn, args, (this.options.timeout || 5) * 1000);
+      return await discoverUOPProperties(fn, args, timeoutMs);
     } catch (error) {
       logger.debug(`UOP discovery failed: ${error.message}`);
       return [];

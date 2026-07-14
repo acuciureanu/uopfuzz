@@ -48,7 +48,7 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
     timeoutMs = 5000,
     blockNetwork = true,
     pollution = null,
-    mode = 'execute', // 'execute' | 'differential' | 'discover_uop'
+    mode = 'execute', // 'execute'|'differential'|'forced_branch'|'multi_property'|'discover_uop'|'merge_pp'
     // Optional: run a different worker script (e.g. the independent reproduction
     // worker) instead of the default sandbox worker. Kept as a passthrough so the
     // fork/timeout/env-scrub plumbing is shared, without coupling the verdict

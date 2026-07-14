@@ -2,6 +2,7 @@ import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { logger } from '../utils/logger.js';
 import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
 import { classifyDiff } from './classify-diff.js';
+import { GATE_PROPERTIES } from './gate-properties.js';
 
 /**
  * Differential Execution Oracle
@@ -563,12 +564,6 @@ export async function executeDifferential(fn, args, pollutionDescriptor, timeout
  * @param {number} timeoutMs
  * @returns {object} Differential result with forced branch info
  */
-const GATE_PROPERTIES = [
-  'debug', 'compileDebug', 'verbose', 'cache', 'client', 'strict',
-  'self', 'async', 'raw', 'unsafe', 'dev', 'development', 'production',
-  'allowDots', 'allowPrototypes', 'pretty', 'rmWhitespace',
-];
-
 export async function executeForcedBranchDifferential(fn, args, pollutionDescriptor, timeoutMs = 5000) {
   const cleanResult = await executeClean(fn, args, timeoutMs);
 
