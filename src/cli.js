@@ -213,7 +213,7 @@ program
   .option('--last <n>', 'Test only the last N versions (newest first)')
   .option('--first <n>', 'Test only the first N versions (oldest first — useful for known-vulnerable older releases)')
   .option('--all', 'Test all available versions (default if no range flags given)')
-  .option('--range <from>..<to>', 'Test versions in range from..to (inclusive, semver)')
+  .option('--range <from>..<to>', 'Test versions in range from..to (inclusive, semver; either order)')
   .option('-o, --output <dir>', 'Output directory for results', './results')
   .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '30')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations per version', '100')

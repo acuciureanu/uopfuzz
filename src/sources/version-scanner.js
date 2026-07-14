@@ -49,11 +49,18 @@ export function selectVersions(versions, strategy) {
   }
 
   if (strategy.mode === 'range') {
-    const { from, to } = strategy;
+    let { from, to } = strategy;
+    // Order-insensitive: accept `from..to` written either oldest..newest
+    // (the natural reading, e.g. 3.0.0..3.5.1) or newest..oldest. Normalize so
+    // `from` is the newer (upper) bound and `to` the older (lower) bound, which
+    // is what the filter below expects.
+    if (from && to && compareVersions(from, to) < 0) {
+      [from, to] = [to, from];
+    }
     return versions.filter(v => {
-      const afterFrom = !from || compareVersions(v, from) <= 0;  // v <= from (from is newer or equal)
-      const beforeTo  = !to   || compareVersions(v, to)   >= 0;  // v >= to   (to is older or equal)
-      return afterFrom && beforeTo;
+      const belowUpper = !from || compareVersions(v, from) <= 0;  // v <= newer bound
+      const aboveLower = !to   || compareVersions(v, to)   >= 0;  // v >= older bound
+      return belowUpper && aboveLower;
     });
   }
 
