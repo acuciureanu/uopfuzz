@@ -8,6 +8,22 @@ import { logger } from './utils/logger.js';
 
 const program = new Command();
 
+/**
+ * Parse a CLI numeric flag, rejecting garbage instead of silently yielding NaN.
+ * `parseInt('foo')` is NaN, which then propagates into loop bounds and timeouts
+ * as a silent no-op (0 iterations, a NaN timeout that never fires); fail loudly
+ * at the boundary instead. `min` defaults to 1 (all our numeric flags are counts
+ * or durations that must be ≥1).
+ */
+function parseIntFlag(value, name, { min = 1 } = {}) {
+  const n = parseInt(value, 10);
+  if (!Number.isInteger(n) || n < min) {
+    logger.error(chalk.red(`Invalid --${name}: "${value}" (expected an integer ≥ ${min})`));
+    process.exit(1);
+  }
+  return n;
+}
+
 program
   .name('uopfuzz')
   .description('UoPFuzz - Prototype pollution gadget hunting framework')
@@ -19,6 +35,7 @@ program
   .option('--target <package>', 'Target package (e.g., pug@3.0.2) — auto-discovers everything')
   .option('-o, --output <dir>', 'Output directory for results', './results')
   .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '60')
+  .option('--install-timeout <seconds>', 'Timeout for the npm install of the target package (retried once)', '30')
   .option('-v, --verbose', 'Enable verbose logging')
   .option('--dry-run', 'Simulate execution without running actual tests')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations', '1000')
@@ -77,14 +94,20 @@ program.action(async (options) => {
       }
     }
 
+    const timeoutSec = parseIntFlag(options.timeout, 'timeout');
+    const maxIterations = parseIntFlag(options.maxIterations, 'max-iterations');
+    const parallelWorkers = parseIntFlag(options.parallel, 'parallel');
+    const installTimeout = parseIntFlag(options.installTimeout, 'install-timeout');
+
     const orchestratorOpts = {
       configPath: options.config || null,
       targetPackage: options.target || null,
       outputDir: options.output,
-      timeout: parseInt(options.timeout),
+      timeout: timeoutSec,
       dryRun: options.dryRun || false,
-      maxIterations: parseInt(options.maxIterations),
-      parallelWorkers: parseInt(options.parallel),
+      maxIterations,
+      parallelWorkers,
+      installTimeout,
       verbose: options.verbose || false,
       // Security options
       allowScripts: options.allowScripts || false,
@@ -112,7 +135,7 @@ program.action(async (options) => {
         // loop. Scale it to the requested work and floor it generously.
         timeoutMs: Math.max(
           15 * 60 * 1000,
-          parseInt(options.timeout) * 1000 * parseInt(options.maxIterations) + 60 * 1000,
+          timeoutSec * 1000 * maxIterations + 60 * 1000,
         ),
       });
       if (error) {
@@ -177,6 +200,7 @@ program
   .option('--concurrency <n>', 'Libraries to scan in parallel (use with caution: shares node_modules)', '1')
   .option('-o, --output <dir>', 'Output directory for results', './results')
   .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '30')
+  .option('--install-timeout <seconds>', 'Timeout for each npm install (retried once)', '30')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations per library', '100')
   .option('--dry-run', 'Simulate without running actual tests')
   .option('-v, --verbose', 'Enable verbose logging')
@@ -194,9 +218,10 @@ program
 
       const orchestratorOptions = {
         outputDir: options.output,
-        timeout: parseInt(options.timeout),
+        timeout: parseIntFlag(options.timeout, 'timeout'),
         dryRun: options.dryRun || false,
-        maxIterations: parseInt(options.maxIterations),
+        maxIterations: parseIntFlag(options.maxIterations, 'max-iterations'),
+        installTimeout: parseIntFlag(options.installTimeout, 'install-timeout'),
         parallelWorkers: 1,
         verbose: options.verbose || false,
         allowScripts: options.allowScripts || false,
@@ -209,10 +234,10 @@ program
 
       const runner = new MassRunner({
         search: options.search,
-        topN: parseInt(options.top),
-        limit: parseInt(options.limit),
+        topN: parseIntFlag(options.top, 'top'),
+        limit: parseIntFlag(options.limit, 'limit'),
         resume: options.resume || false,
-        concurrency: parseInt(options.concurrency),
+        concurrency: parseIntFlag(options.concurrency, 'concurrency'),
         options: orchestratorOptions,
       });
 
@@ -242,6 +267,7 @@ program
   .option('--range <from>..<to>', 'Test versions in range from..to (inclusive, semver; either order)')
   .option('-o, --output <dir>', 'Output directory for results', './results')
   .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '30')
+  .option('--install-timeout <seconds>', 'Timeout for each npm install (retried once)', '30')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations per version', '100')
   .option('--dry-run', 'Simulate without running actual tests')
   .option('-v, --verbose', 'Enable verbose logging')
@@ -260,9 +286,9 @@ program
       // Build version selection strategy
       let strategy;
       if (options.last) {
-        strategy = { mode: 'last', count: parseInt(options.last) };
+        strategy = { mode: 'last', count: parseIntFlag(options.last, 'last') };
       } else if (options.first) {
-        strategy = { mode: 'first', count: parseInt(options.first) };
+        strategy = { mode: 'first', count: parseIntFlag(options.first, 'first') };
       } else if (options.range) {
         const parts = options.range.split('..');
         if (parts.length !== 2) {
@@ -276,9 +302,10 @@ program
 
       const orchestratorOptions = {
         outputDir: options.output,
-        timeout: parseInt(options.timeout),
+        timeout: parseIntFlag(options.timeout, 'timeout'),
         dryRun: options.dryRun || false,
-        maxIterations: parseInt(options.maxIterations),
+        maxIterations: parseIntFlag(options.maxIterations, 'max-iterations'),
+        installTimeout: parseIntFlag(options.installTimeout, 'install-timeout'),
         parallelWorkers: 1,
         verbose: options.verbose || false,
         allowScripts: options.allowScripts || false,
