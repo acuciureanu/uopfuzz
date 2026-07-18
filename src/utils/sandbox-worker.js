@@ -108,8 +108,21 @@ try {
 // dedicated to one package for its whole life.
 let _target = { key: null, module: null, baseline: null, error: null };
 
+/** Cache key for a (package, browserEnv) pair — shared by the loader and the
+ *  self-timeout, so both agree on whether this request is a cold start. */
+function targetCacheKey(packageName, browserEnv) {
+  return `${packageName}::${browserEnv ? 1 : 0}`;
+}
+
+/** True when this request still has to load the target (and, for a browser-only
+ *  package, boot jsdom) — i.e. it is a cold start and earns the startup
+ *  allowance. Mirrors the parent pool's `warm` flag; they must not drift. */
+function isColdStart(packageName, browserEnv) {
+  return _target.key !== targetCacheKey(packageName, browserEnv);
+}
+
 async function loadTargetCached(packageName, browserEnv) {
-  const key = `${packageName}::${browserEnv ? 1 : 0}`;
+  const key = targetCacheKey(packageName, browserEnv);
   if (_target.key === key) return _target; // hit (a cached module, or a cached load error)
 
   let module = null;
@@ -145,10 +158,17 @@ process.on('message', async (msg) => {
 
   // Self-enforced timeout as backup. Browser-only targets get extra time to
   // stand up jsdom before the operation timeout applies (kept in sync with the
-  // parent's allowance in sandbox.js). A synchronous infinite loop in the target
-  // blocks this timer entirely (single thread) — the parent's own per-request
-  // timeout SIGKILLs the worker in that case.
-  const startupAllowance = browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
+  // parent's allowance in sandbox.js / sandbox-pool.js). A synchronous infinite
+  // loop in the target blocks this timer entirely (single thread) — the parent's
+  // own per-request timeout SIGKILLs the worker in that case.
+  //
+  // The allowance is for the COLD start only. Once the target is cached (this
+  // worker is pooled and has served a request) there is no jsdom boot to pay
+  // for, and keeping the allowance would only delay the parent's rescue of a
+  // wedged worker. The parent tracks the same warm/cold state.
+  const startupAllowance = browserEnv && isColdStart(packageName, browserEnv)
+    ? JSDOM_STARTUP_ALLOWANCE_MS
+    : 0;
   let settled = false;
   const reply = (payload) => {
     if (settled) return;

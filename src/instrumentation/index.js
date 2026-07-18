@@ -378,6 +378,35 @@ export class Instrumentation {
     return config.browserEnv === true || isBrowserOnly(packageBaseName(config.package));
   }
 
+  /** True when `config` describes a browser-only target, regardless of sandboxing. */
+  _isBrowserTarget(config) {
+    if (!config?.package) return false;
+    return config.browserEnv === true || isBrowserOnly(packageBaseName(config.package));
+  }
+
+  /**
+   * Warn once per run when --no-sandbox is combined with a browser-only target.
+   * That combination puts the target back in-process, which is exactly where a
+   * synchronous jsdom XHR (e.g. `$.ajax({async:false})` reached by a fuzzed
+   * input) blocks the fuzzer's own event loop — and a frozen loop cannot fire
+   * either the per-call or the per-iteration timeout, so the run wedges until an
+   * external kill. It is a legitimate "faster, less safe" opt-in, but a silent
+   * one looks like a hang.
+   *
+   * @returns {boolean} whether a warning was emitted (for callers/tests).
+   */
+  warnIfUnsandboxedBrowserTarget(config) {
+    if (this.options.sandbox) return false;
+    if (!this._isBrowserTarget(config)) return false;
+    logger.warn(
+      `${config.name || config.package} is a browser-only target running with --no-sandbox: ` +
+      `it executes in-process, where a synchronous jsdom XHR can freeze the fuzzer's event loop ` +
+      `and hang the run (no timeout can fire on a frozen loop). Drop --no-sandbox to run it in ` +
+      `an isolated child with a rescue watchdog.`
+    );
+    return true;
+  }
+
   /**
    * Phase A execution for browser-only targets, routed through the sandbox pool
    * (mode 'execute') instead of the in-process safeExecute path. This keeps a
