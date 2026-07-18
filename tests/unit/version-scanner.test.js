@@ -93,7 +93,18 @@ describe('selectVersions — mode: range', () => {
     assert.ok(!result.includes('3.0.0'));
   });
 
-  test('returns nothing when range has no matches', () => {
+  test('is order-insensitive: oldest..newest yields the same set as newest..oldest', () => {
+    // The natural reading (`--range 3.10.0..4.17.20`) must match the reversed
+    // form (`4.17.20..3.10.0`). Regression for a range that silently returned []
+    // when written oldest-first.
+    const a = selectVersions(ALL_VERSIONS, { mode: 'range', from: '3.10.0', to: '4.17.20' });
+    const b = selectVersions(ALL_VERSIONS, { mode: 'range', from: '4.17.20', to: '3.10.0' });
+    assert.deepEqual(a, b);
+    assert.ok(a.includes('4.17.20') && a.includes('4.16.0') && a.includes('3.10.0'));
+    assert.ok(!a.includes('4.17.21') && !a.includes('3.0.0'));
+  });
+
+  test('returns just the single version when from === to', () => {
     const result = selectVersions(ALL_VERSIONS, { mode: 'range', from: '4.17.21', to: '4.17.21' });
     assert.equal(result.length, 1);
     assert.equal(result[0], '4.17.21');

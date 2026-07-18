@@ -27,11 +27,17 @@ A finding is only reported as a **vulnerability** when it is *independently repr
 
 ```bash
 npm install
-# Single-threaded execution
+# Auto-discovery: point it at a package@version — installs it, finds and verifies gadgets
+node src/cli.js --target lodash@4.17.4
+# Config-driven: use a YAML target spec
 node src/cli.js --config config/targets/pug.yaml --output results/
 # Multi-threaded execution for better performance
 node src/cli.js --config config/targets/pug.yaml --parallel 4 --output results/
 ```
+
+`--target` installs the package from npm and executes its code — run untrusted
+targets inside the dev container (see the **Safety model** below). Full flag
+reference and the container invocation are in [`docs/usage.md`](docs/usage.md).
 
 ## Architecture
 
@@ -57,19 +63,25 @@ will run on your machine.
   secrets in its environment, egress governed by the network policy, ephemeral
   filesystem. **Run untrusted targets inside it.** This is the layer you should
   rely on.
-- Inside that boundary, discovery and reproduction run target code in **forked
-  child processes** with best-effort in-process hardening
+- Inside that boundary, every discovery mode that *calls* target code — the
+  single-property, forced-branch, and multi-property differentials, the merge-PP
+  and URL-gadget probes, and UOP-property discovery — plus reproduction, run in
+  **forked child processes** with best-effort in-process hardening
   (`src/utils/worker-hardening.js`): outbound network (opt-in via
   `--allow-network`), `child_process`, and `worker_threads` are monkey-patched
   off, and known secret-bearing environment variables are stripped from the
   child. These are speed bumps against low-effort/accidental bad behavior — **not
   a sandbox** against a targeted exploit, which shares the process uid,
-  filesystem, and network namespace.
-- Two execution modes (forced-branch and multi-property co-pollution) run
-  **in-process**, in the fuzzer's own process, because they need a live function
-  reference to install prototype traps. In those modes the in-child hardening
-  does **not** apply. `--no-sandbox` runs *everything* in-process. Only use these
-  on code you trust, or strictly inside the container.
+  filesystem, and network namespace. Browser-only libraries (jQuery, Backbone, …)
+  load under a jsdom DOM *inside* that child too, so their fuzzed pollution — and
+  any network their DOM attempts (blocked here) — stays contained rather than
+  corrupting the fuzzer's own Node internals.
+- Two caveats keep this honest. First, the target module is still
+  **`import()`ed in the fuzzer's own process** to auto-generate its config and
+  entry points, so a package's *module-load-time* code runs unsandboxed — another
+  reason the container is the boundary that matters. Second, `--no-sandbox` runs
+  *everything* (module load and every call) in-process. Only fuzz code you trust
+  outside the container.
 
 **Flags that lower the guardrails** (`--no-sandbox`, `--allow-scripts`,
 `--allow-suspicious`, `--allow-network`) are opt-in and print a warning. The

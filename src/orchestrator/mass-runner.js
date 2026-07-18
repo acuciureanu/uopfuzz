@@ -5,11 +5,73 @@
 
 import fs from 'fs/promises';
 import path from 'path';
-import { Orchestrator } from './index.js';
+import { fork } from 'child_process';
+import { fileURLToPath } from 'url';
 import { fetchLibraries, fetchLibrary, resolveNpmPackage, filterJSLibraries, rankByStars } from '../sources/cdnjs.js';
 import { getVersions, selectVersions, resolveInstallable } from '../sources/version-scanner.js';
 import { generateMassReport, generateVersionReport } from '../reporting/markdown-report.js';
 import { logger } from '../utils/logger.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const SUBPROCESS_PATH = path.join(__dirname, 'orchestrator-subprocess.js');
+
+// Wall-clock backstop for a single target. The Orchestrator bounds each
+// iteration itself; this only catches a target that hangs the whole run (a
+// stuck child never returns and would otherwise stall the entire sweep). 15 min
+// is generous for a converging run; a truly hung child is SIGKILLed after it.
+const DEFAULT_PER_TARGET_TIMEOUT_MS = 15 * 60 * 1000;
+
+/**
+ * Run one target's full Orchestrator in a forked child process and return its
+ * results, containing any crash or hang to that child. This is the crash
+ * boundary that lets mass/version sweeps survive a target that kills its process
+ * (e.g. a browser-only package whose in-process pollution corrupts Node's HTTP
+ * internals) — the sweep records a failure for that target and continues.
+ *
+ * Never rejects: a crash, a spawn error, or a timeout all resolve to
+ * `{ results: null, error }`.
+ *
+ * @param {object} options - Orchestrator options (must be JSON-serializable).
+ * @param {object} [opts]
+ * @param {number} [opts.timeoutMs] - Per-target wall-clock cap.
+ * @param {string} [opts.workerPath] - Override the child script (for tests).
+ * @param {boolean} [opts.silent] - Suppress the child's stderr (for tests).
+ * @returns {Promise<{results: object|null, error: string|null}>}
+ */
+export function runOrchestratorIsolated(options, { timeoutMs = DEFAULT_PER_TARGET_TIMEOUT_MS, workerPath = SUBPROCESS_PATH, silent = false } = {}) {
+  return new Promise((resolve) => {
+    const child = fork(workerPath, [], {
+      stdio: ['inherit', 'inherit', silent ? 'ignore' : 'inherit', 'ipc'],
+    });
+
+    let settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill('SIGKILL'); } catch { /* already gone */ }
+      resolve(r);
+    };
+
+    const timer = setTimeout(
+      () => finish({ results: null, error: `target exceeded ${Math.round(timeoutMs / 1000)}s wall-clock budget (killed)` }),
+      timeoutMs,
+    );
+
+    child.on('message', (msg) => {
+      if (msg?.type === 'success') finish({ results: msg.results, error: null });
+      else if (msg?.type === 'error') finish({ results: null, error: msg.error });
+    });
+    child.on('error', (err) => finish({ results: null, error: `subprocess spawn error: ${err.message}` }));
+    child.on('exit', (code, signal) => {
+      // A clean success/error arrives via 'message' first and settles us; reaching
+      // here unsettled means the child died without reporting — a contained crash.
+      finish({ results: null, error: `target process crashed (exit ${code}${signal ? `, ${signal}` : ''})` });
+    });
+
+    child.send({ type: 'run', options });
+  });
+}
 
 // ─── MassRunner ───────────────────────────────────────────────────────────────
 
@@ -86,29 +148,29 @@ export class MassRunner {
 
       logger.info(`[${idx + 1}/${targets.length}] Scanning ${label} (${stars} stars)`);
 
-      try {
-        const orchestratorOpts = {
-          ...this.orchestratorOptions,
-          targetPackage: `${npmPackage}@${version}`,
-          outputDir: path.join(outputDir, `mass-${_safeName(lib.name)}`),
-        };
+      const orchestratorOpts = {
+        ...this.orchestratorOptions,
+        targetPackage: `${npmPackage}@${version}`,
+        outputDir: path.join(outputDir, `mass-${_safeName(lib.name)}`),
+      };
 
-        const orchestrator = new Orchestrator(orchestratorOpts);
-        const results = await orchestrator.run();
+      // Isolate each library in a child process: a crash/hang on one library
+      // (common among the browser-only libs that dominate cdnjs's top ranks) is
+      // contained and recorded as a failure instead of killing the whole scan.
+      const { results, error } = await runOrchestratorIsolated(orchestratorOpts, {
+        timeoutMs: this.orchestratorOptions.perTargetTimeoutMs,
+      });
 
-        allResults[idx] = {
-          library: lib.name, version, stars, results,
-          config: orchestrator.config, error: null
-        };
-
-        const libResultFile = path.join(outputDir, `mass-${_safeName(lib.name)}-${version}.json`);
-        await fs.writeFile(libResultFile, JSON.stringify(results, null, 2));
-        logger.info(`Saved ${label} results -> ${libResultFile}`);
-
-      } catch (err) {
-        logger.warn(`MassRunner: ${label} failed \u2014 ${err.message}`);
-        allResults[idx] = { library: lib.name, version, stars, results: null, config: null, error: err.message };
+      if (error) {
+        logger.warn(`MassRunner: ${label} failed \u2014 ${error}`);
+        allResults[idx] = { library: lib.name, version, stars, results: null, config: null, error };
+        return;
       }
+
+      allResults[idx] = { library: lib.name, version, stars, results, config: null, error: null };
+      const libResultFile = path.join(outputDir, `mass-${_safeName(lib.name)}-${version}.json`);
+      await fs.writeFile(libResultFile, JSON.stringify(results, null, 2));
+      logger.info(`Saved ${label} results -> ${libResultFile}`);
     };
 
     await _runPool(targets, this.concurrency, scanOne);
@@ -190,29 +252,30 @@ export class VersionRunner {
       const installable = resolveInstallable(this.cdnjsName, this.npmPackage, version);
       logger.info(`[${idx + 1}/${selectedVersions.length}] Testing ${installable.installSpec}`);
 
+      const orchestratorOpts = {
+        ...this.orchestratorOptions,
+        targetPackage: installable.installSpec,
+        outputDir: path.join(outputDir, `versions-${_safeName(this.cdnjsName)}`),
+      };
+
+      // Run each version in an isolated child process so a crash/hang on one
+      // version (e.g. a browser-only lib corrupting Node internals) does not kill
+      // the whole sweep — it is recorded as a failure and the sweep continues.
+      const { results, error } = await runOrchestratorIsolated(orchestratorOpts, {
+        timeoutMs: this.orchestratorOptions.perTargetTimeoutMs,
+      });
+
       let scanResult;
-      try {
-        const orchestratorOpts = {
-          ...this.orchestratorOptions,
-          targetPackage: installable.installSpec,
-          outputDir: path.join(outputDir, `versions-${_safeName(this.cdnjsName)}`),
-        };
-
-        const orchestrator = new Orchestrator(orchestratorOpts);
-        const results = await orchestrator.run();
-
-        scanResult = { version, results, config: orchestrator.config, error: null };
-
-        // Persist per-version results
+      if (error) {
+        logger.warn(`VersionRunner: ${installable.installSpec} failed — ${error}`);
+        scanResult = { version, results: null, config: null, error };
+      } else {
+        scanResult = { version, results, config: null, error: null };
         const versionResultFile = path.join(
           outputDir,
           `version-${_safeName(this.cdnjsName)}-${_safeName(version)}.json`
         );
         await fs.writeFile(versionResultFile, JSON.stringify(results, null, 2));
-
-      } catch (err) {
-        logger.warn(`VersionRunner: ${installable.installSpec} failed — ${err.message}`);
-        scanResult = { version, results: null, config: null, error: err.message };
       }
 
       versionResults.push(scanResult);

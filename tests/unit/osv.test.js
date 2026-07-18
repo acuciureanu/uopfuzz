@@ -56,6 +56,21 @@ describe('fetchOsvVulns (mocked fetch)', () => {
     assert.equal(sentBody.package.ecosystem, 'npm');
   });
 
+  test('sends Connection: close so no keep-alive socket lingers to be poisoned', async () => {
+    // Regression: an idle undici keep-alive socket left in the fuzzer process
+    // becomes a crash landmine once fuzzing pollutes Object.prototype — the
+    // socket's idle-timeout callback reads the polluted `timeout` off the
+    // prototype chain and throws in undici's parser, taking the process down.
+    // Closing the connection removes the socket. See src/sources/osv.js.
+    let sentHeaders = null;
+    globalThis.fetch = async (url, opts) => {
+      sentHeaders = opts.headers;
+      return { ok: true, status: 200, json: async () => ({ vulns: [] }) };
+    };
+    await fetchOsvVulns('x', '1.0.0');
+    assert.equal(sentHeaders?.Connection, 'close');
+  });
+
   test('retries up to 3 times on 5xx then succeeds', async () => {
     let calls = 0;
     globalThis.fetch = async () => {

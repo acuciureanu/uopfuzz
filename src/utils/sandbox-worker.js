@@ -15,6 +15,8 @@
 import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 import { hardenWorkerProcess } from './worker-hardening.js';
+import { GATE_PROPERTIES } from '../instrumentation/gate-properties.js';
+import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with repro-worker.js) ───────────────
@@ -92,16 +94,19 @@ try {
 
 // ─── MESSAGE HANDLER ─────────────────────────────────────────
 process.on('message', async (msg) => {
-  const { mode, packageName, entryPoint, args, timeoutMs, pollution } = msg;
+  const { mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv } = msg;
 
-  // Self-enforced timeout as backup
+  // Self-enforced timeout as backup. Browser-only targets get extra time to
+  // stand up jsdom before the operation timeout applies (kept in sync with the
+  // parent's allowance in sandbox.js).
+  const startupAllowance = browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
   const killTimer = setTimeout(() => {
     process.send?.({ error: 'Self-timeout reached', output: null, timedOut: true });
     process.exit(0);
-  }, (timeoutMs || 5000) + 500);
+  }, (timeoutMs || 5000) + startupAllowance + 500);
 
   try {
-    const result = await executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution);
+    const result = await executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv);
     clearTimeout(killTimer);
     process.send?.(result);
   } catch (error) {
@@ -117,16 +122,28 @@ process.on('message', async (msg) => {
   process.exit(0);
 });
 
-async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution) {
-  // Load the target package
+async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv) {
+  // Load the target package. Browser-only packages (jQuery, …) need a jsdom DOM
+  // in place at load time; we stand one up in this isolated child so their
+  // fuzzed pollution — and any network the DOM's XHR attempts (blocked here) —
+  // stays contained instead of corrupting the fuzzer's own process.
   let targetModule;
-  try {
-    targetModule = await import(packageName);
-  } catch {
+  if (browserEnv) {
     try {
-      targetModule = require(packageName);
+      const dom = await setupJsdomGlobals();
+      targetModule = loadBrowserModule(require, packageName, dom);
     } catch (err) {
-      return { error: `Cannot load package ${packageName}: ${err.message}`, output: null };
+      return { error: `Cannot load browser-only package ${packageName}: ${err.message}`, output: null };
+    }
+  } else {
+    try {
+      targetModule = await import(packageName);
+    } catch {
+      try {
+        targetModule = require(packageName);
+      } catch (err) {
+        return { error: `Cannot load package ${packageName}: ${err.message}`, output: null };
+      }
     }
   }
 
@@ -145,6 +162,12 @@ async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, po
 
     case 'differential':
       return await executeDifferential(fn, realArgs, pollution, timeoutMs);
+
+    case 'forced_branch':
+      return await forcedBranchTest(fn, realArgs, pollution, timeoutMs);
+
+    case 'multi_property':
+      return await multiPropertyTest(fn, realArgs, pollution, timeoutMs);
 
     case 'discover_uop':
       return await discoverUOP(fn, realArgs, timeoutMs);
@@ -256,6 +279,127 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
   };
 }
 
+/** Install a getter/setter trap on Object.prototype; returns cleanup state. */
+function installTrap(prop, val) {
+  const hadProp = Object.prototype.hasOwnProperty.call(Object.prototype, prop);
+  const origVal = hadProp ? Object.prototype[prop] : undefined;
+  const state = { prop, hadProp, origVal, fired: false, trapVal: val };
+  try {
+    Object.defineProperty(Object.prototype, prop, {
+      get() { state.fired = true; return state.trapVal; },
+      set(v) { state.fired = true; state.trapVal = v; },
+      configurable: true,
+      enumerable: false,
+    });
+  } catch {
+    // Non-configurable; fall back to plain assignment (read is not observable).
+    try { Object.prototype[prop] = val; } catch { /* sealed */ }
+  }
+  return state;
+}
+
+function restoreTrap({ prop, hadProp, origVal }) {
+  try { delete Object.prototype[prop]; } catch { /* sealed */ }
+  if (hadProp) { try { Object.prototype[prop] = origVal; } catch { /* sealed */ } }
+}
+
+/**
+ * Run one clean call then one call with ALL of `traps` installed on
+ * Object.prototype simultaneously, and return the raw differential FACTS (never
+ * a verdict — the shared classifyDiff() on the parent side owns tiering). Shared
+ * by the forced-branch and multi-property modes so they observe sinks, reads,
+ * and real prototype mutations exactly the way the single-property differential
+ * mode does.
+ *
+ * @param {Function} fn
+ * @param {Array} args
+ * @param {Array<{property:string,value:any}>} descriptors - traps to install
+ * @param {number} timeoutMs
+ */
+async function runWithTraps(fn, args, descriptors, timeoutMs) {
+  sinkLog.length = 0;
+  let cleanOutput, cleanError;
+  try {
+    cleanOutput = safeSerialize(await withTimeout(fn(...clone(args)), timeoutMs));
+  } catch (err) {
+    cleanError = err.message;
+  }
+  const cleanSinkCount = sinkLog.length;
+
+  const snapshot = snapshotPrototype();
+  const traps = descriptors.map(d => installTrap(d.property, d.value));
+  const pollutedProperties = [];
+  let pollutedOutput, pollutedError;
+
+  try {
+    pollutedOutput = safeSerialize(await withTimeout(fn(...clone(args)), timeoutMs));
+  } catch (err) {
+    pollutedError = err.message;
+  } finally {
+    for (const t of traps.reverse()) restoreTrap(t);
+    const detection = detectAndRestorePrototype(snapshot);
+    if (detection.polluted) pollutedProperties.push(...detection.newProps);
+  }
+
+  const cleanSinks = sinkLog.slice(0, cleanSinkCount);
+  const pollutedSinks = sinkLog.slice(cleanSinkCount);
+  const newSinkAccesses = pollutedSinks.filter(ps => !cleanSinks.some(cs => cs.sink === ps.sink));
+
+  return {
+    clean: { output: cleanOutput, error: cleanError },
+    polluted: { output: pollutedOutput, error: pollutedError },
+    outputChanged: cleanOutput !== pollutedOutput,
+    errorChanged: cleanError !== pollutedError,
+    prototypePolluted: pollutedProperties.length > 0,
+    pollutedProperties,
+    firedProperties: traps.filter(t => t.fired).map(t => t.prop),
+    pollutionWasRead: traps.some(t => t.fired),
+    sinkAccesses: pollutedSinks,
+    newSinkAccesses,
+  };
+}
+
+/**
+ * forced_branch: co-pollute the payload property AND every boolean gate property
+ * (GATE_PROPERTIES) with `true`, forcing guarded code paths open (Dasty).
+ * `pollution` is the single { property, value } payload descriptor.
+ */
+async function forcedBranchTest(fn, args, pollution, timeoutMs) {
+  if (!pollution) return { error: 'No pollution descriptor', output: null };
+  const prop = pollution.property;
+  const descriptors = [{ property: prop, value: pollution.value }];
+  const forcedGates = [];
+  for (const gate of GATE_PROPERTIES) {
+    if (gate === prop) continue;
+    descriptors.push({ property: gate, value: true });
+    forcedGates.push(gate);
+  }
+
+  const facts = await runWithTraps(fn, args, descriptors, timeoutMs);
+  // The main payload property drives pollutionWasRead; gate reads are reported
+  // separately so the parent can record which gates actually opened a branch.
+  const forcedGatesFired = facts.firedProperties.filter(p => p !== prop);
+  return {
+    ...facts,
+    property: prop,
+    pollutionWasRead: facts.firedProperties.includes(prop),
+    forcedGates,
+    forcedGatesFired,
+  };
+}
+
+/**
+ * multi_property: co-pollute several attacker-controlled properties at once, for
+ * conjunctive gadgets where no single property alone reaches the sink.
+ * `pollution.descriptors` is the array of { property, value } to co-pollute.
+ */
+async function multiPropertyTest(fn, args, pollution, timeoutMs) {
+  const descriptors = Array.isArray(pollution?.descriptors) ? pollution.descriptors : [];
+  if (!descriptors.length) return { error: 'No descriptors for multi_property', output: null };
+  const facts = await runWithTraps(fn, args, descriptors, timeoutMs);
+  return { ...facts, property: descriptors.map(d => d.property).join('+') };
+}
+
 async function discoverUOP(fn, args, timeoutMs) {
   // Use a Proxy to detect which properties are read as undefined
   const uopCandidates = new Set();
@@ -344,6 +488,17 @@ function withTimeout(promise, ms) {
       timer = setTimeout(() => reject(new Error('timeout')), ms);
     })
   ]).finally(() => clearTimeout(timer));
+}
+
+/** Deep-clone args between the clean and polluted runs so a mutation in one run
+ *  cannot leak into the other. Falls back to the original on non-cloneable args. */
+function clone(arr) {
+  return arr.map(a => {
+    if (a && typeof a === 'object' && !Buffer.isBuffer(a)) {
+      try { return structuredClone(a); } catch { return a; }
+    }
+    return a;
+  });
 }
 
 function resolveEntryPoint(module, name, packageName) {

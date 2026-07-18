@@ -3,7 +3,7 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
 import { Orchestrator } from './orchestrator/index.js';
-import { MassRunner, VersionRunner } from './orchestrator/mass-runner.js';
+import { MassRunner, VersionRunner, runOrchestratorIsolated } from './orchestrator/mass-runner.js';
 import { logger } from './utils/logger.js';
 
 const program = new Command();
@@ -30,6 +30,7 @@ program
   .option('--sandbox', 'Run target code in isolated child process (recommended)', true)
   .option('--no-sandbox', 'Disable child process isolation (faster, less safe)')
   .option('--allow-network', 'Allow network access during target execution')
+  .option('--no-isolate', 'Run the whole session in this process instead of a crash-isolated child (for debugging; a target that corrupts Node internals can then take the fuzzer down)')
   .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only). Note: an OSV query reveals the analyzed package@version to a third party');
 
 program.action(async (options) => {
@@ -94,8 +95,33 @@ program.action(async (options) => {
       noOsv: options.osv === false,
     };
 
-    const orchestrator = new Orchestrator(orchestratorOpts);
-    const results = await orchestrator.run();
+    // Crash isolation (default): run the whole session in a forked child so a
+    // target that corrupts Node's own internals — e.g. a browser-only package
+    // whose in-process Object.prototype pollution poisons undici's HTTP parser —
+    // dies as a contained, reported failure instead of taking the fuzzer down
+    // with an uncaught exception. `--no-isolate` opts out for in-process
+    // debugging. The child streams its logs to this terminal (stdio inherited).
+    let results;
+    if (options.isolate === false) {
+      const orchestrator = new Orchestrator(orchestratorOpts);
+      results = await orchestrator.run();
+    } else {
+      const { results: r, error } = await runOrchestratorIsolated(orchestratorOpts, {
+        // Interactive single-target run: the operator is watching and can Ctrl-C,
+        // so the wall-clock cap is only a backstop against a fully wedged event
+        // loop. Scale it to the requested work and floor it generously.
+        timeoutMs: Math.max(
+          15 * 60 * 1000,
+          parseInt(options.timeout) * 1000 * parseInt(options.maxIterations) + 60 * 1000,
+        ),
+      });
+      if (error) {
+        logger.error(chalk.red.bold('Run failed (isolated child):'), error);
+        logger.info('Re-run with --no-isolate to see the crash in this process, or --no-osv if the OSV lookup is implicated.');
+        process.exit(1);
+      }
+      results = r;
+    }
 
     logger.info(chalk.green.bold('Fuzzing session completed'));
     logger.info(`Results saved to: ${options.output}`);
@@ -213,7 +239,7 @@ program
   .option('--last <n>', 'Test only the last N versions (newest first)')
   .option('--first <n>', 'Test only the first N versions (oldest first — useful for known-vulnerable older releases)')
   .option('--all', 'Test all available versions (default if no range flags given)')
-  .option('--range <from>..<to>', 'Test versions in range from..to (inclusive, semver)')
+  .option('--range <from>..<to>', 'Test versions in range from..to (inclusive, semver; either order)')
   .option('-o, --output <dir>', 'Output directory for results', './results')
   .option('-t, --timeout <seconds>', 'Timeout per iteration in seconds', '30')
   .option('--max-iterations <num>', 'Maximum fuzzing iterations per version', '100')

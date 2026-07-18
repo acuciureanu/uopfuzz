@@ -6,6 +6,7 @@ yarn-error.log*
 
 # Results and outputs
 results/
+results-*/
 test-results/
 test-results-*/
 *.log
