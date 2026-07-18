@@ -58,3 +58,8 @@ pids
 
 # Optional eslint cache
 .eslintcache
+
+# Claude Code local state. `worktrees/` holds full checkouts created by
+# agent worktree-isolation runs; `settings.local.json` is per-machine.
+.claude/worktrees/
+.claude/settings.local.json
