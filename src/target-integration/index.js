@@ -300,6 +300,13 @@ export class TargetIntegration {
     // Auto-discover everything (main module + sub-modules)
     const config = await discoverTarget(targetModule, name, version, subModules);
 
+    // Record whether this target needed a DOM (loaded via jsdom). The
+    // instrumentation uses this to route Phase A execution through the sandbox
+    // child instead of running the browser lib in-process (where a synchronous
+    // jsdom XHR would freeze the fuzzer's event loop). Covers both the known
+    // browser-only packages and the runtime DOM-detection fallback.
+    config.browserEnv = this._loadedViaJsdom === true;
+
     // Cache — merge sub-module exports into targetModule for execution
     const mergedModule = { ...targetModule };
     for (const [subPath, subMod] of Object.entries(subModules)) {
@@ -325,6 +332,9 @@ export class TargetIntegration {
     // versions of the same package sequentially. Without this, require() returns
     // the first version's cached module instead of the newly-installed one.
     this._clearRequireCache(name);
+
+    // Reset the per-load jsdom marker; _loadWithJsdom sets it when a DOM is used.
+    this._loadedViaJsdom = false;
 
     // Known browser-only packages that export a factory requiring window/document.
     // These may import() successfully but return a useless factory without DOM globals.
@@ -388,6 +398,7 @@ export class TargetIntegration {
         });
       } catch { /* ignore */ }
       logger.info(`Using jsdom for ${name}`);
+      this._loadedViaJsdom = true;
       // Use CJS loader for fresh cache and proper DOM initialization
       return await this._importWithFreshCache(name);
     } catch (err_jsdom) {

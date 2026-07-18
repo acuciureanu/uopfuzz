@@ -231,8 +231,23 @@ export class Instrumentation {
       // Layer 3: Set up global sink interception
       this.setupSinkTracing(trace, config.sinks);
 
-      // Execute the input with Layer 2 (Proxy taint tracking)
-      await this.executeInputWithTaintTracking(input, config, trace);
+      if (this._isBrowserSandbox(config)) {
+        // Browser-only targets (jQuery, …) MUST NOT run in-process: a fuzzer
+        // input reaching an ajax-family entry point makes jsdom perform a
+        // SYNCHRONOUS XHR that blocks the fuzzer's own event loop, freezing the
+        // whole run (neither safeExecute's timer nor the iteration timeout can
+        // fire on a frozen loop). Run the call in the sandbox pool instead — its
+        // parent-side SIGKILL watchdog survives a wedged child, and the main
+        // loop stays free so the orchestrator's iteration timeout still works.
+        // The in-process taint proxy / V8 snapshot cannot observe a child call,
+        // so they are skipped here; UOP discovery for browser targets already
+        // runs sandboxed (discoverUOPCandidates) and gadget confirmation is the
+        // differential phase, which is sandboxed too.
+        await this._executeInputSandboxed(input, config, trace);
+      } else {
+        // Execute the input with Layer 2 (Proxy taint tracking)
+        await this.executeInputWithTaintTracking(input, config, trace);
+      }
 
       // Layer 1b: Collect V8 coverage snapshot for this input
       if (this.v8CoverageEnabled) {
@@ -347,6 +362,73 @@ export class Instrumentation {
           });
         }
       }
+    }
+  }
+
+  /**
+   * True when this target's Phase A coverage-exploration calls must run in the
+   * sandbox child rather than in-process: a browser-only package (jQuery, …)
+   * under jsdom, with sandboxing enabled. `config.browserEnv` is set at setup
+   * time when the target was loaded via jsdom (covers the DOM-detection fallback
+   * too); the name check is the shared single-source-of-truth used by every
+   * other sandboxed mode. See _executeInputSandboxed for why in-process is unsafe.
+   */
+  _isBrowserSandbox(config) {
+    if (!this.options.sandbox || !config?.package) return false;
+    return config.browserEnv === true || isBrowserOnly(packageBaseName(config.package));
+  }
+
+  /**
+   * Phase A execution for browser-only targets, routed through the sandbox pool
+   * (mode 'execute') instead of the in-process safeExecute path. This keeps a
+   * synchronous jsdom XHR (from an ajax-family entry point) contained to the
+   * child, where the pool's parent-side SIGKILL watchdog can rescue a wedged
+   * loop — the fuzzer's own event loop stays free. Errors/timeouts are contained
+   * here (never rethrown), mirroring safeExecute's swallow-into-result contract,
+   * and the same 5-consecutive-failure entry-point skip as executeInput().
+   */
+  async _executeInputSandboxed(input, config, trace) {
+    const epKey = input.entryPoint;
+    if ((this._entryPointFailures.get(epKey) || 0) > 5) {
+      trace.errors.push({ message: `Skipped ${epKey} (too many failures)`, timestamp: Date.now() });
+      return;
+    }
+
+    const args = input.type === 'template' ? [input.value] : [input.value];
+    const callRecord = {
+      function: epKey,
+      arguments: args.map(a => typeof a === 'string' ? a.substring(0, 200) : '[object]'),
+      timestamp: Date.now(),
+    };
+    trace.functionCalls.push(callRecord);
+
+    try {
+      const result = await this._getPool().run(config.package, epKey, args, {
+        timeoutMs: DIFF_CALL_TIMEOUT_MS,
+        blockNetwork: this.options.blockNetwork !== false,
+        mode: 'execute',
+        browserEnv: true,
+      });
+
+      if (result?.error) {
+        // A contained failure (fn threw, timed out, or the worker was SIGKILLed
+        // after a sync-XHR freeze). Record it like safeExecute would and count it
+        // toward the entry-point failure budget.
+        callRecord.result = `[ERROR: ${result.error}]`;
+        const count = (this._entryPointFailures.get(epKey) || 0) + 1;
+        this._entryPointFailures.set(epKey, count);
+        if (count === 5) logger.debug(`Disabling entry point ${epKey} after 5 consecutive failures`);
+        return;
+      }
+
+      const out = result?.output;
+      callRecord.result = typeof out === 'string' ? out.substring(0, 500) : typeof out;
+      this._entryPointFailures.set(epKey, 0);
+    } catch (error) {
+      // The pool itself never rejects for target errors, but guard anyway so a
+      // Phase A input can never take the run down.
+      callRecord.result = `[ERROR: ${error.message}]`;
+      trace.errors.push({ message: error.message, timestamp: Date.now() });
     }
   }
 
