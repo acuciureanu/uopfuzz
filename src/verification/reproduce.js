@@ -30,18 +30,23 @@ const REQUIRED_AGREEING_RUNS = 2;
  */
 export async function reproduceProto(packageName, entryPoint, descriptor, opts = {}) {
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
-  const results = [];
-  for (let run = 0; run < REQUIRED_AGREEING_RUNS; run++) {
-    const r = await executeInSandbox(packageName, entryPoint, [{}], {
-      timeoutMs,
-      blockNetwork: opts.blockNetwork !== false,
-      workerScript: REPRO_WORKER,
-      mode: 'repro_pp',
-      extra: { property: descriptor.property, value: descriptor.value, nonce: run },
-    }).catch(err => ({ verified: false, error: err.message }));
-    results.push(r);
-    if (!r?.verified) break; // fail fast — no point running the second fork
-  }
+  // Run both agreeing forks concurrently. They are fully independent fresh
+  // processes (no shared state), so overlapping them halves per-confirmation
+  // latency; the verdict is unchanged — BOTH must still verify. We forgo the
+  // sequential fail-fast (a false lead now pays for two forks instead of one),
+  // a good trade since confirmations are rare and the common path here is the
+  // positive one, where fail-fast never fired anyway.
+  const results = await Promise.all(
+    Array.from({ length: REQUIRED_AGREEING_RUNS }, (_, run) =>
+      executeInSandbox(packageName, entryPoint, [{}], {
+        timeoutMs,
+        blockNetwork: opts.blockNetwork !== false,
+        workerScript: REPRO_WORKER,
+        mode: 'repro_pp',
+        extra: { property: descriptor.property, value: descriptor.value, nonce: run },
+      }).catch(err => ({ verified: false, error: err.message }))
+    )
+  );
 
   const verified = results.length === REQUIRED_AGREEING_RUNS && results.every(r => r?.verified);
   if (!verified) {
@@ -72,18 +77,19 @@ export async function reproduceProto(packageName, entryPoint, descriptor, opts =
 export async function reproduceRce(packageName, entryPoint, spec, opts = {}) {
   const timeoutMs = opts.timeoutMs || DEFAULT_TIMEOUT_MS;
   const minimalArgs = Array.isArray(spec.minimalArgs) && spec.minimalArgs.length ? spec.minimalArgs : [{}];
-  const results = [];
-  for (let run = 0; run < REQUIRED_AGREEING_RUNS; run++) {
-    const r = await executeInSandbox(packageName, entryPoint, minimalArgs, {
-      timeoutMs,
-      blockNetwork: opts.blockNetwork !== false,
-      workerScript: REPRO_WORKER,
-      mode: 'repro_rce',
-      extra: { property: spec.property, gates: spec.gates || [], sequence: spec.sequence || null, nonce: run },
-    }).catch(err => ({ verified: false, error: err.message }));
-    results.push(r);
-    if (!r?.verified) break;
-  }
+  // Both agreeing forks run concurrently — see reproduceProto for the rationale.
+  // Verdict is unchanged: both independent fresh processes must verify.
+  const results = await Promise.all(
+    Array.from({ length: REQUIRED_AGREEING_RUNS }, (_, run) =>
+      executeInSandbox(packageName, entryPoint, minimalArgs, {
+        timeoutMs,
+        blockNetwork: opts.blockNetwork !== false,
+        workerScript: REPRO_WORKER,
+        mode: 'repro_rce',
+        extra: { property: spec.property, gates: spec.gates || [], sequence: spec.sequence || null, nonce: run },
+      }).catch(err => ({ verified: false, error: err.message }))
+    )
+  );
 
   const verified = results.length === REQUIRED_AGREEING_RUNS && results.every(r => r?.verified);
   if (!verified) return { verified: false, runs: results.length };

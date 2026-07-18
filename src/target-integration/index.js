@@ -88,6 +88,22 @@ export class TargetIntegration {
     }
 
     try {
+      // Skip the npm round-trip when node_modules already has this exact
+      // version. The default single-target run and every mass/version target
+      // run in a FRESH forked subprocess, so `installedPackages` (in-memory) is
+      // empty each time — without this on-disk check, a full `npm install`
+      // re-ran for every target/version/invocation even when the package was
+      // already present. Only short-circuits on a concrete exact-version match;
+      // `latest` and semver ranges still go through npm so resolution stays
+      // correct and deterministic.
+      if (!this.options.dryRun && this._isInstalledAtVersion(packageName, version)) {
+        logger.info(`Package ${packageId} already resolvable in node_modules — skipping install`);
+        // Still verify integrity of what's on disk before trusting it.
+        await verifyPackageIntegrity(packageName, version, this.options);
+        this.installedPackages.add(packageId);
+        return;
+      }
+
       logger.info(`Installing package: ${packageId}`);
 
       if (this.options.dryRun) {
@@ -109,13 +125,22 @@ export class TargetIntegration {
       // If a package legitimately needs postinstall (e.g., native addons),
       // use --allow-scripts to opt in explicitly.
       const ignoreScripts = this.options.allowScripts ? '' : '--ignore-scripts';
-      // --no-package-lock avoids write conflicts during concurrent installs
-      const installCommand = `npm install ${packageId} --no-save --silent --no-package-lock ${ignoreScripts}`.trim();
+      // --no-package-lock avoids write conflicts during concurrent installs.
+      // --prefer-offline uses the npm cache when a matching version is present,
+      // avoiding a registry round-trip on repeat scans.
+      const installCommand = `npm install ${packageId} --no-save --silent --no-package-lock --prefer-offline ${ignoreScripts}`.trim();
 
-      logger.debug(`Running: ${installCommand}`);
-      await execAsync(installCommand, {
-        timeout: 30000 // 30 second timeout for package installation
-      });
+      // Install timeout is configurable (--install-timeout, seconds) and retried
+      // once — the previous hard 30 s with no override silently failed whole
+      // targets on slow/proxied networks or large dependency trees.
+      const installTimeoutMs = (this.options.installTimeout || 30) * 1000;
+      logger.debug(`Running: ${installCommand} (timeout ${installTimeoutMs}ms)`);
+      try {
+        await execAsync(installCommand, { timeout: installTimeoutMs });
+      } catch (firstErr) {
+        logger.warn(`Install of ${packageId} failed (${firstErr.killed ? 'timeout' : firstErr.message.split('\n')[0]}); retrying once...`);
+        await execAsync(installCommand, { timeout: installTimeoutMs });
+      }
 
       // SECURITY: Verify package integrity after install
       await verifyPackageIntegrity(packageName, version, this.options);
@@ -125,6 +150,28 @@ export class TargetIntegration {
 
     } catch (error) {
       throw new Error(`Failed to install ${packageId}: ${error.message}`);
+    }
+  }
+
+  /**
+   * True only when node_modules already contains this package at exactly the
+   * requested concrete version. Reads node_modules/<pkg>/package.json directly
+   * (rather than require.resolve) so it works even when a package's "exports"
+   * field hides package.json. Conservative by design: `latest` and any semver
+   * range return false so npm still performs resolution.
+   */
+  _isInstalledAtVersion(packageName, version) {
+    if (!version || version === 'latest') return false;
+    // Only treat a plain, exact semver-ish string as a short-circuit candidate;
+    // ranges/operators (^ ~ > < * | x, spaces) must go through npm.
+    if (!/^[0-9][\w.\-+]*$/.test(version)) return false;
+    try {
+      const pkgJsonPath = path.join(process.cwd(), 'node_modules', packageName, 'package.json');
+      if (!fsSync.existsSync(pkgJsonPath)) return false;
+      const installed = JSON.parse(fsSync.readFileSync(pkgJsonPath, 'utf8'));
+      return installed.version === version;
+    } catch {
+      return false;
     }
   }
 

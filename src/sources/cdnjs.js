@@ -8,11 +8,36 @@
  * Retry policy: up to 3 attempts with exponential backoff on 5xx / network error.
  */
 
+import { readCache, writeCache, clearNamespace } from './http-cache.js';
+
 const BASE_URL = 'https://api.cdnjs.com';
 const RATE_LIMIT_MS = 500;
 const MAX_RETRIES = 3;
+// cdnjs library/version metadata is effectively static; a day-old copy is fine
+// and saves a network round-trip (plus the 500 ms rate-gate) on repeat sweeps.
+const CDNJS_TTL_MS = 24 * 60 * 60 * 1000;
 
 let _lastRequestTime = 0;
+
+/**
+ * Serve `key` from the on-disk cache when fresh, else run `fetcher`, cache its
+ * (successful) result, and return it. Only successful fetches reach here —
+ * `fetcher` throwing (network/5xx) propagates and nothing is cached, so a
+ * transient failure is never memoized. Shared across the forked subprocesses a
+ * mass/version sweep spawns, where an in-process cache would be empty each time.
+ */
+async function _cachedFetch(key, fetcher) {
+  const hit = readCache('cdnjs', key, CDNJS_TTL_MS);
+  if (hit !== null && hit !== undefined) return hit;
+  const data = await fetcher();
+  writeCache('cdnjs', key, data);
+  return data;
+}
+
+/** Test-only: clear the on-disk cdnjs cache between test cases. */
+export function _clearCdnjsCache() {
+  clearNamespace('cdnjs');
+}
 
 async function _rateLimit() {
   const now = Date.now();
@@ -62,8 +87,10 @@ export async function fetchLibraries({ search = '', limit = 50, fields = '' } = 
   const allFields = fields ? `${baseFields},${fields}` : baseFields;
   const params = new URLSearchParams({ fields: allFields, limit: String(limit) });
   if (search) params.set('search', search);
-  const data = await _fetchWithRetry(`${BASE_URL}/libraries?${params}`);
-  return data.results || [];
+  return _cachedFetch(`libraries?${params}`, async () => {
+    const data = await _fetchWithRetry(`${BASE_URL}/libraries?${params}`);
+    return data.results || [];
+  });
 }
 
 /**
@@ -74,7 +101,8 @@ export async function fetchLibraries({ search = '', limit = 50, fields = '' } = 
  */
 export async function fetchLibrary(name) {
   const params = new URLSearchParams({ fields: 'name,version,versions,description,github,autoupdate,fileType,keywords' });
-  return _fetchWithRetry(`${BASE_URL}/libraries/${encodeURIComponent(name)}?${params}`);
+  return _cachedFetch(`library:${name}`, () =>
+    _fetchWithRetry(`${BASE_URL}/libraries/${encodeURIComponent(name)}?${params}`));
 }
 
 /**
@@ -85,9 +113,10 @@ export async function fetchLibrary(name) {
  * @returns {Promise<object>} Version metadata (files, rawFiles, sri)
  */
 export async function fetchLibraryVersion(name, version) {
-  return _fetchWithRetry(
-    `${BASE_URL}/libraries/${encodeURIComponent(name)}/${encodeURIComponent(version)}`
-  );
+  return _cachedFetch(`version:${name}@${version}`, () =>
+    _fetchWithRetry(
+      `${BASE_URL}/libraries/${encodeURIComponent(name)}/${encodeURIComponent(version)}`
+    ));
 }
 
 /**

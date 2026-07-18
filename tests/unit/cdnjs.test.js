@@ -5,7 +5,8 @@ import {
   fetchLibrary,
   resolveNpmPackage,
   filterJSLibraries,
-  rankByStars
+  rankByStars,
+  _clearCdnjsCache
 } from '../../src/sources/cdnjs.js';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -26,9 +27,13 @@ let originalFetch;
 
 beforeEach(() => {
   originalFetch = globalThis.fetch;
+  // The on-disk cache tier persists across cases; clear it so mocked responses
+  // aren't served from a previous test's write (keeps these tests hermetic).
+  _clearCdnjsCache();
 });
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  _clearCdnjsCache();
 });
 
 // ─── fetchLibraries ────────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 import { compareVersions } from './version-scanner.js';
+import { readCache, writeCache, clearNamespace } from './http-cache.js';
 
 /**
  * OSV.dev API client — live known-vulnerability lookups.
@@ -96,6 +97,17 @@ export async function fetchOsvVulns(packageName, version, { ecosystem = 'npm', t
   const cacheKey = `${ecosystem}:${packageName}@${version}`;
   if (_cache.has(cacheKey)) return _cache.get(cacheKey);
 
+  // Tier 2: on-disk cache, shared across the forked subprocesses that each
+  // Orchestrator runs in (where the in-process _cache above is always empty).
+  // A hit here avoids the network POST, its 500 ms rate-gate, and re-leaking
+  // the analyzed package@version to a third party.
+  const disk = readCache('osv', cacheKey);
+  if (disk) {
+    const hit = { ok: true, vulns: Array.isArray(disk.vulns) ? disk.vulns : [], cached: true };
+    _cache.set(cacheKey, hit);
+    return hit;
+  }
+
   let result;
   try {
     const data = await _postWithRetry(
@@ -104,6 +116,9 @@ export async function fetchOsvVulns(packageName, version, { ecosystem = 'npm', t
       timeoutMs,
     );
     result = { ok: true, vulns: Array.isArray(data?.vulns) ? data.vulns : [] };
+    // Only persist SUCCESSFUL lookups. Caching a failure (offline, 5xx) on disk
+    // would wrongly suppress a real advisory on the next run within the TTL.
+    writeCache('osv', cacheKey, { vulns: result.vulns });
   } catch (err) {
     result = { ok: false, vulns: [], error: err.message };
   }
@@ -111,9 +126,10 @@ export async function fetchOsvVulns(packageName, version, { ecosystem = 'npm', t
   return result;
 }
 
-/** Test-only: clear the module cache between test cases. */
+/** Test-only: clear both the in-process and on-disk caches between test cases. */
 export function _clearOsvCache() {
   _cache.clear();
+  clearNamespace('osv');
 }
 
 // ─── Pure helpers (no network) ───────────────────────────────────────────────

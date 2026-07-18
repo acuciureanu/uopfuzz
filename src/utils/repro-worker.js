@@ -279,6 +279,19 @@ function describeConvention(callArgs, prop) {
  */
 function resolveEntryPoint(module, name, packageName) {
   if (!name) return null;
+  // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
+  // Only fall back to the module itself when `name` IS the package's own name —
+  // never as a catch-all for an unrelated or nonexistent entry point name.
+  // Checked BEFORE the dotted-path branch below: a package identifier can be a
+  // filesystem path (a local target, or a test fixture) whose directory contains
+  // a dot — e.g. `.../.claude/worktrees/.../bare-merge`. Treating that as a
+  // dotted property path would walk nonexistent keys and never reach this
+  // fallback, so a bare-function module addressed by a dotted path would fail to
+  // resolve. This short-circuits only when the module itself is callable.
+  if (name === packageName) {
+    if (typeof module === 'function') return module;
+    if (typeof module.default === 'function') return module.default;
+  }
   if (name.includes('.')) {
     const parts = name.split('.');
     let current = module;
@@ -290,13 +303,6 @@ function resolveEntryPoint(module, name, packageName) {
   }
   if (typeof module[name] === 'function') return module[name];
   if (module.default && typeof module.default[name] === 'function') return module.default[name];
-  // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
-  // Only fall back to the module itself when `name` IS the package's own name —
-  // never as a catch-all for an unrelated or nonexistent entry point name.
-  if (name === packageName) {
-    if (typeof module === 'function') return module;
-    if (typeof module.default === 'function') return module.default;
-  }
   return null;
 }
 

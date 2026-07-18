@@ -44,6 +44,58 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
  * @param {object} options.pollution - { property, value } for differential testing
  * @returns {Promise<object>} Execution result with output, error, traces
  */
+/**
+ * Build the scrubbed environment for a sandbox child: known secret-bearing vars
+ * are removed, anything that pattern-matches a secret is removed, and the
+ * network-block flag is set when requested. Shared by the one-shot path here and
+ * the persistent worker pool (sandbox-pool.js) so both apply identical scrubbing.
+ */
+export function buildSandboxChildEnv(blockNetwork = true) {
+  const childEnv = { ...process.env };
+
+  // SECURITY: Block network access in the child process.
+  // 1. Set a flag the child reads to disable net/http at startup
+  // 2. The child process monkey-patches net.connect/http.request
+  if (blockNetwork) {
+    childEnv.UOPFUZZ_BLOCK_NETWORK = '1';
+  }
+
+  // Remove sensitive env vars from the child
+  const sensitiveVars = [
+    'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+    'GITHUB_TOKEN', 'GH_TOKEN', 'GITLAB_TOKEN', 'NPM_TOKEN',
+    'DOCKER_AUTH_CONFIG', 'SSH_AUTH_SOCK', 'SSH_PRIVATE_KEY',
+    'DATABASE_URL', 'REDIS_URL', 'MONGO_URI', 'MONGODB_URI',
+    'API_KEY', 'SECRET_KEY', 'PRIVATE_KEY', 'JWT_SECRET',
+    'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
+  ];
+  for (const v of sensitiveVars) {
+    delete childEnv[v];
+  }
+  // Also strip anything that looks like a secret
+  for (const key of Object.keys(childEnv)) {
+    if (/SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE.*KEY/i.test(key)) {
+      delete childEnv[key];
+    }
+  }
+  return childEnv;
+}
+
+/**
+ * Fork a sandbox worker with the standard hardening (scrubbed env, no inherited
+ * fds, 512 MB heap cap). Shared by the one-shot path and the pool.
+ */
+export function forkSandboxWorker(workerScript, blockNetwork = true) {
+  return fork(path.join(__dirname, workerScript), [], {
+    env: buildSandboxChildEnv(blockNetwork),
+    stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
+    // SECURITY: Don't inherit the parent's file descriptors
+    detached: false,
+    // Limit child memory to 512MB to prevent resource exhaustion
+    execArgv: ['--max-old-space-size=512'],
+  });
+}
+
 export function executeInSandbox(packageName, entryPoint, args, options = {}) {
   const {
     timeoutMs = 5000,
@@ -64,46 +116,7 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
   } = options;
 
   return new Promise((resolve, reject) => {
-    const workerPath = path.join(__dirname, workerScript);
-
-    // Build environment for the child process
-    const childEnv = { ...process.env };
-
-    // SECURITY: Block network access in the child process.
-    // We use two mechanisms:
-    // 1. Set a flag the child reads to disable net/http at startup
-    // 2. The child process monkey-patches net.connect/http.request
-    if (blockNetwork) {
-      childEnv.UOPFUZZ_BLOCK_NETWORK = '1';
-    }
-
-    // Remove sensitive env vars from the child
-    const sensitiveVars = [
-      'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
-      'GITHUB_TOKEN', 'GH_TOKEN', 'GITLAB_TOKEN', 'NPM_TOKEN',
-      'DOCKER_AUTH_CONFIG', 'SSH_AUTH_SOCK', 'SSH_PRIVATE_KEY',
-      'DATABASE_URL', 'REDIS_URL', 'MONGO_URI', 'MONGODB_URI',
-      'API_KEY', 'SECRET_KEY', 'PRIVATE_KEY', 'JWT_SECRET',
-      'ANTHROPIC_API_KEY', 'OPENAI_API_KEY',
-    ];
-    for (const v of sensitiveVars) {
-      delete childEnv[v];
-    }
-    // Also strip anything that looks like a secret
-    for (const key of Object.keys(childEnv)) {
-      if (/SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE.*KEY/i.test(key)) {
-        delete childEnv[key];
-      }
-    }
-
-    const child = fork(workerPath, [], {
-      env: childEnv,
-      stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
-      // SECURITY: Don't inherit the parent's file descriptors
-      detached: false,
-      // Limit child memory to 512MB to prevent resource exhaustion
-      execArgv: ['--max-old-space-size=512'],
-    });
+    const child = forkSandboxWorker(workerScript, blockNetwork);
 
     let settled = false;
 
@@ -166,7 +179,7 @@ export function executeInSandbox(packageName, entryPoint, args, options = {}) {
  * Serialize arguments for IPC transfer.
  * Functions and symbols cannot cross the IPC boundary.
  */
-function serializeArgs(args) {
+export function serializeArgs(args) {
   return args.map(arg => {
     if (typeof arg === 'function') {
       return { __type: 'function', source: arg.toString() };

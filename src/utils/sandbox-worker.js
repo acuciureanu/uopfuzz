@@ -39,6 +39,13 @@ process.exit = function (code) {
   originalExit.call(process, 0);
 };
 
+// A pooled worker outlives a single request (it serves many). If the parent
+// goes away — the run ended, the process crashed, or the pool was destroyed —
+// the IPC channel disconnects; exit rather than lingering as an orphan.
+process.on('disconnect', () => {
+  originalExit.call(process, 0);
+});
+
 // ─── SECURITY: Sink interception ─────────────────────────────
 // Intercept dangerous sinks to detect when polluted values reach them.
 // These are NOT blocked — they execute normally — but accesses are logged
@@ -92,63 +99,103 @@ try {
   }
 } catch { /* vm not available */ }
 
-// ─── MESSAGE HANDLER ─────────────────────────────────────────
+// ─── PERSISTENT TARGET CACHE ─────────────────────────────────
+// A pooled worker serves many requests for the SAME package. Loading the target
+// (and, for browser-only packages, standing up jsdom) once and reusing it — the
+// costliest part of a probe — is the whole point of the pool: it removes the
+// per-probe Node-startup + module-graph-eval + jsdom cold-start that dominated
+// wall-clock. Keyed by package+browserEnv defensively; a worker is normally
+// dedicated to one package for its whole life.
+let _target = { key: null, module: null, baseline: null, error: null };
+
+async function loadTargetCached(packageName, browserEnv) {
+  const key = `${packageName}::${browserEnv ? 1 : 0}`;
+  if (_target.key === key) return _target; // hit (a cached module, or a cached load error)
+
+  let module = null;
+  let error = null;
+  if (browserEnv) {
+    try {
+      const dom = await setupJsdomGlobals();
+      module = loadBrowserModule(require, packageName, dom);
+    } catch (err) {
+      error = `Cannot load browser-only package ${packageName}: ${err.message}`;
+    }
+  } else {
+    try {
+      module = await import(packageName);
+    } catch {
+      try {
+        module = require(packageName);
+      } catch (err) {
+        error = `Cannot load package ${packageName}: ${err.message}`;
+      }
+    }
+  }
+  // Snapshot the monitored prototypes AFTER load, so any properties the module
+  // legitimately adds at load time are part of the baseline (not mistaken for a
+  // leak). Each subsequent request restores to this baseline before running.
+  _target = { key, module, baseline: module ? snapshotPrototype() : null, error };
+  return _target;
+}
+
+// ─── MESSAGE HANDLER (persistent request loop) ───────────────
 process.on('message', async (msg) => {
-  const { mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv } = msg;
+  const { mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv, requestId } = msg;
 
   // Self-enforced timeout as backup. Browser-only targets get extra time to
   // stand up jsdom before the operation timeout applies (kept in sync with the
-  // parent's allowance in sandbox.js).
+  // parent's allowance in sandbox.js). A synchronous infinite loop in the target
+  // blocks this timer entirely (single thread) — the parent's own per-request
+  // timeout SIGKILLs the worker in that case.
   const startupAllowance = browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
+  let settled = false;
+  const reply = (payload) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(killTimer);
+    // Echo requestId so the pool can match this reply to its request; harmless
+    // (undefined) for the legacy one-shot caller, which ignores it.
+    process.send?.({ ...payload, requestId });
+  };
   const killTimer = setTimeout(() => {
-    process.send?.({ error: 'Self-timeout reached', output: null, timedOut: true });
+    // An async-hung request: report a timeout, then exit so the parent pool
+    // discards and respawns a clean worker (a hung async op may have left
+    // pending work that isn't safe to keep serving requests over).
+    reply({ error: 'Self-timeout reached', output: null, timedOut: true });
     process.exit(0);
   }, (timeoutMs || 5000) + startupAllowance + 500);
 
   try {
     const result = await executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv);
-    clearTimeout(killTimer);
-    process.send?.(result);
+    reply(result);
   } catch (error) {
-    clearTimeout(killTimer);
-    process.send?.({
-      error: error.message,
-      stack: error.stack,
-      output: null,
-    });
+    reply({ error: error.message, stack: error.stack, output: null });
   }
 
-  // Exit cleanly after responding
-  process.exit(0);
+  // NOTE: no process.exit() here. The worker stays alive to serve the next
+  // request — this is what makes pooling work. The legacy one-shot caller in
+  // sandbox.js kills the child after reading its single reply, so persistence is
+  // transparent there. Crash/hang isolation is preserved by the parent (pool or
+  // one-shot), which owns the wall-clock timeout and respawns on exit.
 });
 
 async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, pollution, browserEnv) {
-  // Load the target package. Browser-only packages (jQuery, …) need a jsdom DOM
-  // in place at load time; we stand one up in this isolated child so their
-  // fuzzed pollution — and any network the DOM's XHR attempts (blocked here) —
-  // stays contained instead of corrupting the fuzzer's own process.
-  let targetModule;
-  if (browserEnv) {
-    try {
-      const dom = await setupJsdomGlobals();
-      targetModule = loadBrowserModule(require, packageName, dom);
-    } catch (err) {
-      return { error: `Cannot load browser-only package ${packageName}: ${err.message}`, output: null };
-    }
-  } else {
-    try {
-      targetModule = await import(packageName);
-    } catch {
-      try {
-        targetModule = require(packageName);
-      } catch (err) {
-        return { error: `Cannot load package ${packageName}: ${err.message}`, output: null };
-      }
-    }
-  }
+  // Load the target package (once, then cached). Browser-only packages (jQuery,
+  // …) need a jsdom DOM in place at load time; we stand one up in this isolated
+  // child so their fuzzed pollution — and any network the DOM's XHR attempts
+  // (blocked here) — stays contained instead of corrupting the fuzzer process.
+  const target = await loadTargetCached(packageName, browserEnv);
+  if (target.error) return { error: target.error, output: null };
+
+  // Cross-request isolation: undo any prototype leak a previous request in this
+  // reused worker may have left, before running this one. Each differential mode
+  // also snapshots/restores around its own call; this is the belt-and-suspenders
+  // that makes reuse as clean as a fresh fork for discovery purposes.
+  if (target.baseline) detectAndRestorePrototype(target.baseline);
 
   // Resolve the entry point function
-  const fn = resolveEntryPoint(targetModule, entryPoint, packageName);
+  const fn = resolveEntryPoint(target.module, entryPoint, packageName);
   if (!fn) {
     return { error: `Entry point ${entryPoint} not found in ${packageName}`, output: null };
   }
@@ -502,6 +549,19 @@ function clone(arr) {
 }
 
 function resolveEntryPoint(module, name, packageName) {
+  if (!name) return null;
+  // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
+  // Only fall back to the module itself when `name` IS the package's own name —
+  // never as a catch-all for an unrelated or nonexistent entry point name.
+  // Checked BEFORE the dotted-path branch: a package identifier can be a
+  // filesystem path (a local target or test fixture) whose directory contains a
+  // dot (e.g. `.../.claude/worktrees/.../bare-merge`); treating that as a dotted
+  // property path would walk nonexistent keys and never reach this fallback.
+  // Short-circuits only when the module itself is callable.
+  if (name === packageName) {
+    if (typeof module === 'function') return module;
+    if (typeof module.default === 'function') return module.default;
+  }
   if (name.includes('.')) {
     const parts = name.split('.');
     let current = module;
@@ -516,13 +576,6 @@ function resolveEntryPoint(module, name, packageName) {
   }
   if (typeof module[name] === 'function') return module[name];
   if (module.default && typeof module.default[name] === 'function') return module.default[name];
-  // Bare-function module: `module.exports = fn` (merge-deep, deep-extend, …).
-  // Only fall back to the module itself when `name` IS the package's own name —
-  // never as a catch-all for an unrelated or nonexistent entry point name.
-  if (name === packageName) {
-    if (typeof module === 'function') return module;
-    if (typeof module.default === 'function') return module.default;
-  }
   return null;
 }
 

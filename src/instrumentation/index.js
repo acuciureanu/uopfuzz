@@ -4,7 +4,7 @@ import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
 import { classifyDiff } from './classify-diff.js';
-import { executeInSandbox } from '../utils/sandbox.js';
+import { SandboxPool } from '../utils/sandbox-pool.js';
 import { packageBaseName } from '../utils/package-name.js';
 import { isBrowserOnly } from '../utils/browser-env.js';
 import { createRequire } from 'module';
@@ -70,6 +70,11 @@ export class Instrumentation {
     // Track entry points that consistently fail to avoid retrying
     this._entryPointFailures = new Map();
 
+    // Persistent sandbox worker pool for the differential DISCOVERY phase.
+    // Lazily created on first sandboxed probe (see _getPool); reproduction stays
+    // one-shot in fresh processes and never touches this pool.
+    this.sandboxPool = null;
+
     // Layer 1: AFL-style edge coverage (computed from trace events)
     this.coverageTracker = new CoverageTracker();
 
@@ -94,6 +99,53 @@ export class Instrumentation {
    */
   setTargetModule(targetModule) {
     this.targetModule = targetModule;
+  }
+
+  /**
+   * The persistent sandbox worker pool for discovery probes, created on first
+   * use. Reproduction never uses it (it stays one-shot in fresh processes).
+   */
+  _getPool() {
+    if (!this.sandboxPool) this.sandboxPool = new SandboxPool();
+    return this.sandboxPool;
+  }
+
+  /**
+   * Tear down the sandbox pool (SIGKILL its workers). Called at run teardown so
+   * no worker outlives the session.
+   */
+  destroy() {
+    if (this.sandboxPool) {
+      this.sandboxPool.destroy();
+      this.sandboxPool = null;
+    }
+  }
+
+  /**
+   * Lazily build and cache O(1) lookups for a config's entry points and
+   * sequences, keyed by entry-point name. The differential phase calls
+   * `config.entryPoints.find(...)` / `config.sequences.find(...)` hundreds of
+   * times per iteration; each was an O(entryPoints) linear scan. Cached on the
+   * config object itself (via a WeakMap), so it survives across calls and is
+   * garbage-collected with the config.
+   */
+  _epIndex(config) {
+    if (!config) return { epByName: new Map(), seqByEntry: new Map() };
+    if (!this._epIndexCache) this._epIndexCache = new WeakMap();
+    let idx = this._epIndexCache.get(config);
+    if (!idx) {
+      const epByName = new Map();
+      for (const ep of (config.entryPoints || [])) {
+        if (!epByName.has(ep.name)) epByName.set(ep.name, ep);
+      }
+      const seqByEntry = new Map();
+      for (const s of (config.sequences || [])) {
+        if (!seqByEntry.has(s.entryPoint)) seqByEntry.set(s.entryPoint, s);
+      }
+      idx = { epByName, seqByEntry };
+      this._epIndexCache.set(config, idx);
+    }
+    return idx;
   }
 
   /**
@@ -192,13 +244,20 @@ export class Instrumentation {
           // Feed V8 block data into the AFL-style bitmap
           this.feedV8CoverageIntoBitmap(metrics, trace);
 
-          // Accumulate V8 metrics
-          this.v8Metrics.totalBlocks += metrics.summary.totalBlocks;
-          this.v8Metrics.coveredBlocks += metrics.summary.coveredBlocks;
-          this.v8Metrics.totalBranches += metrics.summary.totalBranches;
-          this.v8Metrics.coveredBranches += metrics.summary.coveredBranches;
-          this.v8Metrics.totalFunctions += metrics.summary.totalFunctions;
-          this.v8Metrics.coveredFunctions += metrics.summary.coveredFunctions;
+          // Record V8 metrics as the LATEST cumulative snapshot, not a running
+          // sum. V8 precise coverage (Profiler.takePreciseCoverage) is cumulative
+          // since collection started, so every snapshot already reports the full
+          // covered/total counts for all loaded scripts. Adding successive
+          // snapshots together (the previous `+=`) double-counted every block on
+          // every input and made the reported Block/Branch/Function coverage %
+          // exceed 100% and be meaningless. Assigning the latest snapshot keeps
+          // the reported figure a real fraction (covered ≤ total).
+          this.v8Metrics.totalBlocks = metrics.summary.totalBlocks;
+          this.v8Metrics.coveredBlocks = metrics.summary.coveredBlocks;
+          this.v8Metrics.totalBranches = metrics.summary.totalBranches;
+          this.v8Metrics.coveredBranches = metrics.summary.coveredBranches;
+          this.v8Metrics.totalFunctions = metrics.summary.totalFunctions;
+          this.v8Metrics.coveredFunctions = metrics.summary.coveredFunctions;
         } catch (error) {
           logger.debug(`V8 coverage snapshot failed: ${error.message}`);
         }
@@ -308,7 +367,7 @@ export class Instrumentation {
   async executeDifferentialTracing(input, config, pollutionDescriptor) {
     if (this.options.dryRun) return null;
 
-    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const isUrlSink = this._epIndex(config).epByName.get(input.entryPoint)?._isUrlSink;
     const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
 
     // Sandboxed execution: run in child process.
@@ -322,7 +381,7 @@ export class Instrumentation {
     // In-process execution (--no-sandbox)
     if (!this.targetModule) return null;
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return null;
 
@@ -359,7 +418,7 @@ export class Instrumentation {
 
       const args = input.type === 'template' ? [input.value] : [input.value];
 
-      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+      const result = await this._getPool().run(packageName, input.entryPoint, args, {
         timeoutMs,
         blockNetwork: this.options.blockNetwork !== false,
         pollution: safeDescriptor,
@@ -472,7 +531,7 @@ export class Instrumentation {
 
     if (!this.targetModule) return null;
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return null;
 
@@ -501,7 +560,7 @@ export class Instrumentation {
         value: typeof descriptor.value === 'function' ? '__UOPFUZZ_MARKER_7f3a__' : descriptor.value,
       };
       const args = input.type === 'template' ? [input.value] : [input.value];
-      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+      const result = await this._getPool().run(packageName, input.entryPoint, args, {
         timeoutMs,
         blockNetwork: this.options.blockNetwork !== false,
         pollution: safeDescriptor,
@@ -530,7 +589,7 @@ export class Instrumentation {
   async verifyGadgetExploit(input, config, property) {
     if (this.options.dryRun || !this.targetModule) return null;
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return null;
 
@@ -561,7 +620,7 @@ export class Instrumentation {
 
     if (!this.targetModule) return null;
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return null;
 
@@ -589,7 +648,7 @@ export class Instrumentation {
         value: typeof d.value === 'function' ? '__UOPFUZZ_MARKER_7f3a__' : d.value,
       }));
       const args = input.type === 'template' ? [input.value] : [input.value];
-      const result = await executeInSandbox(packageName, input.entryPoint, args, {
+      const result = await this._getPool().run(packageName, input.entryPoint, args, {
         timeoutMs,
         blockNetwork: this.options.blockNetwork !== false,
         pollution: { descriptors: safeDescriptors },
@@ -617,7 +676,7 @@ export class Instrumentation {
   async executeMergePPDifferential(input, config, descriptor) {
     if (this.options.dryRun) return null;
 
-    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const isUrlSink = this._epIndex(config).epByName.get(input.entryPoint)?._isUrlSink;
     const canSandbox = this.options.sandbox && config.package;
 
     const timeoutMs = isUrlSink ? DIFF_URL_SINK_TIMEOUT_MS : DIFF_CALL_TIMEOUT_MS;
@@ -657,7 +716,7 @@ export class Instrumentation {
         value: typeof descriptor.value === 'function' ? '__UOPFUZZ_MARKER_7f3a__' : descriptor.value,
       };
 
-      const result = await executeInSandbox(packageName, entryPoint, [{}], {
+      const result = await this._getPool().run(packageName, entryPoint, [{}], {
         timeoutMs,
         blockNetwork: this.options.blockNetwork !== false,
         pollution: safeDescriptor,
@@ -703,7 +762,7 @@ export class Instrumentation {
   async executeURLGadgetDifferential(input, config, descriptor) {
     if (this.options.dryRun) return null;
 
-    const isUrlSink = config.entryPoints?.find(ep => ep.name === input.entryPoint)?._isUrlSink;
+    const isUrlSink = this._epIndex(config).epByName.get(input.entryPoint)?._isUrlSink;
     const canSandbox = this.options.sandbox && config.package;
 
     if (canSandbox) {
@@ -777,7 +836,7 @@ export class Instrumentation {
     if (canSandbox) {
       try {
         const args = input.type === 'template' ? [input.value] : [input.value];
-        const result = await executeInSandbox(config.package, input.entryPoint, args, {
+        const result = await this._getPool().run(config.package, input.entryPoint, args, {
           timeoutMs,
           blockNetwork: this.options.blockNetwork !== false,
           mode: 'discover_uop',
@@ -792,7 +851,7 @@ export class Instrumentation {
 
     if (!this.targetModule) return [];
 
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
     const fn = this.buildCallableThunk(input, config, sequence);
     if (!fn) return [];
 
@@ -985,7 +1044,7 @@ export class Instrumentation {
     }
 
     // Check if config defines call sequences for this entry point
-    const sequence = config.sequences?.find(s => s.entryPoint === input.entryPoint);
+    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
 
     try {
       if (sequence) {

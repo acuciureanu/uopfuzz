@@ -113,6 +113,11 @@ export class Orchestrator {
         stack: error.stack
       });
       throw error;
+    } finally {
+      // Tear down the persistent sandbox worker pool so no discovery worker
+      // outlives the run (leaked forked processes would otherwise accumulate,
+      // especially across mass/version sweeps).
+      try { this.instrumentation?.destroy?.(); } catch { /* best effort */ }
     }
   }
 
@@ -184,12 +189,23 @@ export class Orchestrator {
     logger.info(`Starting ${maxIterations} fuzzing iterations with ${this.options.timeout}s timeout`);
 
     if (parallelWorkers > 1) {
-      logger.info(`Using ${parallelWorkers} parallel workers for fuzzing`);
-      await this.executeParallelFuzzing(maxIterations, parallelWorkers);
-    } else {
-      logger.info('Using sequential execution (single worker)');
-      await this.executeSequentialFuzzing(maxIterations);
+      // --parallel is NOT wired for real gadget hunting: the worker-thread path
+      // (orchestrator/worker.js) never loads the target module and never runs
+      // the differential confirmation phase (Phase B), so it produces ZERO
+      // confirmed vulnerabilities and only burns CPU on coverage exploration.
+      // Rather than silently find nothing, fall back to the sequential path,
+      // which is where real (reproduction-proven) findings come from.
+      // TODO: real parallelism should be built on top of the sandbox worker pool
+      // (each worker owning a persistent target process), not the current
+      // simulate-only thread path.
+      logger.warn(
+        `--parallel ${parallelWorkers} is not supported for gadget confirmation ` +
+        `(the parallel path does coverage exploration only and confirms nothing). ` +
+        `Running sequentially so findings are actually reproduced.`
+      );
     }
+    logger.info('Using sequential execution (single worker)');
+    await this.executeSequentialFuzzing(maxIterations);
   }
 
   /**
@@ -812,6 +828,14 @@ export class Orchestrator {
     }
   }
 
+  /**
+   * DEPRECATED / UNREACHABLE. The worker-thread path (orchestrator/worker.js)
+   * never loads the target module and never runs the differential confirmation
+   * phase, so it finds zero real vulnerabilities. executeFuzzingWorkflow() now
+   * always falls back to the sequential path (with a warning) when
+   * --parallel > 1, so this method is no longer called. Kept for reference until
+   * real parallelism is rebuilt on top of the sandbox worker pool.
+   */
   async executeParallelFuzzing(maxIterations, parallelWorkers) {
     const iterationsPerWorker = Math.ceil(maxIterations / parallelWorkers);
     const workers = [];
