@@ -74,7 +74,8 @@ devcontainer exec --workspace-folder . node src/cli.js --target <pkg@version>
 | `--parallel <num>` | `1` | Number of parallel workers |
 | `-v, --verbose` | off | Debug logging |
 | `--dry-run` | off | Validate config/plumbing without executing target code |
-| `--sandbox` / `--no-sandbox` | `--sandbox` | Run target code in an isolated child process (default on) |
+| `--sandbox` / `--no-sandbox` | `--sandbox` | Run each target-executing discovery call in an isolated child process (default on) |
+| `--no-isolate` | isolate on | Run the whole session in this process instead of a crash-isolated child. By default a single-target run is forked so a target that corrupts Node's own internals (e.g. a browser-only package whose in-process pollution poisons undici's HTTP parser) dies as a reported failure instead of taking the fuzzer down; opt out only to debug a crash in-process |
 | `--allow-network` | off | Permit outbound network from target code |
 | `--allow-scripts` | off | Allow npm lifecycle scripts during install (**DANGEROUS**) |
 | `--allow-suspicious` | off | Install packages with suspicious install scripts (**DANGEROUS**) |

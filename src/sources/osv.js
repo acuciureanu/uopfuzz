@@ -52,6 +52,12 @@ async function _postWithRetry(url, body, timeoutMs, attempt = 1) {
         'Content-Type': 'application/json',
         'Accept': 'application/json',
         'User-Agent': 'uopfuzz/1.0 (security-research)',
+        // Do NOT keep the socket alive. An idle undici keep-alive socket left in
+        // the fuzzer process becomes a landmine once fuzzing pollutes
+        // Object.prototype: the socket's idle-timeout callback reads the polluted
+        // `timeout` off the prototype chain and throws in undici's parser,
+        // crashing the whole process. Closing the connection removes the socket.
+        'Connection': 'close',
       },
       body: JSON.stringify(body),
       signal: controller.signal,
