@@ -19,4 +19,15 @@ function extend(target, source) {
   return target;
 }
 
-module.exports = { extend };
+// Synchronously blocks the event loop of whatever process runs it — a hermetic
+// stand-in for jsdom's synchronous XHR (`$.ajax({async:false})`), which is what
+// froze the fuzzer when browser libs ran in-process. When executed in the
+// sandbox child (the fix), only the child's loop blocks; the fuzzer's stays free
+// and the pool's SIGKILL watchdog can rescue the child.
+function blockLoop() {
+  const sab = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sab, 0, 0, 3000); // block ~3s, then return normally
+  return 'unblocked';
+}
+
+module.exports = { extend, blockLoop };
