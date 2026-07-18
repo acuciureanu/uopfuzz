@@ -167,6 +167,7 @@ export class Orchestrator {
       this.config = config;
       if (!this.options.dryRun) {
         this.instrumentation.setTargetModule(targetModule);
+        this.instrumentation.warnIfUnsandboxedBrowserTarget(config);
       }
       logger.info(`Target ${config.name}@${config.version} auto-discovered and ready`);
       return;
@@ -179,6 +180,7 @@ export class Orchestrator {
 
     const targetModule = await this.targetIntegration.setupTarget(this.config);
     this.instrumentation.setTargetModule(targetModule);
+    this.instrumentation.warnIfUnsandboxedBrowserTarget(this.config);
     logger.info(`Target ${this.config.name} setup completed`);
   }
 

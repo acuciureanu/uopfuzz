@@ -41,6 +41,11 @@ class PooledWorker {
     this.current = null;  // { requestId, resolve, timer }
     this.nextId = 1;
     this.destroyed = false;
+    // False until this child has completed one request. Only that first (cold)
+    // request pays the jsdom startup allowance; afterwards the target is loaded
+    // and the allowance would just delay rescuing a wedged worker. Reset to
+    // false whenever the child is dropped, since the replacement starts cold.
+    this.warm = false;
   }
 
   _ensureChild() {
@@ -74,6 +79,11 @@ class PooledWorker {
     clearTimeout(cur.timer);
     this.current = null;
     this.busy = false;
+    // This child has now served a request, so its target (and jsdom, for a
+    // browser-only package) is loaded and cached — subsequent requests are warm.
+    // True even when the reply is a load error: that outcome is cached too, so
+    // the next request returns immediately rather than re-attempting the load.
+    this.warm = true;
     const result = msg ? { ...msg } : { error: 'empty worker reply', output: null };
     delete result.requestId;
     cur.resolve(result);
@@ -87,6 +97,7 @@ class PooledWorker {
     this.child = null;
     this.busy = false;
     this.current = null;
+    this.warm = false; // the replacement child starts cold
     if (cur) {
       clearTimeout(cur.timer);
       cur.resolve({ error: reason, output: null, crashed: true });
@@ -108,7 +119,12 @@ class PooledWorker {
 
     this._ensureChild();
     const requestId = this.nextId++;
-    const startupAllowance = job.browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
+    // Cold starts only: a warm worker already has the target (and jsdom) loaded,
+    // so charging it the 20s boot allowance would just delay rescuing a wedged
+    // child. The worker computes the same allowance from its own target cache,
+    // so the two deadlines stay in the intended order (worker self-timer first,
+    // parent watchdog 500ms later).
+    const startupAllowance = job.browserEnv && !this.warm ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
 
     // Parent-side wall-clock: SIGKILL a worker whose request wedges the event
     // loop (a synchronous infinite loop in the target blocks the worker's own
@@ -117,6 +133,7 @@ class PooledWorker {
     const timer = setTimeout(() => {
       this.current = null;
       this.busy = false;
+      this.warm = false; // killed child is replaced by a cold one
       try { this.child?.kill('SIGKILL'); } catch { /* already gone */ }
       this.child = null;
       job.resolve({ error: 'Sandbox execution timed out', timedOut: true, output: null });
@@ -132,6 +149,7 @@ class PooledWorker {
       this.current = null;
       this.busy = false;
       this.child = null;
+      this.warm = false; // dropped child is replaced by a cold one
       job.resolve({ error: `sandbox worker send failed: ${err.message}`, output: null, crashed: true });
       this._pump();
     }
