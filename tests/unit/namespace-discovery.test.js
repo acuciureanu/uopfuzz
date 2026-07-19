@@ -123,10 +123,60 @@ describe('discovery descends into underscore-named public namespaces', () => {
     assert.ok(names.includes('_.merge'), `the real entry point must survive; got: ${names.join(', ')}`);
   });
 
-  test('still skips genuinely-private leaf members (_internalHelper)', async () => {
+  // Names must never decide what gets TESTED — only what order it is tried in.
+  // shouldSkipExport dropped exports matching React vocabulary (`create`,
+  // `memo`, `lazy`, `forward`, `/^use[A-Z]/`, …). Those are ordinary names in
+  // non-React libraries, so a vulnerable `create` was invisible to the tool.
+  //
+  // The stated reason — React hooks cannot run outside a render context — is
+  // already handled by behaviour: a hook throws when probed, so it is not
+  // merge-like, and it sorts to the bottom on its own. The list bought nothing
+  // and cost real coverage.
+  test('discovers a vulnerable function whose name matches framework vocabulary', async () => {
+    const vulnMerge = (t, s) => {
+      for (const k in s) {
+        if (s[k] && typeof s[k] === 'object') { if (!t[k]) t[k] = {}; vulnMerge(t[k], s[k]); }
+        else { t[k] = s[k]; }
+      }
+      return t;
+    };
+    const mod = { create: vulnMerge, useConfig: vulnMerge, memo: vulnMerge, harmless: (a) => a };
+
+    const config = await discoverTarget(mod, 'framework-named', '1.0.0', {});
+    const names = config.entryPoints.map((ep) => ep.name);
+
+    for (const expected of ['create', 'useConfig', 'memo']) {
+      assert.ok(names.includes(expected),
+        `'${expected}' is behaviourally a merge and must be probed; got: ${names.join(', ')}`);
+    }
+  });
+
+  // The probe cap must truncate only the uninteresting tail. If it can drop a
+  // function the behavioural probe already flagged as merge-like, then rank
+  // position — not evidence — decides what gets tested.
+  test('the probe cap never drops a behaviourally merge-like export', async () => {
+    const vulnMerge = (t, s) => Object.assign(t, s);
+    const mod = {};
+    for (let i = 0; i < 25; i++) mod[`combineVariant${String(i).padStart(2, '0')}`] = vulnMerge;
+    for (let i = 0; i < 15; i++) mod[`plain${i}`] = (a) => String(a).length;
+
+    const config = await discoverTarget(mod, 'many-merges', '1.0.0', {});
+    const names = new Set(config.entryPoints.map((ep) => ep.name));
+
+    const missing = Object.keys(mod).filter(k => k.startsWith('combineVariant') && !names.has(k));
+    assert.deepEqual(missing, [],
+      `every merge-like export must survive the cap; missing: ${missing.join(', ')}`);
+  });
+
+  // A `_` prefix is a convention, not a guarantee — plenty of libraries expose
+  // reachable internals that way, and an attacker does not honour the
+  // convention. So it must not exclude either: a vulnerable `_applyDefaults`
+  // is still a vulnerability. Ordering may demote it; inclusion may not.
+  test('a private-looking member is still probed when it behaves like a merge', async () => {
+    const vulnMerge = (t, s) => Object.assign(t, s);
     const mod = {
       publicFn(x) { return x; },
-      _internalHelper(x) { return x; }, // conventionally private — should stay skipped
+      _applyDefaults: vulnMerge, // conventionally private, genuinely dangerous
     };
 
     const config = await discoverTarget(mod, 'priv-lib', '1.0.0', {});
@@ -134,8 +184,8 @@ describe('discovery descends into underscore-named public namespaces', () => {
 
     assert.ok(names.includes('publicFn'), `public fn should be discovered; got: ${names.join(', ')}`);
     assert.ok(
-      !names.some((n) => n.split('.').pop() === '_internalHelper'),
-      `private _-prefixed leaf must stay skipped; got: ${names.join(', ')}`,
+      names.includes('_applyDefaults'),
+      `a private-looking but merge-like export must still be probed; got: ${names.join(', ')}`,
     );
   });
 });

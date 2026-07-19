@@ -48,6 +48,19 @@ const PROBE_INPUTS = [
   { type: 'none', args: [] },
 ];
 
+// Baseline number of exports to probe. A floor, not a ceiling: every export the
+// behavioural probes flagged is always probed, however many that is (see
+// discoverTarget). This only bounds how far into the unremarkable tail we go.
+const PROBE_CAP = 20;
+
+// Wall-clock budgets for behavioural probing. Probing calls the target's own
+// code, so a single export can block for seconds (real network I/O, a busy
+// loop). These bound the blast radius by MEASURED cost rather than by guessing
+// which names are dangerous. Overrunning only costs an export its behavioural
+// ranking — it is still discovered and still probed by the normal pipeline.
+const EXPORT_PROBE_BUDGET_MS = 250;
+const TOTAL_PROBE_BUDGET_MS = 10000;
+
 // Pre-sliced for UOP discovery — avoids creating a new array per export
 const UOP_PROBES = PROBE_INPUTS.slice(0, 5);
 
@@ -88,21 +101,27 @@ function isStructuralNoise(name) {
 }
 
 /**
- * Should this export name be skipped?
- * Filters React hooks, internal names, and known-useless patterns.
+ * Should this export be skipped entirely?
+ *
+ * Only language/module plumbing qualifies — things that cannot be a meaningful
+ * entry point in any library (`constructor`, `prototype`, `then`, the CJS/ESM
+ * wrapper keys). A name must never decide whether real code gets TESTED.
+ *
+ * This used to also drop React vocabulary (`create`, `memo`, `lazy`, `forward`,
+ * `/^use[A-Z]/`, PascalCase component names) and anything starting with `_`.
+ * Those are ordinary names outside React — `create` especially — so a
+ * vulnerable `create` or `useConfig` was silently invisible, and the tool could
+ * only find bugs in functions we had thought to name.
+ *
+ * Nothing is lost by dropping them. The stated reason for the React rules was
+ * that hooks cannot run outside a render context — which the behavioural probes
+ * already handle: such a function throws when probed, is therefore neither
+ * merge-like nor factory-like, and sorts to the bottom on its own. Evidence
+ * demotes it; a vocabulary list is not needed, and cannot distinguish React's
+ * `create` from anyone else's.
  */
 function shouldSkipExport(name) {
-  const baseName = name.includes('.') ? name.split('.').pop() : name;
-  if (SKIP_NAMES.has(baseName)) return true;
-  if (baseName.startsWith('_')) return true;
-  // React hooks — these CANNOT run outside a component render context
-  if (/^use[A-Z]/.test(baseName)) return true;
-  // React internal patterns
-  if (/^(create|forward|lazy|memo|Children|Fragment|Suspense|Profiler|StrictMode)$/.test(baseName)) return true;
-  // Common React component indicators (PascalCase single-word + returns JSX)
-  // We can't detect JSX statically, but we can skip known React exports
-  if (/^(Component|PureComponent|createElement|cloneElement|isValidElement|createContext|createRef)$/.test(baseName)) return true;
-  return false;
+  return isStructuralNoise(name);
 }
 
 /**
@@ -142,7 +161,13 @@ export async function discoverTarget(targetModule, packageName, version, subModu
     const base = exp.name.includes('.') ? exp.name.split('.').pop() : exp.name;
     return !AJAX_LIKE_METHODS.has(base);
   });
-  const toProbe = prioritizeExports(probeSafe).slice(0, 20);
+  // The cap bounds probe cost, so it may truncate only the tail the behavioural
+  // probes found nothing in. Applying it as a flat top-N would let rank
+  // position veto evidence: with more than N merge-like exports, a genuinely
+  // vulnerable one could be cut purely for sorting late among its peers.
+  const ranked = prioritizeExports(probeSafe);
+  const behavioural = ranked.filter(exp => exp.behavioural);
+  const toProbe = ranked.slice(0, Math.max(PROBE_CAP, behavioural.length));
   const entryPoints = [];
   const sequences = [];
 
@@ -427,11 +452,44 @@ function looksLikeFactory(fn) {
 function prioritizeExports(exports) {
   // One probe pass per export, computed once: merge-likeness drives
   // prototype-pollution discovery, factory-likeness drives multi-step chains.
+  // The flags are recorded on each record so the caller can apply its probe cap
+  // to the uninteresting tail ONLY — evidence, not rank position, decides what
+  // is worth testing.
   const mergeLike = new Map();
   const factoryLike = new Map();
+  let spent = 0;
   for (const exp of exports) {
+    // Probing runs the target's own code, and some exports do real I/O when
+    // called — jQuery's `_evalUrl` performs a network request and blocks for
+    // ~12s per call, which is enough to hang discovery outright.
+    //
+    // The old defence was a list of ajax-ish NAMES, which cannot work: it has
+    // to enumerate every side-effecting function in every library, and it
+    // already missed `_evalUrl`. Cost is observable, so budget it instead —
+    // that covers functions nobody thought to name. An export that overruns is
+    // simply not probed further and ranks as unremarkable; it is still
+    // DISCOVERED and still testable, so nothing is gated out by this.
+    if (spent >= TOTAL_PROBE_BUDGET_MS) {
+      mergeLike.set(exp, false);
+      factoryLike.set(exp, false);
+      exp.behavioural = false;
+      continue;
+    }
+    const t0 = Date.now();
     mergeLike.set(exp, looksLikeMerge(exp.fn));
-    factoryLike.set(exp, looksLikeFactory(exp.fn));
+    const mergeMs = Date.now() - t0;
+    spent += mergeMs;
+
+    // A slow first probe means calling this export is expensive; do not spend a
+    // second round of calls on it.
+    if (mergeMs <= EXPORT_PROBE_BUDGET_MS) {
+      const t1 = Date.now();
+      factoryLike.set(exp, looksLikeFactory(exp.fn));
+      spent += Date.now() - t1;
+    } else {
+      factoryLike.set(exp, false);
+    }
+    exp.behavioural = mergeLike.get(exp) || factoryLike.get(exp);
   }
 
   return [...exports].sort((a, b) => {
