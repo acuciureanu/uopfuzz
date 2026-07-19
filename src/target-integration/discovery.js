@@ -51,18 +51,6 @@ const PROBE_INPUTS = [
 // Pre-sliced for UOP discovery — avoids creating a new array per export
 const UOP_PROBES = PROBE_INPUTS.slice(0, 5);
 
-// Method names that indicate interesting fuzzing targets
-const INTERESTING_METHODS = new Set([
-  'compile', 'render', 'renderString', 'renderFile', 'renderToString',
-  'renderToStaticMarkup', 'parse', 'transform', 'process', 'evaluate',
-  'template', 'execute', 'run', 'build', 'generate', 'create',
-  'prepare', 'handle', 'getRequestHandler', 'use', 'configure',
-  'set', 'get', 'middleware', 'handler', 'resolve', 'load',
-  'read', 'write', 'format', 'stringify', 'serialize', 'deserialize',
-  'encode', 'decode', 'convert', 'merge', 'assign', 'extend', 'mixin',
-  'clone', 'defaults', 'options', 'config', 'init', 'setup',
-]);
-
 // HTTP/AJAX methods — important for URL read-gadgets but MUST NOT be probed
 // during auto-discovery (they fire real XHRs in jsdom and hang/timeout).
 // Instead, they are injected directly into config.entryPoints after discovery.
@@ -76,7 +64,28 @@ const SKIP_NAMES = new Set([
   'toString', 'valueOf', 'toJSON', 'inspect',
   'Symbol(Symbol.toPrimitive)', 'Symbol(Symbol.toStringTag)',
   'then', 'catch', 'finally',
+  // Module plumbing. An ESM/CJS interop wrapper exposes the same namespace as
+  // `default.x` and `module.exports.x`; walking into them mints alias entry
+  // points that can never resolve, because the sandbox and reproduction workers
+  // load the package with require() where no such wrapper key exists. (`default`
+  // is handled transparently by the dedicated walk at the end of
+  // discoverExports, which uses an empty prefix.)
+  'module', 'exports',
 ]);
+
+/**
+ * Structural plumbing that must never be walked INTO, as opposed to a member
+ * that merely should not be probed itself.
+ *
+ * Descending into these mints duplicate, unresolvable entry points. That is not
+ * just wasteful: the differential phase gives up after 3 consecutive
+ * un-callable entry points, so a cluster of dead aliases sorted ahead of a real
+ * one silently starves it.
+ */
+function isStructuralNoise(name) {
+  const baseName = name.includes('.') ? name.split('.').pop() : name;
+  return SKIP_NAMES.has(baseName);
+}
 
 /**
  * Should this export name be skipped?
@@ -263,12 +272,17 @@ function discoverExports(targetModule, packageName) {
         }
       } else if (typeof value === 'object' && value !== null && !seen.has(name)) {
         // Descend into namespace OBJECTS even when the container name looks
-        // private. Libraries expose their whole public API under a short
+        // PRIVATE. Libraries expose their whole public API under a short
         // namespace — `_` (lodash, underscore, @feathersjs/commons) or `$` —
-        // which `shouldSkipExport` would otherwise privatize wholesale,
+        // which the `_`-prefix rule would otherwise privatize wholesale,
         // discarding public members like `_.merge`. The members inside are
         // still filtered by their own names on the next level, so genuinely
         // private helpers stay hidden.
+        //
+        // Structural plumbing is the exception: `default`/`module`/`exports`
+        // are re-exports of what we are already walking, so descending mints
+        // unresolvable alias entry points that can starve the real ones.
+        if (isStructuralNoise(key)) continue;
         seen.add(name);
         walk(value, name, depth + 1);
       }
@@ -328,14 +342,72 @@ function looksLikeMerge(fn) {
 
   try {
     const target = {};
-    if (observed(target, fn(target, source))) return true;
+    if (observed(target, defuse(fn(target, source)))) return true;
   } catch { /* not this convention */ }
 
   try {
     const target = {};
-    if (observed(target, fn(true, target, source))) return true;
+    if (observed(target, defuse(fn(true, target, source)))) return true;
   } catch { /* not merge-like */ }
 
+  return false;
+}
+
+/**
+ * Neutralize a returned thenable.
+ *
+ * Ranking calls every candidate export, so an async function hands back a
+ * promise nobody awaits. If it rejects, Node raises unhandledRejection and can
+ * take the run down — a probe must never do that. Attaching a no-op handler
+ * marks it handled; the value is still returned for shape inspection.
+ */
+function defuse(value) {
+  if (value && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function') {
+    try { value.then(() => {}, () => {}); } catch { /* not a real promise */ }
+  }
+  return value;
+}
+
+// Representative shapes for the factory probe: a template string (compile
+// pattern) and a bare options object (factory pattern).
+const FACTORY_PROBE_ARGS = [['Hello {{name}}'], [{}]];
+
+/** Does `value` carry callable methods? Mirrors buildProbeResult's filter, so
+ *  ranking and probing agree on what "an object with methods" means. */
+function hasCallableMethods(value) {
+  try {
+    const proto = Object.getPrototypeOf(value);
+    const keys = new Set([
+      ...Object.keys(value),
+      ...(proto && proto !== Object.prototype ? Object.getOwnPropertyNames(proto) : []),
+    ]);
+    for (const key of keys) {
+      if (SKIP_NAMES.has(key) || key.startsWith('_')) continue;
+      if (typeof value[key] === 'function') return true;
+    }
+  } catch { /* exotic object */ }
+  return false;
+}
+
+/**
+ * Does this function BEHAVE like a factory/compiler — does calling it hand back
+ * more callable surface (a function, or an object carrying methods) rather than
+ * a plain value?
+ *
+ * This is the behavioural replacement for the INTERESTING_METHODS name list
+ * ('compile', 'render', 'parse', …). Multi-step gadgets (compile -> render,
+ * CVE-2022-29078) only fire on the SECOND call, so the entry point that returns
+ * the callable has to be probed for the chain to be found at all. Ranking that
+ * by name meant a compiler named outside our vocabulary was never probed.
+ */
+function looksLikeFactory(fn) {
+  for (const args of FACTORY_PROBE_ARGS) {
+    try {
+      const value = defuse(fn(...args));
+      if (typeof value === 'function') return true;
+      if (value && typeof value === 'object' && hasCallableMethods(value)) return true;
+    } catch { /* not this shape */ }
+  }
   return false;
 }
 
@@ -353,21 +425,24 @@ function looksLikeMerge(fn) {
  * what a function is called.
  */
 function prioritizeExports(exports) {
+  // One probe pass per export, computed once: merge-likeness drives
+  // prototype-pollution discovery, factory-likeness drives multi-step chains.
   const mergeLike = new Map();
+  const factoryLike = new Map();
   for (const exp of exports) {
     mergeLike.set(exp, looksLikeMerge(exp.fn));
+    factoryLike.set(exp, looksLikeFactory(exp.fn));
   }
 
   return [...exports].sort((a, b) => {
-    const baseName = (name) => name.includes('.') ? name.split('.').pop() : name;
     const aMerges = mergeLike.get(a) === true;
     const bMerges = mergeLike.get(b) === true;
     if (aMerges && !bMerges) return -1;
     if (!aMerges && bMerges) return 1;
-    const aInteresting = INTERESTING_METHODS.has(baseName(a.name));
-    const bInteresting = INTERESTING_METHODS.has(baseName(b.name));
-    if (aInteresting && !bInteresting) return -1;
-    if (!aInteresting && bInteresting) return 1;
+    const aFactory = factoryLike.get(a) === true;
+    const bFactory = factoryLike.get(b) === true;
+    if (aFactory && !bFactory) return -1;
+    if (!aFactory && bFactory) return 1;
     // Prefer shorter names (top-level over deeply nested)
     return a.name.length - b.name.length;
   });

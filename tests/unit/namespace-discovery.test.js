@@ -69,6 +69,60 @@ describe('discovery descends into underscore-named public namespaces', () => {
     );
   });
 
+  // Same failure mode as the merge case, for the other gadget class. Multi-step
+  // chains (compile -> render, CVE-2022-29078-style) were reached by ranking on
+  // an INTERESTING_METHODS name list — 'compile', 'render', 'parse', … A
+  // template compiler named something outside that vocabulary sorted below 40
+  // benign siblings and fell off the probe cap, so its returned function was
+  // never discovered and no call sequence was ever built for it.
+  //
+  // The behavioural signal: calling it hands back more callable surface (a
+  // function, or an object carrying methods) rather than a plain value.
+  test('ranks a factory-like function ahead of benign ones despite an unknown name', async () => {
+    const mod = {};
+    for (let i = 0; i < 40; i++) mod[`fn${String(i).padStart(2, '0')}`] = (a) => String(a).length;
+    // Compile->render shape, with a name in no list and longer than its siblings.
+    mod.assembleTemplateProcessor = (tpl) => (locals) => `${tpl}:${JSON.stringify(locals)}`;
+
+    const config = await discoverTarget(mod, 'factory-lib', '1.0.0', {});
+    const names = config.entryPoints.map((ep) => ep.name);
+
+    assert.ok(
+      names.includes('assembleTemplateProcessor'),
+      `a behaviourally factory-like export must survive the probe cap; got: ${names.join(', ')}`,
+    );
+  });
+
+  // Descending into namespace objects must NOT descend into module-plumbing
+  // keys (`default`, `module`, `exports`). Those are aliases of the same
+  // functions, and the reproduction/sandbox worker loads the package via
+  // require() — where no such wrapper key exists — so `default._.merge` and
+  // `module.exports._.merge` never resolve.
+  //
+  // They are not merely wasteful: the differential phase bails after 3
+  // consecutive un-callable entry points, so a cluster of dead aliases sorted
+  // ahead of a real one starves it. That is exactly how the @feathersjs/commons
+  // CVE went undetected — three `_.extend` aliases burned the budget before
+  // `_.merge` was ever tested.
+  test('does not emit unresolvable module-plumbing aliases', async () => {
+    const utils = {
+      merge(target, source) { return Object.assign(target, source); },
+    };
+    // The shape an ESM/CJS interop wrapper presents: the same namespace reachable
+    // as `_`, as `default._`, and as `module.exports._`.
+    const mod = { _: utils };
+    mod.default = mod;
+    mod.module = { exports: mod };
+
+    const config = await discoverTarget(mod, 'alias-lib', '1.0.0', {});
+    const names = config.entryPoints.map((ep) => ep.name);
+
+    const aliases = names.filter((n) => /(^|\.)(default|module|exports)\./.test(n));
+    assert.deepEqual(aliases, [],
+      `module-plumbing aliases must not become entry points; got: ${aliases.join(', ')}`);
+    assert.ok(names.includes('_.merge'), `the real entry point must survive; got: ${names.join(', ')}`);
+  });
+
   test('still skips genuinely-private leaf members (_internalHelper)', async () => {
     const mod = {
       publicFn(x) { return x; },
