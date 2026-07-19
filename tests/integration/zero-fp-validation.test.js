@@ -72,6 +72,21 @@ describe('reproduction harness — hermetic fixtures (offline)', () => {
     assert.equal(r.verified, false, 'a function that never reaches a sink must never reproduce');
   });
 
+  // Command injection: a polluted value flows into child_process.execSync. The
+  // globalThis execution-canary cannot prove this (the value is a shell string,
+  // and spawning is blocked for safety), so reproduction proves REACHABILITY —
+  // the polluted value arrived at a code/command sink — without any side effect.
+  test('confirms a polluted value reaching a command sink (reachability proof)', async () => {
+    const r = await reproduceRce(FIX('cmd-gadget'), 'run', { property: 'cmd', gates: [], minimalArgs: [{}] });
+    assert.equal(r.verified, true, 'a polluted value reaching execSync must reproduce');
+    assert.equal(r.runs, 2, 'reproduced in two fresh processes');
+  });
+
+  test('does NOT confirm the benign control that reaches no sink', async () => {
+    const r = await reproduceRce(FIX('cmd-gadget'), 'safe', { property: 'cmd', gates: [], minimalArgs: [{}] });
+    assert.equal(r.verified, false, 'a function that never reaches a sink must never reproduce');
+  });
+
   // Real-world false positive (jquery@latest Event/`then`): the RCE canary for a
   // `then` payload is a function. Object.prototype.then = fn makes EVERY object
   // thenable, so the harness's own Promise.resolve(returnValue)/await invokes the

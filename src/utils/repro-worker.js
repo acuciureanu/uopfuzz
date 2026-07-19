@@ -41,6 +41,43 @@ const require = createRequire(import.meta.url);
 // contained by blocking the effects (network/child_process) plus the container.
 hardenWorkerProcess(require, { blockNetwork: process.env.UOPFUZZ_BLOCK_NETWORK === '1' });
 
+// ─── SINK REACHABILITY RECORDING ─────────────────────────────
+// Some gadgets flow a polluted value into a code/command sink as a STRING
+// (child_process.execSync(cmd), eval(code), vm.runInThisContext(code)). The
+// globalThis execution-canary cannot prove those — a shell command is not
+// runnable JS, and spawning is blocked for safety. So we ALSO record the string
+// argument every sink receives; if a unique token planted on the prototype shows
+// up there, the polluted value provably reached that sink (reachability), with no
+// external effect. Only STRING args are recorded — never coerce a target object
+// (that could route through a polluted toString/valueOf). Recording delegates to
+// the original so eval/Function still execute for the execution-canary; for
+// child_process the original is already the blocked stub, so nothing spawns.
+const sinkArgs = [];
+function installSinkRecorders() {
+  const record = (arg) => { if (typeof arg === 'string') sinkArgs.push(arg); };
+  const wrap = (obj, name) => {
+    const orig = obj[name];
+    if (typeof orig !== 'function') return;
+    const wrapped = function (...args) { record(args[0]); return orig.apply(this, args); };
+    // Preserve the original's prototype — jsdom and other code rely on
+    // `Function.prototype` identity (matches the sandbox worker's eval/Function
+    // hooks). Without this, wrapping Function breaks browser-only targets.
+    try { wrapped.prototype = orig.prototype; } catch { /* frozen */ }
+    obj[name] = wrapped;
+  };
+  wrap(globalThis, 'eval');
+  wrap(globalThis, 'Function');
+  try {
+    const vm = require('vm');
+    for (const m of ['runInThisContext', 'runInNewContext', 'compileFunction']) wrap(vm, m);
+  } catch { /* vm unavailable */ }
+  try {
+    const cp = require('child_process');
+    for (const m of ['exec', 'execSync', 'spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) wrap(cp, m);
+  } catch { /* child_process unavailable */ }
+}
+installSinkRecorders();
+
 // ─── SECURITY: Restrict dangerous process methods ────────────
 const originalExit = process.exit;
 process.exit = function (code) {
@@ -213,16 +250,26 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
   const sequenceSteps = msg.sequence?.steps;
   // Unique per-attempt token; built inside the worker so no function crosses IPC.
   const token = `UOPFUZZ_${msg.nonce || 'x'}_${gates.length}`;
+  const sinkToken = `UOPFUZZ_SINK_${msg.nonce || 'x'}_${gates.length}`;
   const nulChar = String.fromCharCode(0);
 
+  // Two proof kinds, each with its own `fired()` oracle:
+  //  - EXECUTION: the polluted value is invoked/eval'd and writes the canary to
+  //    globalThis (proof of actual code execution).
+  //  - REACHABILITY: the polluted value is a token STRING that shows up in a code
+  //    or command sink's argument (proof it flowed to a sink; used for command
+  //    injection, which cannot be safely executed).
+  const canaryFired = () => globalThis[CANARY_GLOBAL] === token;
   const payloads = [
-    { type: 'function_call', make: () => new Function(`globalThis['${CANARY_GLOBAL}']='${token}'`) },
-    { type: 'eval_string', make: () => `globalThis['${CANARY_GLOBAL}']='${token}'` },
-    { type: 'constructor_chain', make: () => `constructor.constructor("globalThis['${CANARY_GLOBAL}']='${token}'")()${nulChar}` },
+    { type: 'function_call', make: () => new Function(`globalThis['${CANARY_GLOBAL}']='${token}'`), fired: canaryFired },
+    { type: 'eval_string', make: () => `globalThis['${CANARY_GLOBAL}']='${token}'`, fired: canaryFired },
+    { type: 'constructor_chain', make: () => `constructor.constructor("globalThis['${CANARY_GLOBAL}']='${token}'")()${nulChar}`, fired: canaryFired },
+    { type: 'sink_reach', make: () => sinkToken, fired: () => sinkArgs.some(a => a.includes(sinkToken)) },
   ];
 
   for (const payload of payloads) {
     delete globalThis[CANARY_GLOBAL];
+    sinkArgs.length = 0;
     const installed = [];
     try {
       installProp(prop, payload.make(), installed);
@@ -238,12 +285,14 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
       for (const p of installed.reverse()) restoreProp(p);
     }
 
-    if (globalThis[CANARY_GLOBAL] === token) {
+    if (payload.fired()) {
       delete globalThis[CANARY_GLOBAL];
+      sinkArgs.length = 0;
       return { verified: true, payloadType: payload.type, canary: token, gates };
     }
   }
   delete globalThis[CANARY_GLOBAL];
+  sinkArgs.length = 0;
   return { verified: false };
 }
 

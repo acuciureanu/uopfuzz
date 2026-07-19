@@ -100,6 +100,25 @@ try {
   }
 } catch { /* vm not available */ }
 
+// Hook child_process — command-injection sinks. worker-hardening already replaced
+// these with throwing stubs (nothing spawns), but logging the access surfaces a
+// command-injection gadget as a high-tier candidate; reproduction then proves the
+// polluted value reached the sink (repro-worker's sink_reach proof). Only string
+// args are stringified for the log — never coerce a target object here.
+try {
+  const cp = require('child_process');
+  for (const method of ['exec', 'execSync', 'spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) {
+    const orig = cp[method];
+    if (typeof orig === 'function') {
+      cp[method] = function(...args) {
+        const a = typeof args[0] === 'string' ? args[0].substring(0, 200) : '';
+        sinkLog.push({ sink: `child_process.${method}`, args: [a], timestamp: Date.now() });
+        return orig.apply(this, args);
+      };
+    }
+  }
+} catch { /* child_process not available */ }
+
 // ─── PERSISTENT TARGET CACHE ─────────────────────────────────
 // A pooled worker serves many requests for the SAME package. Loading the target
 // (and, for browser-only packages, standing up jsdom) once and reusing it — the
