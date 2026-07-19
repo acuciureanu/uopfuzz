@@ -85,6 +85,39 @@ export function appendDiscovery(record, filePath = DEFAULT_DISCOVERY_STORE_PATH)
 }
 
 /**
+ * Append a record only if the store holds no finding with the same identity
+ * (`package` + `version` + `entryPoint` + `property`).
+ *
+ * The store is a curated corpus of what this tool has genuinely found, not a
+ * run log. Re-scanning a target re-confirms the same gadget every time, so a
+ * plain append buries the distinct findings under repeats of whatever happens
+ * to be scanned most often. Version is part of the identity on purpose:
+ * confirming the same gadget in another release is a real, separate data point.
+ *
+ * Best-effort, and deliberately so. This reads before writing, which under
+ * parallel scans (`--parallel N`, MassRunner) lets two processes both miss and
+ * both append. The cost of losing that race is one duplicate line — exactly the
+ * behaviour before this function existed — so the concurrency contract is no
+ * weaker than it was, while the common single-process case stays clean.
+ *
+ * @param {object} record
+ * @param {string} [filePath=DEFAULT_DISCOVERY_STORE_PATH]
+ * @returns {boolean} true when written, false when it was already recorded
+ */
+export function appendDiscoveryIfNew(record, filePath = DEFAULT_DISCOVERY_STORE_PATH) {
+  const existing = loadDiscoveries(filePath);
+  const duplicate = existing.some(r =>
+    (r.package || '') === (record.package || '') &&
+    (r.version || '') === (record.version || '') &&
+    (r.entryPoint || '') === (record.entryPoint || '') &&
+    (r.property || '') === (record.property || '')
+  );
+  if (duplicate) return false;
+  appendDiscovery(record, filePath);
+  return true;
+}
+
+/**
  * Find the earliest prior sighting of the same bug in `discoveries`.
  *
  * Identity key (version-agnostic): `package + entryPoint + property`. If

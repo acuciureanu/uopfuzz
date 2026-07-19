@@ -12,6 +12,7 @@ import { executeDifferential, executeMergePPTest } from '../../src/instrumentati
 import {
   loadDiscoveries,
   appendDiscovery,
+  appendDiscoveryIfNew,
   findPriorSighting,
   buildRecord,
 } from '../../src/gadget-analysis/discovery-store.js';
@@ -251,6 +252,30 @@ describe('discovery store — durable memory across runs (offline)', () => {
     const recs = loadDiscoveries(f);
     assert.equal(recs.length, 2, 'two valid records survive; malformed/blank lines skipped');
     assert.deepEqual(recs.map(r => r.package).sort(), ['a', 'b']);
+  });
+
+  // The store is a curated corpus of what this tool has actually found, not a
+  // run log. Re-scanning a target re-confirms the same gadget every time, so a
+  // plain append buries the distinct findings under repeats of whatever was
+  // scanned most often (one @feathersjs/commons gadget had accumulated 20 rows).
+  test('appendDiscoveryIfNew records a finding once, however often it is re-confirmed', () => {
+    const f = tmpStore();
+    const rec = () => ({
+      package: '@feathersjs/commons', version: '5.0.44', entryPoint: '_.merge',
+      property: 'debug', discoveredAt: new Date().toISOString(),
+    });
+
+    assert.equal(appendDiscoveryIfNew(rec(), f), true, 'first sighting is stored');
+    assert.equal(appendDiscoveryIfNew(rec(), f), false, 're-confirmation is not stored again');
+    assert.equal(loadDiscoveries(f).length, 1);
+
+    // A genuinely different finding in the same package is still recorded.
+    assert.equal(appendDiscoveryIfNew({ ...rec(), entryPoint: '_.extend' }, f), true);
+    assert.equal(loadDiscoveries(f).length, 2);
+
+    // …as is the same gadget confirmed in a different version.
+    assert.equal(appendDiscoveryIfNew({ ...rec(), version: '5.0.43' }, f), true);
+    assert.equal(loadDiscoveries(f).length, 3);
   });
 
   test('appendDiscovery writes one JSON line and never throws on a bad path', () => {

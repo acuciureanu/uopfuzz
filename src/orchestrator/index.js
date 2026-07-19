@@ -13,7 +13,7 @@ import { classifyFinding } from '../gadget-analysis/disclosure.js';
 import { fetchOsvVulns } from '../sources/osv.js';
 import {
   loadDiscoveries,
-  appendDiscovery,
+  appendDiscoveryIfNew,
   buildRecord,
   DEFAULT_DISCOVERY_STORE_PATH,
 } from '../gadget-analysis/discovery-store.js';
@@ -499,7 +499,7 @@ export class Orchestrator {
       // a known CVE, a regression suspect, a rediscovery, or a first-sighting
       // undocumented vulnerability). Never throws; a write failure is logged
       // and swallowed.
-      appendDiscovery(buildRecord(chain, { package: pkg, version, proofType }), this._discoveryStorePath);
+      appendDiscoveryIfNew(buildRecord(chain, { package: pkg, version, proofType }), this._discoveryStorePath);
 
       const disclosureTag = chain.disclosure.label === 'known-cve'
         ? `KNOWN CVE${chain.disclosure.cve ? ' ' + chain.disclosure.cve : ''}`
