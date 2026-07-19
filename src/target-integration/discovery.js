@@ -243,10 +243,13 @@ function discoverExports(targetModule, packageName) {
     }
 
     for (const [key, value] of entries) {
-      if (shouldSkipExport(key)) continue;
+      const skip = shouldSkipExport(key);
       const name = prefix ? `${prefix}.${key}` : key;
 
       if (typeof value === 'function' && !seen.has(name)) {
+        // The private-member convention (`_foo`) applies to callable leaves:
+        // skip a function that looks internal, but still register public ones.
+        if (skip) continue;
         seen.add(name);
         exports.push({ name, fn: value });
         // Also walk function properties — libraries like jQuery attach methods
@@ -255,6 +258,13 @@ function discoverExports(targetModule, packageName) {
           walk(value, name, depth + 1);
         }
       } else if (typeof value === 'object' && value !== null && !seen.has(name)) {
+        // Descend into namespace OBJECTS even when the container name looks
+        // private. Libraries expose their whole public API under a short
+        // namespace — `_` (lodash, underscore, @feathersjs/commons) or `$` —
+        // which `shouldSkipExport` would otherwise privatize wholesale,
+        // discarding public members like `_.merge`. The members inside are
+        // still filtered by their own names on the next level, so genuinely
+        // private helpers stay hidden.
         seen.add(name);
         walk(value, name, depth + 1);
       }
