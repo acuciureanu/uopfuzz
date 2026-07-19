@@ -35,6 +35,40 @@ describe('discovery descends into underscore-named public namespaces', () => {
     );
   });
 
+  // Discovery probes only the top-N ranked exports. Ranking was purely
+  // name-based: a hardcoded DANGEROUS_MERGE_METHODS list, then an
+  // INTERESTING_METHODS list, then "prefer shorter names". A merge function
+  // whose name is in neither list AND is longer than its benign siblings sorts
+  // last and falls off the cap — so a genuinely vulnerable deep-merge is never
+  // probed and the tool reports nothing. That makes detection depend on
+  // guessing the author's vocabulary.
+  //
+  // Merge-likeness is detectable by BEHAVIOUR, not name: fn({}, {k: v}) makes
+  // k observable. Rank on that instead, so an unheard-of name is still probed.
+  test('ranks a merge-like function ahead of benign ones despite an unknown, long name', async () => {
+    const mod = {};
+    // 40 short, top-level, benign names — these win every name-based tie-break.
+    for (let i = 0; i < 40; i++) mod[`fn${String(i).padStart(2, '0')}`] = (a) => String(a).length;
+    // The vulnerable one: in no hardcoded list, and longer than every sibling.
+    mod.reconcileConfigurationTree = function (target, source) {
+      for (const key in source) {
+        if (source[key] && typeof source[key] === 'object') {
+          if (!target[key]) target[key] = {};
+          mod.reconcileConfigurationTree(target[key], source[key]);
+        } else { target[key] = source[key]; }
+      }
+      return target;
+    };
+
+    const config = await discoverTarget(mod, 'hidden-lib', '1.0.0', {});
+    const names = config.entryPoints.map((ep) => ep.name);
+
+    assert.ok(
+      names.includes('reconcileConfigurationTree'),
+      `a behaviourally merge-like export must survive the probe cap; got: ${names.join(', ')}`,
+    );
+  });
+
   test('still skips genuinely-private leaf members (_internalHelper)', async () => {
     const mod = {
       publicFn(x) { return x; },

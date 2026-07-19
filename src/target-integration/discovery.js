@@ -126,10 +126,14 @@ export async function discoverTarget(targetModule, packageName, version, subModu
   // Step 2: Probe each export to determine input types and return behavior
   // Limit to top 20 most interesting exports to avoid probing hundreds of methods
   // IMPORTANT: skip AJAX-like methods — probing them fires real XHRs that hang.
-  const toProbe = prioritizeExports(allExports).filter(exp => {
+  // AJAX-like methods are excluded BEFORE ranking, not after: ranking now calls
+  // each candidate (behavioural merge detection), and calling an ajax method
+  // fires a real XHR that hangs the run.
+  const probeSafe = allExports.filter(exp => {
     const base = exp.name.includes('.') ? exp.name.split('.').pop() : exp.name;
     return !AJAX_LIKE_METHODS.has(base);
-  }).slice(0, 20);
+  });
+  const toProbe = prioritizeExports(probeSafe).slice(0, 20);
   const entryPoints = [];
   const sequences = [];
 
@@ -305,13 +309,66 @@ const DANGEROUS_MERGE_METHODS = new Set([
   'deepExtend', 'deepMerge', 'deepAssign',
 ]);
 
+// Probe key for behavioural merge detection. Deliberately obscure so a target
+// cannot plausibly carry it already.
+const MERGE_PROBE_KEY = '__uopfuzz_merge_probe__';
+
 /**
- * Prioritize exports: put likely-interesting names first.
- * Dangerous merge/extend methods get highest priority.
+ * Does this function BEHAVE like a merge/extend/assign?
+ *
+ * A merge makes the source object's keys observable — either by mutating its
+ * first argument (lodash.merge, Object.assign) or by returning an object that
+ * carries them. That is a property of behaviour, not of the author's naming
+ * taste, so it catches a vulnerable deep-merge called `reconcileConfigurationTree`
+ * exactly as well as one called `merge`.
+ *
+ * Both real calling conventions are tried: fn(target, source) and the
+ * jQuery-style fn(true, target, source) deep form. Arity is deliberately NOT
+ * checked — plenty of merges are written with rest args (fn.length === 0).
+ * Every call is contained: a throwing function simply is not merge-like.
+ */
+function looksLikeMerge(fn) {
+  const source = { [MERGE_PROBE_KEY]: 1 };
+  const observed = (target, result) =>
+    target[MERGE_PROBE_KEY] === 1 ||
+    (result && typeof result === 'object' && result[MERGE_PROBE_KEY] === 1);
+
+  try {
+    const target = {};
+    if (observed(target, fn(target, source))) return true;
+  } catch { /* not this convention */ }
+
+  try {
+    const target = {};
+    if (observed(target, fn(true, target, source))) return true;
+  } catch { /* not merge-like */ }
+
+  return false;
+}
+
+/**
+ * Prioritize exports: put likely-interesting functions first.
+ *
+ * Behavioural merge-likeness ranks highest. It used to be the hardcoded
+ * DANGEROUS_MERGE_METHODS name list that led, which made discovery depend on
+ * guessing the author's vocabulary: because only the top-N ranked exports are
+ * probed, a genuinely vulnerable deep-merge with an unlisted, longer-than-average
+ * name sorted last, fell off the cap, and was never tested. The name lists are
+ * kept below as secondary hints (they cost nothing and still help order ties for
+ * functions the probe cannot safely exercise).
  */
 function prioritizeExports(exports) {
+  const mergeLike = new Map();
+  for (const exp of exports) {
+    mergeLike.set(exp, looksLikeMerge(exp.fn));
+  }
+
   return [...exports].sort((a, b) => {
     const baseName = (name) => name.includes('.') ? name.split('.').pop() : name;
+    const aMerges = mergeLike.get(a) === true;
+    const bMerges = mergeLike.get(b) === true;
+    if (aMerges && !bMerges) return -1;
+    if (!aMerges && bMerges) return 1;
     const aDangerous = DANGEROUS_MERGE_METHODS.has(baseName(a.name));
     const bDangerous = DANGEROUS_MERGE_METHODS.has(baseName(b.name));
     if (aDangerous && !bDangerous) return -1;
