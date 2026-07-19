@@ -61,8 +61,16 @@ const PROBE_CAP = 20;
 const EXPORT_PROBE_BUDGET_MS = 250;
 const TOTAL_PROBE_BUDGET_MS = 10000;
 
-// Pre-sliced for UOP discovery — avoids creating a new array per export
-const UOP_PROBES = PROBE_INPUTS.slice(0, 5);
+// UOP discovery probes every entry point with the FULL diverse input set, not
+// just template shapes: a config property read only for an object-first or
+// HTTP-like argument is invisible otherwise. Bounded by a wall-clock budget
+// (below) so a large library does not turn broad probing into a hang.
+const UOP_PROBES = PROBE_INPUTS;
+
+// Total wall-clock budget for taint UOP discovery across all entry points. Like
+// the ranking probe budget, this bounds cost by MEASURED time rather than by an
+// arbitrary export/probe count — broad where it is cheap, capped where it is not.
+const UOP_TOTAL_BUDGET_MS = 8000;
 
 // HTTP/AJAX methods — important for URL read-gadgets but MUST NOT be probed
 // during auto-discovery (they fire real XHRs in jsdom and hang/timeout).
@@ -206,9 +214,11 @@ export async function discoverTarget(targetModule, packageName, version, subModu
     }
   }
 
-  // Step 3: Discover UOP properties via taint-tracked probing
-  // Probe across multiple entry points with multiple input shapes
-  const discoveredProperties = await discoverAllUOPProperties(allExports.slice(0, 10));
+  // Step 3: Discover UOP properties via taint-tracked probing across EVERY entry
+  // point we will fuzz (not just the first handful of raw exports). These are the
+  // target-driven pollution candidates — the keys the library itself reads off
+  // the prototype chain — so detection is not bound to a static name vocabulary.
+  const discoveredProperties = await discoverAllUOPProperties(toProbe);
   if (discoveredProperties.length > 0) {
     logger.info(`Discovered ${discoveredProperties.length} pollution candidates: ${discoveredProperties.slice(0, 10).join(', ')}${discoveredProperties.length > 10 ? '...' : ''}`);
   }
@@ -641,10 +651,15 @@ async function tryConstruct(fn, args, timeoutMs = 2000) {
  */
 async function discoverAllUOPProperties(exports) {
   const allProperties = new Set();
+  let spent = 0;
 
   for (const exp of exports) {
+    if (spent >= UOP_TOTAL_BUDGET_MS) break;
     for (const probe of UOP_PROBES) {
+      if (spent >= UOP_TOTAL_BUDGET_MS) break;
+      const t0 = Date.now();
       const props = await discoverPropertiesFromProbe(exp.fn, probe);
+      spent += Date.now() - t0;
       for (const p of props) allProperties.add(p);
     }
   }
@@ -709,16 +724,21 @@ async function discoverPropertiesFromProbe(fn, probe) {
       }
     }
 
-    // If result has .render(), probe it too
-    if (result && typeof result === 'object' && typeof result.render === 'function') {
-      const innerLog = [];
-      try {
-        const tracked = createTaintProxy({}, innerLog, '$renderArg');
-        await tryCall(result.render.bind(result), [tracked], 1500);
-      } catch { /* expected */ }
-      for (const event of innerLog) {
-        if (event.type === 'get' && event.isUOPCandidate && typeof event.property === 'string') {
-          addProperty(properties, event.property);
+    // If result is an object, probe its callable methods too — a compile->render
+    // / create->method gadget reads its config on the SECOND call, so the UOP
+    // property lives on the returned object's method, not the entry point.
+    if (result && typeof result === 'object') {
+      const methods = collectMethods(result).slice(0, 5);
+      for (const method of methods) {
+        const innerLog = [];
+        try {
+          const tracked = createTaintProxy({}, innerLog, `$${method}Arg`);
+          await tryCall(result[method].bind(result), [tracked], 1500);
+        } catch { /* expected */ }
+        for (const event of innerLog) {
+          if (event.type === 'get' && event.isUOPCandidate && typeof event.property === 'string') {
+            addProperty(properties, event.property);
+          }
         }
       }
     }
@@ -738,9 +758,32 @@ async function discoverPropertiesFromProbe(fn, probe) {
   return [...properties];
 }
 
+// Callable method names on an object (own + one prototype level), minus plumbing.
+// Used to probe a returned object's methods for UOP reads (compile->render etc.).
+function collectMethods(obj) {
+  const names = new Set();
+  try {
+    for (const k of Object.keys(obj)) names.add(k);
+    const proto = Object.getPrototypeOf(obj);
+    if (proto && proto !== Object.prototype) {
+      for (const k of Object.getOwnPropertyNames(proto)) names.add(k);
+    }
+  } catch { /* exotic object */ }
+  const out = [];
+  for (const k of names) {
+    if (k === 'constructor' || SKIP_NAMES.has(k) || k.startsWith('_')) continue;
+    try { if (typeof obj[k] === 'function') out.push(k); } catch { /* getter throws */ }
+  }
+  return out;
+}
+
 function addProperty(set, prop) {
   if (typeof prop !== 'string') return;
   if (prop.startsWith('__') || prop.startsWith('Symbol(') || prop.length <= 1) return;
+  // Reject coercion artifacts: a lookup keyed by a non-string value stringifies
+  // (`[object Object]`, `function () {…}`), and any key with whitespace/brackets
+  // is not a real gadget property — it is noise the broadened probes surface.
+  if (/[\s[\]{}()<>]|^\[object /.test(prop)) return;
   if (SKIP_NAMES.has(prop) || prop === 'nodeType' || prop === 'tagName' ||
       prop === 'jquery' || prop === 'length' || prop === 'splice') return;
   set.add(prop);
