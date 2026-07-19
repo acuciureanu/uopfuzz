@@ -17,7 +17,6 @@ import {
   buildRecord,
   DEFAULT_DISCOVERY_STORE_PATH,
 } from '../gadget-analysis/discovery-store.js';
-import { packageBaseName } from '../utils/package-name.js';
 import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -571,26 +570,30 @@ export class Orchestrator {
     const testInputs = [];
     const seenEP = new Set();
 
-    // clone/init included: $.fn.clone({}) accesses .cloneNode on args (real gadget surface);
-    // $.fn.init({}) accesses .nodeType and .window.
-    const highPriorityEPs = new Set(['extend', 'merge', 'clone', 'init', 'defaults', 'defaultsDeep', 'deepExtend', 'deepMerge']);
-    const medPriorityEPs = new Set(['assign', 'set', 'mergeWith', 'setWith', 'mixin', 'cloneDeep', 'mixin']);
     // URL sinks: libraries read url/method/headers/data from option objects passed to these;
     // pre-polluting Object.prototype with those properties is a high-impact gadget class.
+    // This list stays by NAME on purpose, and is the one place that is defensible:
+    // these functions cannot be identified behaviourally because they must never be
+    // called speculatively — invoking ajax/fetch fires a real request. It selects a
+    // probing STRATEGY (empty options object, getter trap), never a verdict.
     const urlSinkEPs = new Set(['ajax', 'post', 'getJSON', 'getScript', 'fetch', 'request', 'send']);
     const getBaseName = (name) => name.includes('.') ? name.split('.').pop() : name;
 
-    // A bare-function module (module.exports = fn, e.g. merge-deep) is registered
-    // under the package base name — treat that entry point as high-priority too.
-    const pkgBase = packageBaseName(this.config.package || '');
-
-    // Pass 1: Create test inputs directly from config.entryPoints for dangerous EPs.
+    // Pass 1: Create test inputs directly from config.entryPoints, in order.
     // This is deterministic — not dependent on random input generation.
+    //
+    // The order IS the priority: discovery ranks entry points behaviourally
+    // (merge-like first, then factory-like — see prioritizeExports). This used
+    // to filter by a hardcoded name list instead, which inverted the result on
+    // any library whose vocabulary did not match ours: a package exposing a SAFE
+    // `merge`/`extend`/`clone` alongside a vulnerable `applyPatch` spent its
+    // whole deterministic budget on the three harmless decoys and never tested
+    // the real gadget. Ranking by what functions DO cannot be fooled that way.
     if (this.config.entryPoints) {
       for (const ep of this.config.entryPoints) {
         if (testInputs.length >= 5) break;
-        const base = getBaseName(ep.name);
-        if (!highPriorityEPs.has(base) && ep.name !== pkgBase) continue;
+        // URL sinks are handled by Pass 1b, which probes them differently.
+        if (urlSinkEPs.has(getBaseName(ep.name))) continue;
         if (seenEP.has(ep.name)) continue;
         seenEP.add(ep.name);
         testInputs.push({
@@ -621,13 +624,13 @@ export class Orchestrator {
       }
     }
 
-    // Pass 2: Medium-priority from config (only shallow names to avoid noise)
+    // Pass 2: Keep filling from config.entryPoints in ranked order, preferring
+    // shallow names so a deeply-nested method does not crowd out a top-level one.
     if (this.config.entryPoints) {
       for (const ep of this.config.entryPoints) {
         if (testInputs.length >= 8) break;
-        const base = getBaseName(ep.name);
-        const depth = ep.name.split('.').length;
-        if (!medPriorityEPs.has(base) || depth > 2) continue;
+        if (ep.name.split('.').length > 2) continue;
+        if (urlSinkEPs.has(getBaseName(ep.name))) continue;
         if (seenEP.has(ep.name)) continue;
         seenEP.add(ep.name);
         testInputs.push({
