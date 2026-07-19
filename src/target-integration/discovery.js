@@ -356,33 +356,39 @@ function discoverExports(targetModule, packageName) {
 const MERGE_PROBE_KEY = '__uopfuzz_merge_probe__';
 
 /**
- * Does this function BEHAVE like a merge/extend/assign?
+ * Does this function BEHAVE like a DEEP merge — the prototype-pollution-capable
+ * kind that recurses into a nested object?
  *
- * A merge makes the source object's keys observable — either by mutating its
- * first argument (lodash.merge, Object.assign) or by returning an object that
- * carries them. That is a property of behaviour, not of the author's naming
- * taste, so it catches a vulnerable deep-merge called `reconcileConfigurationTree`
- * exactly as well as one called `merge`.
+ * The discriminator is deliberately strict: a source with a NESTED object is
+ * merged into a target whose SAME nested key already holds a value, and the
+ * function must preserve the existing key while adding the source's. Only a deep
+ * merge does that (it recurses into `target[key]`); a shallow prop-copy replaces
+ * or ignores the nested object. This matters because only deep merges pollute
+ * (they recurse into `__proto__`), and because the loose "a source key became
+ * observable" test flagged shallow copiers — jQuery's Event/data/makeArray copy
+ * props — as merges, diluting the merge-like tier so a real merge (`extend`)
+ * sorted below them and fell past the probe/differential cap. That is exactly
+ * how jQuery 3.1.1's `extend` prototype pollution went unfound.
  *
- * Both real calling conventions are tried: fn(target, source) and the
- * jQuery-style fn(true, target, source) deep form. Arity is deliberately NOT
- * checked — plenty of merges are written with rest args (fn.length === 0).
- * Every call is contained: a throwing function simply is not merge-like.
+ * Name-agnostic (catches a deep merge called `reconcileConfigurationTree`), and
+ * both conventions are tried: fn(target, source) and the jQuery deep form
+ * fn(true, target, source). Every call is contained.
  */
 function looksLikeMerge(fn) {
-  const source = { [MERGE_PROBE_KEY]: 1 };
-  const observed = (target, result) =>
-    target[MERGE_PROBE_KEY] === 1 ||
-    (result && typeof result === 'object' && result[MERGE_PROBE_KEY] === 1);
+  const makeSource = () => ({ nest: { [MERGE_PROBE_KEY]: 1 } });
+  const mergedDeeply = (target, result) => {
+    const ok = (o) => o && o.nest && o.nest[MERGE_PROBE_KEY] === 1 && o.nest.existing === 1;
+    return ok(target) || ok(result);
+  };
 
   try {
-    const target = {};
-    if (observed(target, defuse(fn(target, source)))) return true;
+    const target = { nest: { existing: 1 } };
+    if (mergedDeeply(target, defuse(fn(target, makeSource())))) return true;
   } catch { /* not this convention */ }
 
   try {
-    const target = {};
-    if (observed(target, defuse(fn(true, target, source)))) return true;
+    const target = { nest: { existing: 1 } };
+    if (mergedDeeply(target, defuse(fn(true, target, makeSource())))) return true;
   } catch { /* not merge-like */ }
 
   return false;

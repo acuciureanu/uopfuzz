@@ -35,6 +35,32 @@ describe('discovery descends into underscore-named public namespaces', () => {
     );
   });
 
+  // Merge-likeness must mean DEEP merge (the prototype-pollution-capable kind
+  // that recurses into a nested target), not "a source key became observable".
+  // jQuery's Event/data/makeArray shallow-copy props, so the loose test flagged
+  // them as merges; they then tied with the real deep merge and, being
+  // shorter-named, pushed it below the probe/differential cap — which is exactly
+  // why jQuery 3.1.1's `extend` prototype pollution (CVE-2019-11358) went unfound.
+  test('a deep merge outranks shallow prop-copy decoys', async () => {
+    const shallowCopy = (a, b) => Object.assign({}, a, b); // observable, but NOT PP-capable
+    const mod = {};
+    for (let i = 0; i < 6; i++) mod[`aaCopy${i}`] = shallowCopy; // short names, would win a tie
+    mod.zzDeepMerge = function m(t, s) {
+      for (const k in s) {
+        if (s[k] && typeof s[k] === 'object') { if (!t[k]) t[k] = {}; m(t[k], s[k]); }
+        else { t[k] = s[k]; }
+      }
+      return t;
+    };
+
+    const cfg = await discoverTarget(mod, 'rank-lib', '1.0.0', {});
+    const names = cfg.entryPoints.map((ep) => ep.name);
+    assert.ok(
+      names.indexOf('zzDeepMerge') < names.indexOf('aaCopy0'),
+      `the deep merge must outrank shallow copies; order: ${names.join(', ')}`,
+    );
+  });
+
   // Discovery probes only the top-N ranked exports. Ranking was purely
   // name-based: a hardcoded DANGEROUS_MERGE_METHODS list, then an
   // INTERESTING_METHODS list, then "prefer shorter names". A merge function
