@@ -302,13 +302,6 @@ function discoverExports(targetModule, packageName) {
   return exports;
 }
 
-// Methods most likely to contain prototype pollution vulnerabilities
-const DANGEROUS_MERGE_METHODS = new Set([
-  'merge', 'extend', 'defaults', 'defaultsDeep', 'assign',
-  'mergeWith', 'setWith', 'set', 'mixin', 'clone', 'cloneDeep',
-  'deepExtend', 'deepMerge', 'deepAssign',
-]);
-
 // Probe key for behavioural merge detection. Deliberately obscure so a target
 // cannot plausibly carry it already.
 const MERGE_PROBE_KEY = '__uopfuzz_merge_probe__';
@@ -349,13 +342,15 @@ function looksLikeMerge(fn) {
 /**
  * Prioritize exports: put likely-interesting functions first.
  *
- * Behavioural merge-likeness ranks highest. It used to be the hardcoded
- * DANGEROUS_MERGE_METHODS name list that led, which made discovery depend on
- * guessing the author's vocabulary: because only the top-N ranked exports are
- * probed, a genuinely vulnerable deep-merge with an unlisted, longer-than-average
- * name sorted last, fell off the cap, and was never tested. The name lists are
- * kept below as secondary hints (they cost nothing and still help order ties for
- * functions the probe cannot safely exercise).
+ * Merge-likeness is decided ONLY by behaviour. There used to be a hardcoded
+ * DANGEROUS_MERGE_METHODS list ('merge', 'extend', 'assign', …) leading the
+ * sort, which made prototype-pollution discovery depend on guessing the
+ * author's vocabulary: because only the top-N ranked exports are probed, a
+ * genuinely vulnerable deep-merge with an unlisted name sorted last, fell off
+ * the cap, and was never tested. Worse, it flattered the tool — a hit on a
+ * conventionally-named `merge` proved nothing about finding an unknown gadget.
+ * The list is gone; nothing about prototype-pollution ranking now depends on
+ * what a function is called.
  */
 function prioritizeExports(exports) {
   const mergeLike = new Map();
@@ -369,10 +364,6 @@ function prioritizeExports(exports) {
     const bMerges = mergeLike.get(b) === true;
     if (aMerges && !bMerges) return -1;
     if (!aMerges && bMerges) return 1;
-    const aDangerous = DANGEROUS_MERGE_METHODS.has(baseName(a.name));
-    const bDangerous = DANGEROUS_MERGE_METHODS.has(baseName(b.name));
-    if (aDangerous && !bDangerous) return -1;
-    if (!aDangerous && bDangerous) return 1;
     const aInteresting = INTERESTING_METHODS.has(baseName(a.name));
     const bInteresting = INTERESTING_METHODS.has(baseName(b.name));
     if (aInteresting && !bInteresting) return -1;

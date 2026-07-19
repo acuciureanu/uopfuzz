@@ -147,7 +147,15 @@ program.action(async (options) => {
     }
 
     logger.info(chalk.green.bold('Fuzzing session completed'));
-    logger.info(`Results saved to: ${options.output}`);
+    // Name the exact files, not just the directory — a run drops a
+    // timestamped pair in there and "./results" leaves the reader guessing
+    // which one they just produced.
+    if (results?.outputFiles?.report) {
+      logger.info(`Report:  ${results.outputFiles.report}`);
+      logger.info(`Results: ${results.outputFiles.results}`);
+    } else {
+      logger.info(`Results saved to: ${options.output}`);
+    }
 
     const confirmedChains = results.confirmedChains || [];
     const confirmed = confirmedChains.length;

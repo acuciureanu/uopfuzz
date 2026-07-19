@@ -1006,12 +1006,22 @@ export class Orchestrator {
     const resultsFile = path.join(outputDir, `results-${ts}.json`);
     const reportFile = path.join(outputDir, `report-${ts}.md`);
 
+    // Record the exact paths on the results themselves, BEFORE serializing, so
+    // the JSON documents where it lives and the CLI can name the report even
+    // when the run happened inside the isolated child (results cross that
+    // boundary serialized; a field on the instance would not survive).
+    this.results.outputFiles = { results: resultsFile, report: reportFile };
+
     await fs.writeFile(resultsFile, JSON.stringify(this.results, null, 2));
 
     const report = generateSingleReport(this.results, this.config);
     await fs.writeFile(reportFile, report);
 
-    logger.info(`Results saved to ${outputDir}`);
+    // debug, not info: the CLI reports these paths to the user from
+    // results.outputFiles, and logging here too would print them twice (the
+    // isolated child's logs are forwarded to the parent).
+    logger.debug(`Report:  ${reportFile}`);
+    logger.debug(`Results: ${resultsFile}`);
   }
 
   /**
