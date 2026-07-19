@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { logger } from '../utils/logger.js';
+import { packageBaseName } from '../utils/package-name.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -99,7 +100,10 @@ export function appendDiscovery(record, filePath = DEFAULT_DISCOVERY_STORE_PATH)
  */
 export function findPriorSighting(discoveries, key) {
   if (!Array.isArray(discoveries) || !key) return null;
-  const pkg = (key.package || '').split('@')[0];
+  // packageBaseName, not split('@')[0] — see buildRecord. A scoped key would
+  // otherwise resolve to '' and bail below, so a scoped package could never
+  // match its own prior sighting.
+  const pkg = packageBaseName(key.package || '');
   const entryPoint = key.entryPoint || '';
   const property = key.property || '';
   if (!pkg || !entryPoint) return null;
@@ -147,7 +151,10 @@ export function buildRecord(chain, ctx) {
 
   return {
     discoveredAt: new Date().toISOString(),
-    package: (ctx.package || '').split('@')[0],
+    // packageBaseName, not split('@')[0]: a scoped spec starts with '@', so the
+    // naive split records every @scope/* finding under an empty name — and this
+    // store is keyed by package name for prior-sighting matches.
+    package: packageBaseName(ctx.package || ''),
     version: ctx.version || '',
     entryPoint,
     property,

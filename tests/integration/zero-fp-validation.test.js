@@ -357,6 +357,37 @@ describe('disclosure classifier + prior discoveries (offline)', () => {
     assert.equal(a.label, 'undocumented-vulnerability');
   });
 
+  // The store is keyed by package name, and findPriorSighting matches on
+  // package + entryPoint + property. Recording a SCOPED package under an empty
+  // name therefore collapses every @scope/* finding into one bucket, so an
+  // unrelated gadget in @a/x can mark @b/y as "previously discovered".
+  test('buildRecord preserves scoped package names', () => {
+    const chain = {
+      source: { property: 'debug' }, input: { entryPoint: '_.merge' },
+      disclosure: { label: 'known-cve' },
+    };
+    const rec = buildRecord(chain, { package: '@feathersjs/commons@5.0.44', version: '5.0.44', proofType: 'pp' });
+    assert.equal(rec.package, '@feathersjs/commons');
+
+    // …and still strips a version suffix from an unscoped spec.
+    const plain = buildRecord(chain, { package: 'lodash@4.17.4', version: '4.17.4', proofType: 'pp' });
+    assert.equal(plain.package, 'lodash');
+  });
+
+  // Read side of the same defect: with split('@')[0] the scoped key resolves to
+  // '' and the function bails early, so a scoped package could never match its
+  // own prior sighting — it would be re-reported as newly undocumented forever.
+  test('findPriorSighting matches a scoped package against its own record', () => {
+    const store = [
+      { package: '@feathersjs/commons', entryPoint: '_.merge', property: 'debug', discoveredAt: '2026-01-01T00:00:00.000Z' },
+    ];
+    const hit = findPriorSighting(store, {
+      package: '@feathersjs/commons@5.0.44', entryPoint: '_.merge', property: 'debug',
+    });
+    assert.ok(hit, 'a scoped package must match its own prior sighting');
+    assert.equal(hit.discoveredAt, '2026-01-01T00:00:00.000Z');
+  });
+
   test('buildRecord collapses the disclosure verdict into a store label', () => {
     const baseChain = {
       source: { property: 'escapeFunction' }, input: { entryPoint: 'compile' },

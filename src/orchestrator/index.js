@@ -41,6 +41,10 @@ export class Orchestrator {
   constructor(options) {
     this.config = null;
     this.options = options;
+    // Where the durable discovery ledger lives. Injectable so a test run does
+    // not append to the repo's real, tracked store — the suite must not mutate
+    // the record of what this tool has genuinely found.
+    this._discoveryStorePath = options?.discoveryStorePath || DEFAULT_DISCOVERY_STORE_PATH;
     this.targetIntegration = null;
     this.inputGeneration = null;
     this.instrumentation = null;
@@ -89,7 +93,7 @@ export class Orchestrator {
       // Load this tool's durable discovery store (once per run) so confirmed
       // findings can be recognized as rediscoveries of bugs previously found.
       // Same timing/defensive contract as fetchOsvData: never throws, [] on miss.
-      this.priorDiscoveries = loadDiscoveries(DEFAULT_DISCOVERY_STORE_PATH);
+      this.priorDiscoveries = loadDiscoveries(this._discoveryStorePath);
 
       logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
@@ -495,7 +499,7 @@ export class Orchestrator {
       // a known CVE, a regression suspect, a rediscovery, or a first-sighting
       // undocumented vulnerability). Never throws; a write failure is logged
       // and swallowed.
-      appendDiscovery(buildRecord(chain, { package: pkg, version, proofType }), DEFAULT_DISCOVERY_STORE_PATH);
+      appendDiscovery(buildRecord(chain, { package: pkg, version, proofType }), this._discoveryStorePath);
 
       const disclosureTag = chain.disclosure.label === 'known-cve'
         ? `KNOWN CVE${chain.disclosure.cve ? ' ' + chain.disclosure.cve : ''}`

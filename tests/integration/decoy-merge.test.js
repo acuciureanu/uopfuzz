@@ -42,6 +42,8 @@ describe('decoy library — safe conventional names, real gadget under an unlist
     const orchestrator = new Orchestrator({
       targetPackage: 'decoy-merge@1.0.0',
       outputDir: OUT,
+      // Never append this fixture's finding to the repo's real discovery ledger.
+      discoveryStorePath: path.join(OUT, 'discoveries.jsonl'),
       timeout: 20,
       maxIterations: 6,
       verbose: false,
