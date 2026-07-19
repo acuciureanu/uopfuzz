@@ -426,17 +426,18 @@ export class Orchestrator {
     let proof = null;
     if (pkg && diff.reproducible !== false) {
       try {
+        const browserEnv = this.config.browserEnv === true;
         if (proofType === 'pp') {
           proof = await reproduceProto(pkg, entryPoint,
             { property: descriptor.property, value: descriptor.value },
-            { version, blockNetwork: this.options.blockNetwork !== false });
+            { version, blockNetwork: this.options.blockNetwork !== false, browserEnv });
         } else {
           const gates = extra.gates
             || diff.details?.forcedGatesFired
             || (extra.coPolluteProperties || []).filter(p => p !== descriptor.property);
           proof = await reproduceRce(pkg, entryPoint,
             { property: descriptor.property, gates, minimalArgs: [testInput.value ?? {}], sequence: this.buildResolvedSequence(testInput) },
-            { version, blockNetwork: this.options.blockNetwork !== false });
+            { version, blockNetwork: this.options.blockNetwork !== false, browserEnv });
         }
       } catch (err) {
         logger.debug(`Reproduction error for ${descriptor.property} via ${entryPoint}: ${err.message}`);

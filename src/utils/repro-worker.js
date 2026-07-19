@@ -29,6 +29,7 @@
 import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 import { hardenWorkerProcess } from './worker-hardening.js';
+import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with sandbox-worker.js) ─────────────
@@ -50,11 +51,15 @@ const CANARY_GLOBAL = '__uopfuzz_repro_canary';
 
 // ─── MESSAGE HANDLER ─────────────────────────────────────────
 process.on('message', async (msg) => {
-  const { mode, packageName, entryPoint, args, timeoutMs } = msg;
+  const { mode, packageName, entryPoint, args, timeoutMs, browserEnv } = msg;
+  // Browser-only targets must boot jsdom before loading; give the same cold-start
+  // allowance the discovery worker and the sandbox driver use, so the module
+  // graph + DOM setup does not race the self-timeout on the first (only) load.
+  const startupAllowance = browserEnv ? JSDOM_STARTUP_ALLOWANCE_MS : 0;
   const killTimer = setTimeout(() => {
     process.send?.({ error: 'Self-timeout reached', verified: false, timedOut: true });
     originalExit.call(process, 0);
-  }, (timeoutMs || 3000) + 500);
+  }, (timeoutMs || 3000) + startupAllowance + 500);
 
   try {
     const result = await handle(mode, packageName, entryPoint, args, msg, timeoutMs);
@@ -68,7 +73,7 @@ process.on('message', async (msg) => {
 });
 
 async function handle(mode, packageName, entryPoint, args, msg, timeoutMs) {
-  const targetModule = await loadPackage(packageName);
+  const targetModule = await loadPackage(packageName, msg.browserEnv);
   if (targetModule?.__loadError) {
     return { error: `Cannot load ${packageName}: ${targetModule.__loadError}`, verified: false };
   }
@@ -114,7 +119,20 @@ async function runSequence(targetModule, steps, timeoutMs, packageName) {
   return lastResult;
 }
 
-async function loadPackage(packageName) {
+async function loadPackage(packageName, browserEnv) {
+  // Browser-only libraries (jQuery, Backbone, …) touch `window`/`document` at
+  // load time and export a factory; stand up jsdom first and load through it,
+  // mirroring the discovery worker (sandbox-worker.js loadTargetCached). Without
+  // this, the fresh reproduction process could never load such a target, so any
+  // real browser-library gadget was permanently unprovable.
+  if (browserEnv) {
+    try {
+      const dom = await setupJsdomGlobals();
+      return loadBrowserModule(require, packageName, dom);
+    } catch (err) {
+      return { __loadError: `browser-only load failed: ${err.message}` };
+    }
+  }
   try { return await import(packageName); }
   catch {
     try { return require(packageName); }

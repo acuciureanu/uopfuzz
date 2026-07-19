@@ -41,6 +41,7 @@ export async function reproduceProto(packageName, entryPoint, descriptor, opts =
       executeInSandbox(packageName, entryPoint, [{}], {
         timeoutMs,
         blockNetwork: opts.blockNetwork !== false,
+        browserEnv: opts.browserEnv === true,
         workerScript: REPRO_WORKER,
         mode: 'repro_pp',
         extra: { property: descriptor.property, value: descriptor.value, nonce: run },
@@ -84,6 +85,7 @@ export async function reproduceRce(packageName, entryPoint, spec, opts = {}) {
       executeInSandbox(packageName, entryPoint, minimalArgs, {
         timeoutMs,
         blockNetwork: opts.blockNetwork !== false,
+        browserEnv: opts.browserEnv === true,
         workerScript: REPRO_WORKER,
         mode: 'repro_rce',
         extra: { property: spec.property, gates: spec.gates || [], sequence: spec.sequence || null, nonce: run },
