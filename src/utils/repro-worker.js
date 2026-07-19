@@ -30,6 +30,7 @@ import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 import { hardenWorkerProcess } from './worker-hardening.js';
 import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
+import { callAndAwaitReal } from './proto-safe.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with sandbox-worker.js) ─────────────
@@ -114,7 +115,7 @@ async function runSequence(targetModule, steps, timeoutMs, packageName) {
       if (!fn) return null;
     }
     const args = deserializeArgs(step.args || []);
-    lastResult = await callAwaitingRealPromise(fn, args, timeoutMs);
+    lastResult = (await callAndAwaitReal(fn, args, timeoutMs)).value;
   }
   return lastResult;
 }
@@ -170,7 +171,7 @@ async function reproPP(fn, baseArgs, msg, timeoutMs) {
 
   for (const callArgs of argVariants) {
     const snapshot = snapshotPrototype();
-    try { await withTimeout(Promise.resolve(fn(...clone(callArgs))), timeoutMs); }
+    try { await callAndAwaitReal(fn, clone(callArgs), timeoutMs); }
     catch { /* execution errors are expected */ }
     const detection = detectAndRestorePrototype(snapshot);
 
@@ -230,7 +231,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
         if (Array.isArray(sequenceSteps) && sequenceSteps.length) {
           await runSequence(targetModule, sequenceSteps, timeoutMs, packageName);
         } else {
-          await callAwaitingRealPromise(fn, clone(baseArgs), timeoutMs);
+          await callAndAwaitReal(fn, clone(baseArgs), timeoutMs);
         }
       } catch { /* exploit payloads routinely throw after firing */ }
     } finally {
@@ -260,32 +261,10 @@ function restoreProp({ prop, hadProp, origVal }) {
   if (hadProp) { try { Object.prototype[prop] = origVal; } catch { /* sealed */ } }
 }
 
-// ─── helpers ─────────────────────────────────────────────────
-function withTimeout(promise, ms) {
-  let timer;
-  return Promise.race([
-    Promise.resolve(promise),
-    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); }),
-  ]).finally(() => clearTimeout(timer));
-}
-
-/**
- * Invoke the target and await only a GENUINE promise result.
- *
- * `Promise.resolve(value)` and `await value` adopt any thenable by reading
- * `value.then` and, if callable, invoking it. When the reproduction payload
- * pollutes `Object.prototype.then` with a callable canary, EVERY returned object
- * becomes thenable, so wrapping the target's return value would fire the canary
- * from the harness's own plumbing — "code execution" the target never performed
- * (observed as a false positive on jQuery's Event()). Gating on `instanceof
- * Promise` awaits real async results (a native promise is awaited without a
- * `.then` property read) while never adopting a plain return object, so the only
- * way the canary can fire is the target actually reaching a sink.
- */
-async function callAwaitingRealPromise(fn, args, ms) {
-  const ret = fn(...args);
-  return ret instanceof Promise ? await withTimeout(ret, ms) : ret;
-}
+// The self-trigger guard (await only a real Promise; never adopt a plain return
+// value's inherited `then`) and the pollution-invariant serializer now live in
+// the shared proto-safe.js so the discovery oracles and this reproduction gate
+// cannot drift.
 
 function clone(arr) {
   return arr.map(a => {

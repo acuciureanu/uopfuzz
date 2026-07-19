@@ -17,6 +17,7 @@ import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monito
 import { hardenWorkerProcess } from './worker-hardening.js';
 import { GATE_PROPERTIES } from '../instrumentation/gate-properties.js';
 import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
+import { callAndAwaitReal, structuralSerialize } from './proto-safe.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with repro-worker.js) ───────────────
@@ -248,20 +249,14 @@ async function executeRequest(mode, packageName, entryPoint, args, timeoutMs, po
 }
 
 async function executeCall(fn, args, timeoutMs) {
-  let timer;
   try {
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-    });
-    const output = await Promise.race([Promise.resolve(fn(...args)), timeout]);
+    const box = await callAndAwaitReal(fn, args, timeoutMs);
     return {
-      output: safeSerialize(output),
+      output: structuralSerialize(box.value),
       error: null,
     };
   } catch (error) {
     return { output: null, error: error.message };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -273,7 +268,7 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
   const cleanStartTime = Date.now();
   sinkLog.length = 0; // Clear any previous sink logs
   try {
-    cleanOutput = safeSerialize(await withTimeout(fn(...args), timeoutMs));
+    cleanOutput = structuralSerialize((await callAndAwaitReal(fn, args, timeoutMs)).value);
   } catch (err) {
     cleanError = err.message;
   }
@@ -310,7 +305,7 @@ async function executeDifferential(fn, args, pollution, timeoutMs) {
       // Property may be non-configurable; fall back to simple assignment
       Object.prototype[prop] = val;
     }
-    pollutedOutput = safeSerialize(await withTimeout(fn(...args), timeoutMs));
+    pollutedOutput = structuralSerialize((await callAndAwaitReal(fn, args, timeoutMs)).value);
   } catch (err) {
     pollutedError = err.message;
   } finally {
@@ -387,7 +382,7 @@ async function runWithTraps(fn, args, descriptors, timeoutMs) {
   sinkLog.length = 0;
   let cleanOutput, cleanError;
   try {
-    cleanOutput = safeSerialize(await withTimeout(fn(...clone(args)), timeoutMs));
+    cleanOutput = structuralSerialize((await callAndAwaitReal(fn, clone(args), timeoutMs)).value);
   } catch (err) {
     cleanError = err.message;
   }
@@ -399,7 +394,7 @@ async function runWithTraps(fn, args, descriptors, timeoutMs) {
   let pollutedOutput, pollutedError;
 
   try {
-    pollutedOutput = safeSerialize(await withTimeout(fn(...clone(args)), timeoutMs));
+    pollutedOutput = structuralSerialize((await callAndAwaitReal(fn, clone(args), timeoutMs)).value);
   } catch (err) {
     pollutedError = err.message;
   } finally {
@@ -487,7 +482,7 @@ async function discoverUOP(fn, args, timeoutMs) {
   });
 
   try {
-    await withTimeout(fn(...trackedArgs), timeoutMs);
+    await callAndAwaitReal(fn, trackedArgs, timeoutMs);
   } catch { /* errors expected */ }
 
   return {
@@ -535,7 +530,7 @@ async function mergePPTest(fn, baseArgs, pollution, timeoutMs) {
     const snapshot = snapshotPrototype();
 
     try {
-      await withTimeout(Promise.resolve(fn(...callArgs)), timeoutMs);
+      await callAndAwaitReal(fn, callArgs, timeoutMs);
     } catch { /* expected */ }
 
     const detection = detectAndRestorePrototype(snapshot);
@@ -545,16 +540,6 @@ async function mergePPTest(fn, baseArgs, pollution, timeoutMs) {
   }
 
   return { pollutionDetected: false };
-}
-
-function withTimeout(promise, ms) {
-  let timer;
-  return Promise.race([
-    Promise.resolve(promise),
-    new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('timeout')), ms);
-    })
-  ]).finally(() => clearTimeout(timer));
 }
 
 /** Deep-clone args between the clean and polluted runs so a mutation in one run
@@ -613,10 +598,3 @@ function deserializeArgs(args) {
   });
 }
 
-function safeSerialize(value) {
-  if (value === null || value === undefined) return String(value);
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  if (typeof value === 'function') return '[function]';
-  try { return JSON.stringify(value); } catch { return String(value); }
-}

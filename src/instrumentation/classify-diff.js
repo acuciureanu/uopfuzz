@@ -21,22 +21,6 @@
  */
 
 /**
- * High-risk, sink-adjacent property names. A property that is merely READ under
- * pollution (Tier 5 — nothing observable changed) is only worth a reproduction
- * attempt when its name is one of these; the rest are low-value manual-review
- * leads with no reproduction attempt.
- */
-export const HIGH_RISK_PROPS = new Set([
-  'template', 'code', 'script', 'eval', 'command', 'shell', 'exec',
-  'source', 'expression', 'compile', 'render', 'Function',
-  'url', 'href', 'src', 'action', 'baseURL', 'endpoint', 'proxy',
-  'innerHTML', 'outerHTML', 'textContent', 'onclick', 'onerror',
-  'compileDebug', 'debug', 'self', 'constructor', 'allowDots',
-  'allowPrototypes', 'outputFunctionName', 'localsName', 'destructuredLocals',
-  'escape', 'client', 'globals', 'filename',
-]);
-
-/**
  * Classify a differential observation into a reproduction-candidate verdict.
  *
  * @param {object} facts
@@ -100,13 +84,19 @@ export function classifyDiff(facts) {
     verdict.reproducible = true;
     verdict.confidence = 0.60;
   } else if (pollutionWasRead) {
-    // Tier 5: the property was read but nothing observable changed. High-risk
-    // (sink-adjacent) names are still worth a reproduction attempt; the rest are
-    // low-value leads kept only for manual review (no reproduction attempt).
+    // Tier 5: the target read the polluted property but nothing else observably
+    // changed. This used to gate reproduction on a hardcoded HIGH_RISK_PROPS name
+    // list — a genuine read of an unlisted property was dropped to manual review,
+    // exactly the vocabulary-dependence the tool is meant to avoid. Now that the
+    // read signal is accurate (the harness no longer self-reads a polluted
+    // property while serializing/awaiting — see proto-safe.js), every genuine
+    // read is worth a reproduction attempt. Reproduction stays the real gate and
+    // rejects non-gadgets; the orchestrator dedups failed attempts so an
+    // unconfirmable read is tried once, not every iteration.
     verdict.isCandidate = true;
     verdict.proofType = 'rce';
-    verdict.reproducible = HIGH_RISK_PROPS.has(property);
-    verdict.confidence = verdict.reproducible ? 0.50 : 0.30;
+    verdict.reproducible = true;
+    verdict.confidence = 0.50;
   }
 
   return verdict;

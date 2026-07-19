@@ -3,6 +3,7 @@ import { logger } from '../utils/logger.js';
 import { snapshotPrototype, detectAndRestorePrototype } from '../utils/prototype-monitor.js';
 import { classifyDiff } from './classify-diff.js';
 import { GATE_PROPERTIES } from './gate-properties.js';
+import { callAndAwaitReal, structuralSerialize } from '../utils/proto-safe.js';
 
 /**
  * Differential Execution Oracle
@@ -37,20 +38,16 @@ async function executeClean(fn, args, timeoutMs = 5000) {
     return arg;
   });
 
-  let timer;
   try {
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-    });
-    const execution = Promise.resolve(fn(...trackedArgs));
-    result.output = await Promise.race([execution, timeout]);
+    // callAndAwaitReal never adopts the target's return value as a thenable, so
+    // a polluted `then` can't self-trigger; it applies the timeout to a genuine
+    // async result. box.value is the raw return (see proto-safe.js).
+    result.output = (await callAndAwaitReal(fn, trackedArgs, timeoutMs)).value;
     // Drain microtask queue for consistent comparison with polluted run
     await new Promise(r => setTimeout(r, 0));
     await new Promise(r => setTimeout(r, 0));
   } catch (error) {
     result.error = error.message;
-  } finally {
-    clearTimeout(timer);
   }
 
   if (taintLog.length > 0) {
@@ -118,7 +115,6 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
   let trapReadCount = 0;
   let trapVal = val;
 
-  let timer;
   try {
     try {
       Object.defineProperty(Object.prototype, prop, {
@@ -139,11 +135,7 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
       Object.prototype[prop] = val;
     }
 
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-    });
-    const execution = Promise.resolve(fn(...trackedArgs));
-    result.output = await Promise.race([execution, timeout]);
+    result.output = (await callAndAwaitReal(fn, trackedArgs, timeoutMs)).value;
 
     // Drain microtask queue: some libraries schedule reads via Promise.resolve().then()
     // or process.nextTick(). Without draining, the getter trap is torn down before the
@@ -154,8 +146,6 @@ async function executePolluted(fn, args, pollutionDescriptor, timeoutMs = 5000) 
   } catch (error) {
     result.error = error.message;
   } finally {
-    clearTimeout(timer);
-
     // Restore: remove our descriptor, then reinstate original if it existed
     try { delete Object.prototype[prop]; } catch { /* sealed */ }
     if (hadProperty) {
@@ -206,8 +196,8 @@ function diffResults(cleanResult, pollutedResult, pollutionDescriptor) {
   };
 
   // Compare outputs
-  const cleanOutput = normalizeOutput(cleanResult.output);
-  const pollutedOutput = normalizeOutput(pollutedResult.output);
+  const cleanOutput = structuralSerialize(cleanResult.output);
+  const pollutedOutput = structuralSerialize(pollutedResult.output);
   diff.outputChanged = cleanOutput !== pollutedOutput;
 
   if (diff.outputChanged) {
@@ -259,13 +249,6 @@ function diffResults(cleanResult, pollutedResult, pollutionDescriptor) {
   Object.assign(diff, verdict);
 
   return diff;
-}
-
-function normalizeOutput(output) {
-  if (output === null || output === undefined) return '';
-  if (typeof output === 'string') return output;
-  if (typeof output === 'function') return '[function]';
-  try { return JSON.stringify(output); } catch { return String(output); }
 }
 
 /**
@@ -330,10 +313,7 @@ export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 50
     let output = null;
     let error = null;
     try {
-      const timeoutPromise = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-      });
-      output = await Promise.race([Promise.resolve(fn(...args)), timeoutPromise]);
+      output = (await callAndAwaitReal(fn, args, timeoutMs)).value;
     } catch (e) {
       error = e.message;
       logger.debug(`MergePP execution error: ${error}`);
@@ -384,10 +364,7 @@ export async function executeMergePPTest(fn, baseArgs, prop, val, timeoutMs = 50
     let error = null;
     let timer;
     try {
-      const timeoutPromise = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-      });
-      output = await Promise.race([Promise.resolve(fn({}, pathStr, pathVal)), timeoutPromise]);
+      output = (await callAndAwaitReal(fn, [{}, pathStr, pathVal], timeoutMs)).value;
     } catch (e) {
       error = e.message;
     } finally {
@@ -479,10 +456,7 @@ export async function executeURLGadgetTest(fn, prop, val, timeoutMs = 5000) {
     let error = null;
     let timer;
     try {
-      const timeoutPromise = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-      });
-      output = await Promise.race([Promise.resolve(callFn({}, payload)), timeoutPromise]);
+      output = (await callAndAwaitReal(callFn, [{}, payload], timeoutMs)).value;
     } catch (e) {
       error = e.message;
     } finally {
@@ -606,10 +580,7 @@ export async function executeForcedBranchDifferential(fn, args, pollutionDescrip
       result.forcedGates.push(gate);
     }
 
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-    });
-    result.output = await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
+    result.output = (await callAndAwaitReal(fn, trackedArgs, timeoutMs)).value;
 
     // Drain microtask queue
     await new Promise(r => setTimeout(r, 0));
@@ -733,10 +704,7 @@ export async function executeMultiPropertyDifferential(fn, args, descriptors, ti
       }
     }
 
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-    });
-    result.output = await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
+    result.output = (await callAndAwaitReal(fn, trackedArgs, timeoutMs)).value;
   } catch (error) {
     result.error = error.message;
   } finally {
@@ -794,10 +762,7 @@ export async function discoverUOPProperties(fn, args, timeoutMs = 5000) {
 
   let timer;
   try {
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => reject(new Error('Execution timeout')), timeoutMs);
-    });
-    await Promise.race([Promise.resolve(fn(...trackedArgs)), timeout]);
+    await callAndAwaitReal(fn, trackedArgs, timeoutMs);
   } catch {
     // Errors are expected - we just want the taint log
   } finally {
@@ -817,83 +782,4 @@ export async function discoverUOPProperties(fn, args, timeoutMs = 5000) {
   }
 
   return [...uopProps];
-}
-
-/**
- * Verify a confirmed gadget produces actual code execution.
- *
- * For confirmed gadgets (Tier 0-2), this re-runs the execution with
- * a canary-based payload that writes a unique token to a global variable.
- * If the token is present after execution, we have proof of code execution.
- *
- * This turns "property was read and behavior changed" into "attacker-controlled
- * code actually executed."
- *
- * @param {Function} fn - Entry point function
- * @param {Array} args - Arguments
- * @param {string} property - The property to pollute
- * @param {number} timeoutMs
- * @returns {{ verified: boolean, executionProof: string|null, payloadType: string|null }}
- */
-export async function verifyExploit(fn, args, property, timeoutMs = 5000) {
-  const canaryToken = `__UOPFUZZ_CANARY_${Date.now()}_${Math.random().toString(36).slice(2)}__`;
-
-  // Payloads that prove code execution by setting a global canary
-  const verificationPayloads = [
-    {
-      type: 'function_call',
-      value: new Function(`globalThis.__uopfuzz_canary = "${canaryToken}"`),
-      check: () => globalThis.__uopfuzz_canary === canaryToken,
-    },
-    {
-      type: 'eval_string',
-      value: `globalThis.__uopfuzz_canary = "${canaryToken}"`,
-      check: () => globalThis.__uopfuzz_canary === canaryToken,
-    },
-    {
-      type: 'constructor_chain',
-      value: `constructor.constructor("globalThis.__uopfuzz_canary = '${canaryToken}'")()\u0000`,
-      check: () => globalThis.__uopfuzz_canary === canaryToken,
-    },
-  ];
-
-  for (const payload of verificationPayloads) {
-    // Clean up canary from previous attempt
-    delete globalThis.__uopfuzz_canary;
-
-    const snapshot = snapshotPrototype();
-    const hadProperty = Object.prototype.hasOwnProperty.call(Object.prototype, property);
-    const originalValue = Object.prototype[property];
-
-    let timer;
-    try {
-      Object.prototype[property] = payload.value;
-
-      const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('timeout')), timeoutMs);
-      });
-      await Promise.race([Promise.resolve(fn(...args)), timeout]);
-    } catch {
-      // Errors expected — we're testing exploit payloads
-    } finally {
-      clearTimeout(timer);
-      try { delete Object.prototype[property]; } catch { /* sealed */ }
-      if (hadProperty) {
-        try { Object.prototype[property] = originalValue; } catch { /* sealed */ }
-      }
-      detectAndRestorePrototype(snapshot);
-    }
-
-    if (payload.check()) {
-      delete globalThis.__uopfuzz_canary;
-      return {
-        verified: true,
-        executionProof: `Payload type '${payload.type}' on Object.prototype.${property} achieved code execution (canary: ${canaryToken})`,
-        payloadType: payload.type,
-      };
-    }
-  }
-
-  delete globalThis.__uopfuzz_canary;
-  return { verified: false, executionProof: null, payloadType: null };
 }

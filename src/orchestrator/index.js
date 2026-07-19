@@ -424,6 +424,16 @@ export class Orchestrator {
     const entryPoint = testInput.entryPoint;
     const proofType = diff.proofType || (diff.prototypePolluted ? 'pp' : 'rce');
 
+    // Reproduction is deterministic (same code, fresh processes, two agreeing
+    // runs), so a candidate that failed once will fail identically forever.
+    // Cache failed attempts by (property, entryPoint, proofType) and skip the
+    // respawn. This bounds cost — important now that Tier-5 reads reach
+    // reproduction without a name allowlist — and removes provably-redundant
+    // work across the ~1000-iteration loop.
+    if (!this._attemptedRepro) this._attemptedRepro = new Set();
+    const attemptSig = `${descriptor.property}:${entryPoint}:${proofType}`;
+    if (this._attemptedRepro.has(attemptSig)) return false;
+
     // Without an installable/require-able package we cannot reproduce in a fresh
     // process, so we cannot prove it → record as a candidate, never confirm.
     let proof = null;
@@ -514,7 +524,10 @@ export class Orchestrator {
       return true;
     }
 
-    // Not proven → unproven candidate (never counted as a vulnerability).
+    // Not proven → unproven candidate (never counted as a vulnerability). If a
+    // reproduction was actually attempted, remember it so the deterministic
+    // failure is not re-run on every later iteration.
+    if (pkg && diff.reproducible !== false) this._attemptedRepro.add(attemptSig);
     const candSig = `${proofType}:${descriptor.property}:${entryPoint}`;
     if (!this.results.candidateChains.some(c => c.sig === candSig)) {
       this.results.candidateChains.push({

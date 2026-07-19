@@ -100,6 +100,36 @@ describe('reproduction harness — hermetic fixtures (offline)', () => {
   });
 });
 
+// ─── Harness self-trigger category (offline) ─────────────────────────────────
+// The jQuery Event/`then` false positive was one member of a category: a
+// polluted property that the engine or the harness itself invokes on the
+// target's return value — `then` (thenable adoption via await/Promise.resolve)
+// and the coercion hooks `toString`/`valueOf`/`toJSON` (String()/JSON.stringify
+// during output serialization). None of these must ever look like the TARGET
+// did something.
+describe('harness never self-triggers a polluted engine-invoked property', () => {
+  const OBJECT_RETURNING = () => ({ a: 1, b: 'x' }); // returns an object, reaches no sink
+
+  test('discovery does not fake outputChanged/read when a coercion property is polluted', async () => {
+    for (const property of ['toString', 'valueOf', 'toJSON']) {
+      const { diff } = await executeDifferential(OBJECT_RETURNING, [{}], { property, value: 'PWN' });
+      assert.equal(diff.outputChanged, false,
+        `${property}: the harness's own serialization must not fake an output change`);
+      assert.equal(diff.pollutionWasRead, false,
+        `${property}: the harness must not read the polluted property while serializing`);
+      assert.equal(diff.isConfirmedGadget, false, `${property}: nothing real happened`);
+    }
+  });
+
+  test('reproduction does not confirm code-execution for then/coercion properties', async () => {
+    for (const property of ['then', 'toString', 'valueOf', 'toJSON']) {
+      const r = await reproduceRce(FIX('benign'), 'makeThing', { property, gates: [], minimalArgs: [{}] });
+      assert.equal(r.verified, false,
+        `polluting Object.prototype.${property} must not self-confirm through the harness`);
+    }
+  });
+});
+
 // ─── Discovery-oracle demotion (offline) ─────────────────────────────────────
 describe('discovery oracle demotes behavioral signals (offline)', () => {
   test('output change is a candidate, never a confirmed gadget', async () => {

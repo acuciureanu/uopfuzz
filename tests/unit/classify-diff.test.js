@@ -1,7 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
 
-import { classifyDiff, HIGH_RISK_PROPS } from '../../src/instrumentation/classify-diff.js';
+import { classifyDiff } from '../../src/instrumentation/classify-diff.js';
 
 /**
  * classifyDiff is the single tier ladder shared by both discovery oracles
@@ -70,20 +70,16 @@ describe('classifyDiff — tier ladder', () => {
     assert.equal(v.reproducible, true);
   });
 
-  test('Tier 5: high-risk property read with no observable change is reproducible', () => {
-    assert.ok(HIGH_RISK_PROPS.has('command'));
-    const v = classifyDiff({ property: 'command', pollutionWasRead: true });
-    assert.equal(v.isCandidate, true);
-    assert.equal(v.reproducible, true);
-    assert.equal(v.confidence, 0.50);
-  });
-
-  test('Tier 5: low-risk property read is a lead only, not reproducible', () => {
-    assert.ok(!HIGH_RISK_PROPS.has('someRandomOption'));
-    const v = classifyDiff({ property: 'someRandomOption', pollutionWasRead: true });
-    assert.equal(v.isCandidate, true);
-    assert.equal(v.reproducible, false);
-    assert.equal(v.confidence, 0.30);
+  // Tier 5 no longer depends on a property-name allowlist: any genuine read of a
+  // polluted property is worth a reproduction attempt, whatever it is called.
+  // Reproduction stays the real gate.
+  test('Tier 5: a read with no observable change is reproducible regardless of name', () => {
+    for (const property of ['command', 'someRandomOption', 'wildlyUnusualName']) {
+      const v = classifyDiff({ property, pollutionWasRead: true });
+      assert.equal(v.isCandidate, true, `${property} should be a candidate`);
+      assert.equal(v.reproducible, true, `${property} should be reproducible (no name gate)`);
+      assert.equal(v.confidence, 0.50);
+    }
   });
 
   test('nothing observed → no verdict', () => {

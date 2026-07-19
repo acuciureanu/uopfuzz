@@ -2,7 +2,7 @@ import { logger } from '../utils/logger.js';
 import { CoverageTracker } from '../utils/coverage.js';
 import { V8CoverageCollector } from '../utils/v8-coverage.js';
 import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
-import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest, verifyExploit } from './differential.js';
+import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
 import { classifyDiff } from './classify-diff.js';
 import { SandboxPool } from '../utils/sandbox-pool.js';
 import { packageBaseName } from '../utils/package-name.js';
@@ -693,28 +693,6 @@ export class Instrumentation {
     }
   }
 
-  /**
-   * Verify a confirmed gadget actually achieves code execution.
-   * Uses canary-based payloads to prove the polluted property reaches a code execution sink.
-   */
-  async verifyGadgetExploit(input, config, property) {
-    if (this.options.dryRun || !this.targetModule) return null;
-
-    const sequence = this._epIndex(config).seqByEntry.get(input.entryPoint);
-    const fn = this.buildCallableThunk(input, config, sequence);
-    if (!fn) return null;
-
-    const args = sequence
-      ? this.buildCallArgs(sequence.steps[0], input, config)
-      : (input.type === 'template' ? [input.value] : [input.value]);
-
-    try {
-      return await verifyExploit(fn, args, property, DIFF_CALL_TIMEOUT_MS);
-    } catch (error) {
-      logger.debug(`Exploit verification failed for ${property}: ${error.message}`);
-      return { verified: false, executionProof: null, payloadType: null };
-    }
-  }
 
   /**
    * Multi-property co-pollution differential test.
