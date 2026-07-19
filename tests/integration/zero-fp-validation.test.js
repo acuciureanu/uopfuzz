@@ -72,6 +72,17 @@ describe('reproduction harness — hermetic fixtures (offline)', () => {
     assert.equal(r.verified, false, 'a function that never reaches a sink must never reproduce');
   });
 
+  // Real-world false positive (jquery@latest Event/`then`): the RCE canary for a
+  // `then` payload is a function. Object.prototype.then = fn makes EVERY object
+  // thenable, so the harness's own Promise.resolve(returnValue)/await invokes the
+  // canary during thenable adoption — the target never runs attacker code. The
+  // proof must come from the target's execution, not the harness's plumbing.
+  test('does NOT confirm `then` code-execution via the harness adopting the return value', async () => {
+    const r = await reproduceRce(FIX('benign'), 'makeThing', { property: 'then', gates: [], minimalArgs: [{}] });
+    assert.equal(r.verified, false,
+      'polluting Object.prototype.then must not self-confirm through the harness await');
+  });
+
   test('confirms RCE that only fires once the compile()-returned function is invoked (two-step sequence)', async () => {
     // Mirrors CVE-2022-29078 (EJS): compile() alone never executes the gadget —
     // only calling the function it returns does. A reproduction driver that

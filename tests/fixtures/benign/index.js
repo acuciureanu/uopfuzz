@@ -7,4 +7,13 @@ function greet(opts) {
   return `hello ${name}`;
 }
 
-module.exports = { greet };
+// Returns a plain object and reaches no sink. Exists to pin a specific false
+// positive: if the reproduction harness wraps this return value in
+// Promise.resolve()/await, then polluting Object.prototype.then with a callable
+// canary makes the HARNESS invoke it during thenable adoption — "code execution"
+// that this function never performed.
+function makeThing(opts) {
+  return { ok: true, echoed: opts && opts.name };
+}
+
+module.exports = { greet, makeThing };

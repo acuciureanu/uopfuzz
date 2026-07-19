@@ -114,7 +114,7 @@ async function runSequence(targetModule, steps, timeoutMs, packageName) {
       if (!fn) return null;
     }
     const args = deserializeArgs(step.args || []);
-    lastResult = await withTimeout(Promise.resolve(fn(...args)), timeoutMs);
+    lastResult = await callAwaitingRealPromise(fn, args, timeoutMs);
   }
   return lastResult;
 }
@@ -230,7 +230,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
         if (Array.isArray(sequenceSteps) && sequenceSteps.length) {
           await runSequence(targetModule, sequenceSteps, timeoutMs, packageName);
         } else {
-          await withTimeout(Promise.resolve(fn(...clone(baseArgs))), timeoutMs);
+          await callAwaitingRealPromise(fn, clone(baseArgs), timeoutMs);
         }
       } catch { /* exploit payloads routinely throw after firing */ }
     } finally {
@@ -267,6 +267,24 @@ function withTimeout(promise, ms) {
     Promise.resolve(promise),
     new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms); }),
   ]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Invoke the target and await only a GENUINE promise result.
+ *
+ * `Promise.resolve(value)` and `await value` adopt any thenable by reading
+ * `value.then` and, if callable, invoking it. When the reproduction payload
+ * pollutes `Object.prototype.then` with a callable canary, EVERY returned object
+ * becomes thenable, so wrapping the target's return value would fire the canary
+ * from the harness's own plumbing — "code execution" the target never performed
+ * (observed as a false positive on jQuery's Event()). Gating on `instanceof
+ * Promise` awaits real async results (a native promise is awaited without a
+ * `.then` property read) while never adopting a plain return object, so the only
+ * way the canary can fire is the target actually reaching a sink.
+ */
+async function callAwaitingRealPromise(fn, args, ms) {
+  const ret = fn(...args);
+  return ret instanceof Promise ? await withTimeout(ret, ms) : ret;
 }
 
 function clone(arr) {
