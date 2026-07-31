@@ -122,10 +122,9 @@ export const BENCHMARK_CORPUS = [
 ];
 
 /**
- * Success thresholds — the project's stated criteria (docs/IDEA-ASSESSMENT.md
- * "Success criteria"): the benchmark PASSES only when the oracle detects at
- * least this fraction of vulnerable versions AND false-alarms on at most this
- * fraction of patched versions.
+ * Success thresholds: the benchmark PASSES only when the oracle detects at least
+ * this fraction of vulnerable versions AND false-alarms on at most this fraction
+ * of patched versions.
  */
 export const THRESHOLDS = {
   minTruePositiveRate: 0.90,
