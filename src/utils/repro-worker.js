@@ -77,6 +77,11 @@ process.on('disconnect', () => {
 // the original so eval/Function still execute for the execution-canary; for
 // child_process the original is already the blocked stub, so nothing spawns.
 const sinkArgs = [];
+// DOM sinks record {sink, value} (not just the value) so a confirmed client-side
+// gadget can name the exact sink (innerHTML, script.src, …) and emit an accurate
+// browser-URL PoC. Kept separate from sinkArgs so the code/command-sink path is
+// untouched.
+const domSinkHits = [];
 function installSinkRecorders() {
   const record = (arg) => { if (typeof arg === 'string') sinkArgs.push(arg); };
   const wrap = (obj, name) => {
@@ -150,7 +155,7 @@ let _domRecordedWindow = null;
 function installDomSinkRecorder(dom) {
   const win = dom?.window;
   if (!win || _domRecordedWindow === win) return; // already hooked for this DOM
-  installDomSinkHooksShared(dom, (_sink, value) => sinkArgs.push(value));
+  installDomSinkHooksShared(dom, (sink, value) => domSinkHits.push({ sink, value }));
   _domRecordedWindow = win;
 }
 
@@ -384,7 +389,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
     // after the reversible value transforms real gadget code applies (case fold,
     // dash/underscore, URL-encode). argContainsTransformedValue is a strict
     // superset of includes(), so this never loses a plain-substring match.
-    { type: 'sink_reach', make: () => sinkToken, fired: () => sinkArgs.some(a => argContainsTransformedValue(a, sinkToken)) },
+    { type: 'sink_reach', make: () => sinkToken, fired: () => sinkArgs.some(a => argContainsTransformedValue(a, sinkToken)) || domSinkHits.some(h => argContainsTransformedValue(h.value, sinkToken)) },
   ];
 
   for (const payload of payloads) {
@@ -400,6 +405,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
 
     delete globalThis[CANARY_GLOBAL];
     sinkArgs.length = 0;
+    domSinkHits.length = 0;
     const installed = [];
     try {
       installProp(prop, payload.make(), installed);
@@ -427,13 +433,16 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
     }
 
     if (payload.fired()) {
+      const domHit = domSinkHits.find(h => argContainsTransformedValue(h.value, sinkToken));
       delete globalThis[CANARY_GLOBAL];
       sinkArgs.length = 0;
-      return { verified: true, payloadType: payload.type, canary: token, gates };
+      domSinkHits.length = 0;
+      return { verified: true, payloadType: payload.type, canary: token, gates, sink: domHit?.sink || null };
     }
   }
   delete globalThis[CANARY_GLOBAL];
   sinkArgs.length = 0;
+  domSinkHits.length = 0;
   return { verified: false };
 }
 
