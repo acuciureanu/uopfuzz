@@ -12,7 +12,16 @@
   // SECURITY: Run as non-root user inside the container
   "remoteUser": "node",
 
-  // SECURITY: Drop ALL capabilities, add back only what's needed
+  // SECURITY: capability/privilege containment — dropped caps, seccomp (via the
+  // run args passed by the CLI), no-new-privileges, read-only rootfs (writable
+  // tmpfs for /tmp and the npm cache), non-root user, memory/PID caps.
+  //
+  // NOTE: network is intentionally NOT disabled. The tool installs the fuzzer's
+  // own dependencies (postCreateCommand) and each --target/benchmark package from
+  // npm, and queries OSV.dev — all of which need egress. This matches
+  // run-sandboxed.sh and the README "Safety model": the container provides
+  // capability containment, not network isolation. Add an external egress policy
+  // if you need to contain the network too.
   "runArgs": [
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges:true",
@@ -21,8 +30,7 @@
     "--tmpfs=/home/node/.npm:rw,noexec,nosuid,size=256m",
     "--memory=2g",
     "--cpus=2",
-    "--pids-limit=256",
-    "--network=none"
+    "--pids-limit=256"
   ],
 
   // Mount the project source as writable, everything else read-only
