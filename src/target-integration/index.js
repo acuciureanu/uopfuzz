@@ -172,13 +172,24 @@ export class TargetIntegration {
     // Only treat a plain, exact semver-ish string as a short-circuit candidate;
     // ranges/operators (^ ~ > < * | x, spaces) must go through npm.
     if (!/^[0-9][\w.\-+]*$/.test(version)) return false;
+    return this._installedVersion(packageName) === version;
+  }
+
+  /**
+   * The CONCRETE version npm actually installed for this package, read from
+   * node_modules/<pkg>/package.json, or null if unreadable. Used to reconcile a
+   * dist-tag / range / 'latest' spec down to an exact version — without which the
+   * reported version, the PoC, and (critically) the OSV/GitHub-Advisory-DB
+   * lookups all carry the literal "latest", making every advisory query miss and
+   * a known CVE masquerade as an undocumented finding.
+   */
+  _installedVersion(packageName) {
     try {
       const pkgJsonPath = path.join(process.cwd(), 'node_modules', packageName, 'package.json');
-      if (!fsSync.existsSync(pkgJsonPath)) return false;
-      const installed = JSON.parse(fsSync.readFileSync(pkgJsonPath, 'utf8'));
-      return installed.version === version;
+      if (!fsSync.existsSync(pkgJsonPath)) return null;
+      return JSON.parse(fsSync.readFileSync(pkgJsonPath, 'utf8')).version || null;
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -281,12 +292,27 @@ export class TargetIntegration {
    * @returns {{ config: object, module: object }} The auto-generated config and loaded module
    */
   async setupTargetFromPackage(packageSpec) {
-    const { name, version } = this.parsePackageSpec(packageSpec);
+    const { name, version: requestedVersion } = this.parsePackageSpec(packageSpec);
+    let version = requestedVersion;
 
     logger.info(`Setting up target from package: ${name}@${version}`);
 
     // Install the package
     await this.installPackage(name, version);
+
+    // Reconcile the requested spec ('latest', a dist-tag, or a semver range) to
+    // the CONCRETE version npm installed. Everything downstream — the reported
+    // version, the standalone PoC, and the OSV / GitHub-Advisory-DB lookups that
+    // decide known-cve vs undocumented — must key on an exact version, or a known
+    // CVE gets mislabelled as an undocumented 0-day (advisory queries for the
+    // literal "latest" match nothing).
+    if (!this.options.dryRun) {
+      const installed = this._installedVersion(name);
+      if (installed && installed !== version) {
+        logger.info(`Resolved ${name}@${version} to installed version ${installed}`);
+        version = installed;
+      }
+    }
 
     if (this.options.dryRun) {
       const config = {
