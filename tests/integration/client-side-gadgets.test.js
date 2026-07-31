@@ -26,9 +26,12 @@ describe('client-side script-src injection gadget', () => {
     assert.equal(r.payloadType, 'sink_reach');
     assert.equal(r.sink, 'script.src', 'the exact DOM sink must be identified');
     // The client-side PoC must be a browser exploit URL (not a Node require PoC),
-    // with the gadget property in the __proto__ query param.
-    assert.match(r.standalonePoC, /https:\/\/TARGET\/\?__proto__\[scriptSrc\]=/);
-    assert.match(r.standalonePoC, /constructor\[prototype\]\[scriptSrc\]=/);
+    // with the DISCOVERED gadget property in the __proto__ query param and a
+    // <PAYLOAD> placeholder — no hardcoded/invented exploit string.
+    assert.match(r.standalonePoC, /https:\/\/TARGET\/\?__proto__\[scriptSrc\]=<PAYLOAD>/);
+    assert.match(r.standalonePoC, /constructor\[prototype\]\[scriptSrc\]=<PAYLOAD>/);
+    assert.doesNotMatch(r.standalonePoC, /alert\(|attacker\.example|onerror=/,
+      'the PoC must not contain a hardcoded exploit payload');
   });
 
   test('the sandbox worker records the script.src DOM sink under jsdom', async () => {
