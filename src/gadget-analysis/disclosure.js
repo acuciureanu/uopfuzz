@@ -7,16 +7,19 @@ import { packageBaseName } from '../utils/package-name.js';
 /**
  * Disclosure-status classifier.
  *
- * "Undocumented" means no public advisory (static DB or OSV.dev) covers this
- * finding. A tool that re-discovers a documented CVE has not found anything
- * undocumented. This module cross-references a reproduction-proven finding
- * against (1) the built-in static known-vulnerability database
- * (known-gadgets.js), (2) — when available — live OSV.dev advisories, and (3)
- * this tool's own durable discovery store, labelling it:
+ * "Undocumented" means NO public advisory covers this finding. A tool that
+ * re-discovers a documented CVE has not found anything undocumented. This module
+ * cross-references a reproduction-proven finding against (1) the built-in static
+ * known-vulnerability database (known-gadgets.js), (2) — when available — live
+ * advisories from BOTH OSV.dev AND the GitHub Advisory Database (the npm bulk
+ * endpoint; merged into the same `osvVulns` array upstream because OSV alone
+ * misses real npm PP advisories and would mislabel them as undocumented), and
+ * (3) this tool's own durable discovery store, labelling it:
  *
- *   - 'known-cve'                  : a documented advisory (static DB and/or OSV)
- *                                    covers this package@version. Good for
- *                                    regression, not undocumented.
+ *   - 'known-cve'                  : a documented advisory (static DB, OSV.dev,
+ *                                    and/or the GitHub Advisory DB) covers this
+ *                                    package@version. Good for regression, not
+ *                                    undocumented.
  *   - 'undocumented-vulnerability' : no known advisory covers it and this tool
  *                                    has never recorded it before. A candidate
  *                                    undocumented vulnerability (still needs
@@ -31,7 +34,8 @@ import { packageBaseName } from '../utils/package-name.js';
  * 'undocumented-vulnerability' with the flag set — a regression triage signal,
  * distinct from a clean first sighting).
  *
- * `source` records provenance of a known-cve label: 'static' | 'osv' | 'static+osv'.
+ * `source` records provenance of a known-cve label: 'static' | 'osv' | 'ghsa' |
+ * 'static+osv' | 'static+ghsa'.
  *
  * OSV is class-aware: only prototype-pollution advisories (see
  * src/sources/osv.js `isPrototypePollution`) may flip a finding to known-cve.
@@ -87,9 +91,15 @@ function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regress
   const osv = osvKnownCve(osvVulns, version);            // PP-class match or null
   const otherAdv = osvOtherAdvisories(osvVulns, version); // non-PP ids (FYI only)
   const osvNote = otherAdv.length
-    ? `OSV lists ${otherAdv.length} other (non-prototype-pollution) advisor${otherAdv.length !== 1 ? 'ies' : 'y'} at this version: ${otherAdv.slice(0, 3).join(', ')}${otherAdv.length > 3 ? '…' : ''}.`
+    ? `Advisory sources list ${otherAdv.length} other (non-prototype-pollution) advisor${otherAdv.length !== 1 ? 'ies' : 'y'} at this version: ${otherAdv.slice(0, 3).join(', ')}${otherAdv.length > 3 ? '…' : ''}.`
     : null;
   const withNote = (obj) => (osvNote ? { ...obj, osvNote } : obj);
+
+  // Which live source matched: the OSV array now also carries GitHub-Advisory-DB
+  // entries adapted to the OSV shape (marked `_source: 'ghsa'`), so report the
+  // real provenance rather than always crediting OSV.
+  const advSrc = osv?.vuln?._source === 'ghsa' ? 'ghsa' : 'osv';
+  const advName = advSrc === 'ghsa' ? 'GitHub Advisory DB' : 'OSV.dev';
 
   // Static DB confirms a documented range covering this version.
   if (staticInRange) {
@@ -97,21 +107,21 @@ function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regress
       label: 'known-cve',
       cve: staticInRange.cve || osv?.cve || null,
       matchedRange: staticInRange.versions,
-      source: osv ? 'static+osv' : 'static',
+      source: osv ? `static+${advSrc}` : 'static',
     });
   }
 
   // Static DB documents the package but this version is outside its range.
   if (staticOutOfRange) {
     if (osv) {
-      // OSV independently confirms this version IS affected → static DB is stale,
-      // not a regression. Clean known-cve, no human triage needed.
+      // A live advisory independently confirms this version IS affected → static
+      // DB is stale, not a regression. Clean known-cve, no human triage needed.
       return withNote({
         label: 'known-cve',
         cve: osv.cve,
         matchedRange: osv.matchedRange,
-        source: 'osv',
-        note: `OSV advisory ${osv.cve} confirms ${pkg}@${version} is affected; the static DB's documented range (${staticOutOfRange.versions}) appears stale.`,
+        source: advSrc,
+        note: `${advName} advisory ${osv.cve} confirms ${pkg}@${version} is affected; the static DB's documented range (${staticOutOfRange.versions}) appears stale.`,
       });
     }
     return withNote({
@@ -129,7 +139,7 @@ function combineWithOsv({ pkg, version, staticInRange, staticOutOfRange, regress
       label: 'known-cve',
       cve: osv.cve,
       matchedRange: osv.matchedRange,
-      source: 'osv',
+      source: advSrc,
     });
   }
 
