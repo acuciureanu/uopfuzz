@@ -1,5 +1,6 @@
 import { logger } from '../utils/logger.js';
 import { createTaintProxy } from '../utils/taint-proxy.js';
+import { defuseResult } from '../utils/proto-safe.js';
 
 /**
  * Automatic Target Discovery
@@ -402,12 +403,10 @@ function looksLikeMerge(fn) {
  * take the run down — a probe must never do that. Attaching a no-op handler
  * marks it handled; the value is still returned for shape inspection.
  */
-function defuse(value) {
-  if (value && (typeof value === 'object' || typeof value === 'function') && typeof value.then === 'function') {
-    try { value.then(() => {}, () => {}); } catch { /* not a real promise */ }
-  }
-  return value;
-}
+// Neutralise a probed value so a returned thenable or EventEmitter (e.g. the
+// Server from express `app.listen(<fuzzed>)`) can't crash discovery. Shared with
+// the fuzzing paths via proto-safe.js so they all defend identically.
+const defuse = defuseResult;
 
 // Representative shapes for the factory probe: a template string (compile
 // pattern) and a bare options object (factory pattern).
@@ -638,7 +637,7 @@ async function tryCall(fn, args, timeoutMs = 2000) {
       timer = setTimeout(() => reject(new Error('probe timeout')), timeoutMs);
     });
     const execution = withSuppressedConsole(() => Promise.resolve(fn(...args)));
-    const value = await Promise.race([execution, timeout]);
+    const value = defuse(await Promise.race([execution, timeout]));
     return { success: true, value };
   } catch {
     return { success: false, value: null };
@@ -657,7 +656,7 @@ async function tryConstruct(fn, args, timeoutMs = 2000) {
       timer = setTimeout(() => reject(new Error('probe timeout')), timeoutMs);
     });
     const execution = withSuppressedConsole(() => Promise.resolve(new fn(...args)));
-    const value = await Promise.race([execution, timeout]);
+    const value = defuse(await Promise.race([execution, timeout]));
     return { success: true, value };
   } catch {
     return { success: false, value: null };
@@ -722,10 +721,10 @@ async function discoverPropertiesFromProbe(fn, probe) {
     // Try regular call; if it fails and fn looks like a constructor, try new
     let result;
     try {
-      result = await Promise.race([Promise.resolve(fn(...args)), timeout]);
+      result = defuse(await Promise.race([Promise.resolve(fn(...args)), timeout]));
     } catch {
       if (isLikelyConstructor(fn)) {
-        result = await Promise.race([Promise.resolve(new fn(...args)), timeout]);
+        result = defuse(await Promise.race([Promise.resolve(new fn(...args)), timeout]));
       } else {
         throw new Error('call failed');
       }

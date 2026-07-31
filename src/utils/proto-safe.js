@@ -24,6 +24,7 @@
 // replaces global.setTimeout with a logging stub that returns a sentinel
 // string, and the timeout race in callAndAwaitReal needs a genuine timer.
 import { setTimeout as realSetTimeout, clearTimeout as realClearTimeout } from 'node:timers';
+import { EventEmitter } from 'node:events';
 
 // Captured once at module load, before any pollution, so the serializer's own
 // property enumeration cannot be redirected by a polluted prototype.
@@ -123,7 +124,40 @@ export async function callAndAwaitReal(fn, args, timeoutMs) {
   } else {
     resolved = ret;
   }
+  defuseResult(resolved);
   const box = Object.create(null);
   box.value = resolved;
   return box;
+}
+
+/**
+ * Neutralise a value a target call returned so it cannot crash the fuzzer:
+ *   - a thenable gets a no-op catch (an unhandled rejection would otherwise
+ *     surface later), and
+ *   - an EventEmitter (e.g. the Server that `express app.listen(<fuzzed>)`
+ *     returns) gets a no-op 'error' listener and is closed — an unhandled
+ *     'error' event becomes an uncaught exception that kills the process, and a
+ *     leaked server/socket holds a live handle.
+ * Single source of truth so every execution path (discovery, Phase-A, the
+ * differential oracle) defends the same way.
+ */
+export function defuseResult(value) {
+  if (!value || (typeof value !== 'object' && typeof value !== 'function')) return value;
+  // CRITICAL: use `instanceof` (a prototype-chain check that INVOKES nothing),
+  // never a `typeof value.then`/`value.on` property read. Reading `.then`/`.on`
+  // on an arbitrary object would resolve through a POLLUTED Object.prototype and
+  // invoking it would self-trigger — the exact failure callAndAwaitReal exists to
+  // avoid.
+  //
+  // Real native Promise: a no-op catch so a rejection never surfaces unhandled.
+  if (value instanceof Promise) {
+    try { value.then(() => {}, () => {}); } catch { /* ignore */ }
+  }
+  // Genuine EventEmitter (Server/socket/stream from e.g. express app.listen()):
+  // absorb its async 'error' event so it can't become an uncaught exception that
+  // kills the run. `.on` here is EventEmitter.prototype.on, not a polluted one.
+  if (value instanceof EventEmitter) {
+    try { value.on('error', () => {}); } catch { /* ignore */ }
+  }
+  return value;
 }

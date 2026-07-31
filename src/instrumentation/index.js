@@ -6,6 +6,7 @@ import { createTaintProxy, analyzeTaintLog } from '../utils/taint-proxy.js';
 import { executeDifferential, executeMultiPropertyDifferential, executeForcedBranchDifferential, discoverUOPProperties, executeMergePPTest, executeURLGadgetTest } from './differential.js';
 import { classifyDiff } from './classify-diff.js';
 import { argContainsTransformedValue } from '../utils/value-contains.js';
+import { defuseResult } from '../utils/proto-safe.js';
 import { SandboxPool } from '../utils/sandbox-pool.js';
 import { packageBaseName } from '../utils/package-name.js';
 import { isBrowserOnly } from '../utils/browser-env.js';
@@ -1412,9 +1413,13 @@ export class Instrumentation {
         timer = realSetTimeout(() => reject(new Error('Execution timeout')), 5000);
       });
 
-      const execution = Promise.resolve(fn(...args));
-
-      return await Promise.race([execution, timeout]);
+      // Defuse the raw return synchronously (before any async 'error' fires),
+      // then again after awaiting — a target that returns a Server/socket (e.g.
+      // express app.listen(<fuzzed>)) would otherwise crash the run with an
+      // unhandled 'error' event.
+      const raw = fn(...args);
+      defuseResult(raw);
+      return defuseResult(await Promise.race([Promise.resolve(raw), timeout]));
 
     } catch (error) {
       logger.debug(`Safe execution failed: ${error.message}`);
