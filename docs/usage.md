@@ -211,5 +211,5 @@ node src/cli.js --config config/targets/pug.yaml \
 
 ## Requirements
 
-Node.js ≥ 18 (`package.json` `engines`). Target packages are installed via npm at
+Node.js ≥ 20 (`package.json` `engines`). Target packages are installed via npm at
 run time, so npm and network access are required for `--target`.

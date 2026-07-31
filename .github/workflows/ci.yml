@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        node-version: ['18', '20', '22'] # matches package.json engines (>=18)
+        node-version: ['20', '22'] # matches package.json engines (>=20); needs node:inspector/promises (Node 19+)
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

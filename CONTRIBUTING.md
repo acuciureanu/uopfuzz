@@ -13,7 +13,7 @@ and the README's "Safety model" for what is and isn't isolated.
 
 ## Development setup
 
-Requires Node.js **>= 18**.
+Requires Node.js **>= 20**.
 
 ```bash
 git clone https://github.com/acuciureanu/uopfuzz.git
