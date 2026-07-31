@@ -50,7 +50,7 @@ program
   .option('--i-understand-untrusted-code', 'Proceed with --target on a non-sandboxed host (installs + EXECUTES an arbitrary npm package). Prefer the dev container / run-sandboxed.sh')
   .option('--allow-network', 'Allow network access during target execution')
   .option('--no-isolate', 'Run the whole session in this process instead of a crash-isolated child (for debugging; a target that corrupts Node internals can then take the fuzzer down)')
-  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only). Note: an OSV query reveals the analyzed package@version to a third party');
+  .option('--no-osv', 'Disable live advisory lookups (OSV.dev AND the GitHub Advisory DB / npm bulk endpoint); disclosure labels then use the built-in DB only. Note: a lookup reveals the analyzed package@version to a third party (the npm registry already sees it on install)');
 
 program.action(async (options) => {
   try {
@@ -230,7 +230,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
-  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only)')
+  .option('--no-osv', 'Disable live advisory lookups (OSV.dev AND the GitHub Advisory DB); disclosure labels then use the built-in DB only')
   .option('--i-understand-untrusted-code', 'Run untrusted packages OUTSIDE a container (DANGEROUS — bypasses the host-safety gate)')
   .action(async (options) => {
     try {
@@ -308,7 +308,7 @@ program
   .option('--sandbox', 'Run in isolated child process (default: on)', true)
   .option('--no-sandbox', 'Disable child process isolation')
   .option('--allow-network', 'Allow network access during target execution')
-  .option('--no-osv', 'Disable live OSV.dev advisory lookups (disclosure labels use the built-in DB only)')
+  .option('--no-osv', 'Disable live advisory lookups (OSV.dev AND the GitHub Advisory DB); disclosure labels then use the built-in DB only')
   .option('--i-understand-untrusted-code', 'Run untrusted packages OUTSIDE a container (DANGEROUS — bypasses the host-safety gate)')
   .action(async (options) => {
     try {

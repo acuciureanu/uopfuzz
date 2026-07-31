@@ -18,6 +18,7 @@ import { generateSingleReport } from '../reporting/markdown-report.js';
 import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
 import { classifyFinding } from '../gadget-analysis/disclosure.js';
 import { fetchOsvVulns } from '../sources/osv.js';
+import { fetchNpmAdvisories, npmAdvisoryToOsvVuln } from '../sources/npm-advisories.js';
 import {
   loadDiscoveries,
   appendDiscoveryIfNew,
@@ -371,12 +372,24 @@ export class Orchestrator {
    *    run the differential oracle (clean vs polluted) and confirm gadgets.
    */
   /**
-   * Fetch live OSV.dev advisories for the target package@version, once per run,
-   * to enrich the disclosure-status classification. Fail-safe: never throws; leaves `this.osvVulns`
-   * null (→ static-DB-only classification) when disabled, dry-run, or unreachable
-   * (offline / --network=none / egress-blocked). NOT gated on --allow-network:
-   * that flag governs the untrusted target's egress, whereas this is a trusted
-   * read-only metadata call from the orchestrator itself. Opt out with --no-osv.
+   * Fetch live known-vulnerability advisories for the target package@version,
+   * once per run, to enrich the disclosure-status classification. Queries TWO
+   * independent sources and merges them into `this.osvVulns`:
+   *   1. OSV.dev (Google) — broad aggregator.
+   *   2. The GitHub Advisory Database via the npm bulk endpoint (what `npm audit`
+   *      uses). This is NOT redundant: OSV is missing real npm PP advisories
+   *      (e.g. deep-defaults CVE-2021-25944, deep-set GHSA-wgxm-rg53-h2c6), so
+   *      OSV-only classification manufactures false 0-day candidates. Both must
+   *      say "unknown" before a finding is labelled undocumented.
+   *
+   * The GHSA advisories are adapted into the OSV vuln shape (npmAdvisoryToOsvVuln)
+   * so the disclosure classifier consumes one uniform array with no changes.
+   *
+   * Fail-safe: never throws; leaves `this.osvVulns` null (→ static-DB-only) when
+   * disabled, dry-run, or unreachable (offline / egress-blocked). NOT gated on
+   * --allow-network: that flag governs the untrusted target's egress, whereas
+   * these are trusted read-only metadata calls from the orchestrator itself.
+   * Opt out of BOTH with --no-osv.
    */
   async fetchOsvData() {
     this.osvVulns = null;
@@ -385,13 +398,27 @@ export class Orchestrator {
     const version = this.config?.version;
     if (!pkg || !version) return;
 
-    const result = await fetchOsvVulns(pkg, version, { ecosystem: 'npm' }); // never throws
-    if (result.ok && result.vulns.length > 0) {
-      this.osvVulns = result.vulns;
-      logger.info(`OSV.dev: ${result.vulns.length} advisor${result.vulns.length !== 1 ? 'ies' : 'y'} for ${pkg}@${version}`);
-    } else if (!result.ok) {
-      logger.debug(`OSV.dev lookup unavailable for ${pkg}@${version}: ${result.error} (using static DB only)`);
+    const merged = [];
+
+    const osv = await fetchOsvVulns(pkg, version, { ecosystem: 'npm' }); // never throws
+    if (osv.ok && osv.vulns.length > 0) {
+      merged.push(...osv.vulns);
+      logger.info(`OSV.dev: ${osv.vulns.length} advisor${osv.vulns.length !== 1 ? 'ies' : 'y'} for ${pkg}@${version}`);
+    } else if (!osv.ok) {
+      logger.debug(`OSV.dev lookup unavailable for ${pkg}@${version}: ${osv.error} (falling back to other sources)`);
     }
+
+    // GitHub Advisory Database (npm bulk endpoint). Returns only advisories that
+    // affect this exact version, already adapted to the OSV shape on merge.
+    const ghsa = await fetchNpmAdvisories(pkg, version); // never throws
+    if (ghsa.ok && ghsa.advisories.length > 0) {
+      merged.push(...ghsa.advisories.map(a => npmAdvisoryToOsvVuln(a, version)));
+      logger.info(`GitHub Advisory DB: ${ghsa.advisories.length} advisor${ghsa.advisories.length !== 1 ? 'ies' : 'y'} for ${pkg}@${version}`);
+    } else if (!ghsa.ok) {
+      logger.debug(`GitHub Advisory DB lookup unavailable for ${pkg}@${version}: ${ghsa.error} (using remaining sources)`);
+    }
+
+    if (merged.length > 0) this.osvVulns = merged;
   }
 
   /**
