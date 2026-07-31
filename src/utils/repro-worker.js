@@ -29,7 +29,7 @@
 import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 import { hardenWorkerProcess } from './worker-hardening.js';
-import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
+import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS, installDomSinkHooks as installDomSinkHooksShared } from './browser-env.js';
 import { callAndAwaitReal } from './proto-safe.js';
 import { argContainsTransformedValue } from './value-contains.js';
 const require = createRequire(import.meta.url);
@@ -141,26 +141,16 @@ function installSinkRecorders() {
 }
 installSinkRecorders();
 
-// DOM-XSS sink: the innerHTML setter. jsdom only exists once loadPackage stands
-// it up for a browser-only target, so this recorder installs lazily there —
-// mirroring the discovery worker's DOM hook (sandbox-worker.js installDomSinkHooks).
+// DOM-XSS / script-injection sinks. jsdom only exists once loadPackage stands it
+// up for a browser-only target, so this recorder installs lazily there — via the
+// same shared hook the discovery worker uses (browser-env.js), so a polluted
+// value reaching innerHTML/outerHTML/insertAdjacentHTML/document.write/
+// setAttribute/<script|iframe|img>.src is recorded for the sink_reach proof.
 let _domRecordedWindow = null;
 function installDomSinkRecorder(dom) {
   const win = dom?.window;
   if (!win || _domRecordedWindow === win) return; // already hooked for this DOM
-  const proto = win.Element?.prototype;
-  if (!proto) return;
-  const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
-  if (desc?.set && desc.configurable !== false) {
-    const origSet = desc.set;
-    Object.defineProperty(proto, 'innerHTML', {
-      ...desc,
-      set(value) {
-        if (typeof value === 'string') sinkArgs.push(value);
-        return origSet.call(this, value);
-      },
-    });
-  }
+  installDomSinkHooksShared(dom, (_sink, value) => sinkArgs.push(value));
   _domRecordedWindow = win;
 }
 

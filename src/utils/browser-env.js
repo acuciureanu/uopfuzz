@@ -68,6 +68,62 @@ export async function setupJsdomGlobals() {
 }
 
 /**
+ * Install DOM-XSS / script-injection sink hooks on a jsdom window, invoking
+ * `record(sinkName, value)` for every string value that reaches a sink. Shared
+ * by the discovery worker (sandbox-worker.js) and the reproduction worker
+ * (repro-worker.js) so their DOM sink coverage cannot drift. Record-then-
+ * delegate: the real DOM operation still runs.
+ *
+ * Covers the sink classes client-side prototype-pollution gadgets funnel into —
+ * cf. the BlackFan/client-side-prototype-pollution catalog (jQuery, etc.):
+ * innerHTML, outerHTML, insertAdjacentHTML, document.write(ln), dangerous
+ * setAttribute targets (src/href/srcdoc/on*), and the `src` property of
+ * script/iframe/img elements. jsdom does not execute scripts here, so this
+ * proves REACHABILITY of a polluted value to a DOM-XSS sink, not execution.
+ */
+export function installDomSinkHooks(dom, record) {
+  const win = dom?.window;
+  if (!win) return;
+  const rec = (sink, v) => { if (typeof v === 'string') { try { record(sink, v); } catch { /* ignore */ } } };
+
+  const hookSetter = (proto, name, label) => {
+    if (!proto) return;
+    const desc = Object.getOwnPropertyDescriptor(proto, name);
+    if (desc?.set && desc.configurable !== false) {
+      const origSet = desc.set;
+      Object.defineProperty(proto, name, { ...desc, set(v) { rec(label || name, v); return origSet.call(this, v); } });
+    }
+  };
+  const hookMethod = (obj, name, pick) => {
+    if (!obj || typeof obj[name] !== 'function') return;
+    const orig = obj[name];
+    obj[name] = function (...args) { rec(name, pick(args)); return orig.apply(this, args); };
+  };
+
+  const el = win.Element?.prototype;
+  hookSetter(el, 'innerHTML');
+  hookSetter(el, 'outerHTML');
+  hookMethod(el, 'insertAdjacentHTML', a => a[1]);
+
+  if (el && typeof el.setAttribute === 'function') {
+    const orig = el.setAttribute;
+    const DANGER = new Set(['src', 'href', 'xlink:href', 'srcdoc', 'formaction', 'action', 'data', 'onerror', 'onload', 'onclick']);
+    el.setAttribute = function (name, value) {
+      if (typeof name === 'string' && DANGER.has(name.toLowerCase())) rec('setAttribute:' + name.toLowerCase(), value);
+      return orig.call(this, name, value);
+    };
+  }
+
+  const docProto = win.Document?.prototype;
+  hookMethod(docProto, 'write', a => a[0]);
+  hookMethod(docProto, 'writeln', a => a[0]);
+
+  for (const [tag, label] of [['HTMLScriptElement', 'script.src'], ['HTMLIFrameElement', 'iframe.src'], ['HTMLImageElement', 'img.src']]) {
+    hookSetter(win[tag]?.prototype, 'src', label);
+  }
+}
+
+/**
  * Load a browser-only CommonJS module against a prepared DOM. Prefers a
  * `<name>/factory` entry point invoked with `window` (jQuery's documented way to
  * get a DOM-bound instance); falls back to a plain require, which works once

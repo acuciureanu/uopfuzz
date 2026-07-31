@@ -16,7 +16,7 @@ import { createRequire } from 'module';
 import { snapshotPrototype, detectAndRestorePrototype } from './prototype-monitor.js';
 import { hardenWorkerProcess } from './worker-hardening.js';
 import { GATE_PROPERTIES } from '../instrumentation/gate-properties.js';
-import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS } from './browser-env.js';
+import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS, installDomSinkHooks as installDomSinkHooksShared } from './browser-env.js';
 import { callAndAwaitReal, structuralSerialize } from './proto-safe.js';
 import { V8CoverageCollector } from './v8-coverage.js';
 const require = createRequire(import.meta.url);
@@ -213,32 +213,17 @@ function isColdStart(packageName, browserEnv) {
 }
 
 // ─── DOM SINK HOOKS (browserEnv only) ────────────────────────
-// The classic DOM-XSS sink: the innerHTML setter. jsdom is stood up lazily when
-// a browser-only target first loads, so the hook installs lazily too — on that
-// jsdom's Element.prototype. Record-then-delegate, exactly like the code sinks
-// above: the assigned value is logged, then the real setter runs so the DOM
-// behaves normally. These hooks only RECORD; they confirm nothing.
-// Deliberately NOT hooked (YAGNI): ShadowRoot.innerHTML, outerHTML, and
-// insertAdjacentHTML — rarer sinks we have no fixtures or findings for; add
-// them when a real gadget needs them.
+// DOM-XSS / script-injection sinks (innerHTML, outerHTML, insertAdjacentHTML,
+// document.write, dangerous setAttribute, script/iframe/img src). Installed
+// lazily when a browser-only target first stands up jsdom, via the shared hook
+// in browser-env.js so discovery and reproduction cover the same sinks.
+// Record-then-delegate: the value is logged, then the real DOM op runs.
 let _domHookedWindow = null;
 function installDomSinkHooks(dom) {
   const win = dom?.window;
   if (!win || _domHookedWindow === win) return; // already hooked for this DOM
-  const proto = win.Element?.prototype;
-  if (!proto) return;
-  const desc = Object.getOwnPropertyDescriptor(proto, 'innerHTML');
-  if (desc?.set && desc.configurable !== false) {
-    const origSet = desc.set;
-    Object.defineProperty(proto, 'innerHTML', {
-      ...desc,
-      set(value) {
-        const a = typeof value === 'string' ? value.substring(0, 200) : '';
-        sinkLog.push({ sink: 'innerHTML', args: [a], timestamp: Date.now() });
-        return origSet.call(this, value);
-      },
-    });
-  }
+  installDomSinkHooksShared(dom, (sink, value) =>
+    sinkLog.push({ sink, args: [value.substring(0, 200)], timestamp: Date.now() }));
   _domHookedWindow = win;
 }
 

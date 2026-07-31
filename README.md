@@ -17,11 +17,23 @@
 
 UoPFuzz points coverage-guided fuzzing at a JavaScript library, pollutes
 `Object.prototype`, and watches whether the library reads an attacker-controlled
-property that reaches a dangerous sink (`eval`, `child_process.exec`,
-`innerHTML`, `http.request`, `fs.readFile`, …). The name comes from the
+property that reaches a dangerous sink. The name comes from the
 **undefined-oriented programming (UOP)** view: a library reads a property that
 *doesn't exist on the object*, so it resolves up the prototype chain to whatever
 an attacker planted there.
+
+It covers both server-side and client-side gadgets:
+
+- **Server-side** — code execution (`eval`, `Function`, `child_process.exec`),
+  template-compilation injection (e.g. EJS `outputFunctionName`), SSRF
+  (`http.request`), and LFI (`fs.readFile`).
+- **Client-side** — browser libraries load under jsdom, and DOM-XSS /
+  script-injection sinks are hooked (`innerHTML`, `outerHTML`,
+  `insertAdjacentHTML`, `document.write`, dangerous `setAttribute`, and
+  `script`/`iframe`/`img` `src`) — the gadget classes catalogued in
+  [BlackFan/client-side-prototype-pollution](https://github.com/BlackFan/client-side-prototype-pollution).
+  jsdom does not execute scripts, so client-side findings prove **reachability**
+  of a polluted value to a sink, not execution.
 
 What makes it different from a heuristic scanner: **a finding is only reported
 after it is independently reproduced in fresh, isolated child processes.** No
