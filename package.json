@@ -13,7 +13,8 @@
     "lint": "eslint src/ tests/",
     "dev": "node --watch src/cli.js",
     "benchmark": "node benchmark/run-benchmark.js",
-    "benchmark:self-test": "node benchmark/run-benchmark.js --self-test"
+    "benchmark:self-test": "node benchmark/run-benchmark.js --self-test",
+    "demo": "node scripts/gen-demo-cast.mjs && agg --font-size 22 --theme asciinema assets/demo.cast assets/demo.gif"
   },
   "keywords": [
     "security",

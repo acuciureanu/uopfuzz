@@ -1,133 +1,276 @@
-# UoPFuzz
+<h1 align="center">UoPFuzz</h1>
 
-A framework for finding prototype-pollution gadgets in JavaScript libraries. It
-takes the "undefined-oriented programming" (UOP) view — a library reads an
-attacker-controllable property that resolves through a polluted prototype chain
-— and searches for those reads reaching dangerous sinks.
+<p align="center">
+  <b>Find prototype-pollution gadgets in JavaScript libraries — and only report the ones that actually reproduce.</b>
+</p>
 
-## Overview
+<p align="center">
+  <a href="https://github.com/acuciureanu/uopfuzz/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/acuciureanu/uopfuzz/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
+  <img alt="Node >= 18" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen">
+  <img alt="Status: research" src="https://img.shields.io/badge/status-research-orange">
+</p>
 
-UoPFuzz combines coverage-guided fuzzing, a differential execution oracle
-(clean vs. polluted runs), and Proxy-based taint tracking to detect prototype
-pollution and pollution → sink gadgets in Node.js libraries, targeting sinks
-like `eval`, `child_process.exec`, `innerHTML`, `http.request`, and
-`fs.readFile`. It is a research tool, not a turnkey scanner.
+<p align="center">
+  <img src="assets/demo.gif" alt="UoPFuzz detecting and reproducing a prototype-pollution gadget" width="820">
+</p>
 
-### Reproduction-gated reporting
+UoPFuzz points coverage-guided fuzzing at a JavaScript library, pollutes
+`Object.prototype`, and watches whether the library reads an attacker-controlled
+property that reaches a dangerous sink (`eval`, `child_process.exec`,
+`innerHTML`, `http.request`, `fs.readFile`, …). The name comes from the
+**undefined-oriented programming (UOP)** view: a library reads a property that
+*doesn't exist on the object*, so it resolves up the prototype chain to whatever
+an attacker planted there.
 
-A finding is only reported as a **vulnerability** when it is *independently
-reproduced in fresh, isolated child processes* (twice) by a second oracle that
-computes ground-truth facts — either a **real prototype mutation** (an
-own-property added to a builtin prototype) or **real code execution** (a canary
-token reaching `globalThis` through a code sink). Behavioral heuristics
-(output/error changed, a property merely read) never confirm a vulnerability on
-their own; they are kept as clearly-labeled **unproven leads** for manual review.
-On the project's [ground-truth benchmark](benchmark/RESULTS.md) this yields a
-**0% false-positive rate** against patched versions — see the benchmark for the
-full picture, including a known miss. This is a strong empirical result, not an
-absolute guarantee. Every proven finding is cross-referenced against a built-in
-CVE database, live OSV.dev advisories, and this tool's own discovery store, and
-labeled **KNOWN CVE**, **PREVIOUSLY DISCOVERED**, or **UNDOCUMENTED
-VULNERABILITY** — and ships with a standalone, runnable PoC. See
-`src/verification/reproduce.js` and `tests/integration/zero-fp-validation.test.js`.
+What makes it different from a heuristic scanner: **a finding is only reported
+after it is independently reproduced in fresh, isolated child processes.** No
+reproduction, no vulnerability — just a clearly-labelled lead for manual review.
 
-> "Undocumented vulnerability" means *not present in the built-in advisory database or OSV.dev* — a candidate that still requires human verification against public advisories before disclosure. "Previously discovered" means this tool found the same bug on an earlier run, before any public advisory existed for it. The tool files nothing externally on its own.
+> ⚠️ **This is a research tool that executes untrusted code and generates real,
+> working exploits.** Read [Safety model](#safety-model) before pointing it at a
+> package you don't control.
 
-## Features
+---
 
-- **Configuration-driven**: YAML target definitions, or point `--target` at an npm `package@version` for auto-discovery
-- **Differential oracle**: confirms causation (this pollution caused this behaviour), not just correlation
-- **Coverage-guided fuzzing**: AFL-style edge bitmap plus V8 precise coverage steer input generation
-- **Parallel discovery**: `--parallel N` runs Phase-B probes across a pool of sandbox workers
-- **Isolation-aware**: target code IS executed — in a forked child for discovery,
-  and in fresh child processes for reproduction. It is not merely simulated; see
-  the **Safety model** below for what that means and how to run it responsibly.
-- **Real-world focus**: known-vulnerable libraries (e.g. pug 3.0.2, Squirrelly, hogan.js) and a ground-truth benchmark
+## Contents
 
-## Quick Start
+- [Why UoPFuzz](#why-uopfuzz)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Use cases](#use-cases)
+- [Understanding the output](#understanding-the-output)
+- [Reproduction-gated reporting](#reproduction-gated-reporting)
+- [Safety model](#safety-model)
+- [Documentation](#documentation)
+- [Contributing & security](#contributing--security)
+- [License](#license)
 
-```bash
-npm install
-# Auto-discovery: point it at a package@version — installs it, finds and verifies gadgets
-node src/cli.js --target lodash@4.17.4
-# Config-driven: use a YAML target spec
-node src/cli.js --config config/targets/pug.yaml --output results/
-# Multi-threaded execution for better performance
-node src/cli.js --config config/targets/pug.yaml --parallel 4 --output results/
+## Why UoPFuzz
+
+Prototype pollution is easy to *find* and hard to *prove*. A property read on a
+polluted prototype might be exploitable, or it might be a dead end. Most tooling
+stops at "this property was read" — which drowns you in false positives.
+
+UoPFuzz is built around a single discipline: **causation over correlation, and
+reproduction over heuristics.**
+
+- **Differential oracle** — runs the target twice (clean vs. polluted) and only
+  cares about behaviour the pollution *caused*.
+- **Reproduction gate** — every candidate is re-proven in two fresh Node
+  processes by a second, independent oracle that checks ground-truth facts (a
+  real own-property added to a builtin prototype, or a canary that actually
+  executes). On the project's [ground-truth benchmark](benchmark/RESULTS.md)
+  this yields a **0% false-positive rate** against patched versions.
+- **Runnable proof** — every confirmed finding ships a standalone PoC you can run
+  with `node`.
+
+It targets Node.js libraries (and browser-only libraries via jsdom), with a bias
+toward real, published, high-impact bugs.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[Target library<br/>--target pkg@ver or --config] --> B[Auto-discovery<br/>entry points + config]
+    B --> C[Phase A<br/>coverage-guided fuzzing]
+    C --> D[Phase B<br/>differential oracle<br/>clean vs. polluted]
+    D -->|behavioural lead| E[Reproduction gate<br/>2× fresh child processes]
+    E -->|proven| F[Confirmed finding<br/>+ standalone PoC]
+    E -->|not proven| G[Unproven lead<br/>manual review]
+    F --> H[Cross-reference<br/>CVE DB · OSV.dev · discovery store]
 ```
 
-`--target` installs the package from npm and executes its code — run untrusted
-targets inside the dev container (see the **Safety model** below). Full flag
-reference and the container invocation are in [`docs/usage.md`](docs/usage.md).
+| Stage | What it does |
+|-------|--------------|
+| **Target Integration** | Installs / loads the library and auto-generates entry points |
+| **Input Generation** | Coverage-guided fuzzing with UOP-specific mutations (Thompson-sampled strategies) |
+| **Instrumentation** | AFL-style edge coverage + V8 precise coverage + Proxy taint tracking |
+| **Gadget Analysis** | Turns pollution → sink traces into ranked candidates |
+| **Verification** | Reproduces each candidate in fresh child processes — the only thing that confirms a finding |
 
-## Architecture
+See [`docs/architecture.md`](docs/architecture.md) for the full pipeline.
 
-- **Target Integration**: Dynamic library loading and configuration management
-- **Input Generation**: Coverage-guided fuzzing with UOP-specific mutations
-- **Instrumentation**: Dynamic tracing — coverage bitmap + Proxy taint tracking
-- **Gadget Analysis**: Taint tracking and exploit chain identification
-- **Orchestrator**: Main workflow coordination and result aggregation
+## Install
+
+Requires **Node.js ≥ 18**.
+
+```bash
+git clone https://github.com/acuciureanu/uopfuzz.git
+cd uopfuzz
+npm install
+```
+
+## Quick start
+
+```bash
+# Point it at an npm package@version — installs it, finds and verifies gadgets
+node src/cli.js --target lodash@4.17.4
+
+# Or use a curated YAML target spec
+node src/cli.js --config config/targets/ejs.yaml --output results/
+```
+
+Confirmed findings and their PoCs are written under `results/`. Full flag
+reference is in [`docs/usage.md`](docs/usage.md).
+
+> `--target` installs a package from npm and **executes its code**. On a
+> non-sandboxed host the command refuses unless you pass
+> `--i-understand-untrusted-code`; the intended way to run untrusted targets is
+> the container (see [Safety model](#safety-model)).
+
+## Use cases
+
+<details open>
+<summary><b>1. Audit a dependency before you ship it</b></summary>
+
+Point UoPFuzz at the exact version in your lockfile. If it confirms a gadget,
+you get a runnable PoC and a CVE/OSV cross-reference telling you whether it's
+already public. If nothing reproduces, the run exits clean — no noise.
+
+```bash
+node src/cli.js --target deep-extend@0.5.0
+```
+</details>
+
+<details>
+<summary><b>2. Verify a patch actually fixes the bug (version regression scan)</b></summary>
+
+Scan a library across versions to see exactly where a vulnerability was
+introduced or fixed — great for validating a security advisory or your own
+patch.
+
+```bash
+node src/cli.js versions --library lodash.js --range 4.17.4..4.17.21
+```
+</details>
+
+<details>
+<summary><b>3. Reproduce a known CVE and get a PoC</b></summary>
+
+The curated configs under `config/targets/` model published CVEs (e.g. EJS
+CVE-2022-29078). UoPFuzz reproduces them end-to-end and drops a standalone PoC.
+
+```bash
+node src/cli.js --config config/targets/ejs.yaml
+```
+</details>
+
+<details>
+<summary><b>4. Hunt gadgets across many libraries at scale (mass mode)</b></summary>
+
+Sweep the most-used libraries from cdnjs and surface anything that reproduces.
+Run this **inside the container** — it installs and executes a lot of untrusted code.
+
+```bash
+./run-sandboxed.sh mass --top 50
+```
+</details>
+
+<details>
+<summary><b>5. Benchmark & research</b></summary>
+
+A ground-truth benchmark pairs known-vulnerable and patched versions and
+measures true-/false-positive rates end-to-end.
+
+```bash
+npm run benchmark          # full pipeline against real packages
+npm run benchmark:self-test  # scoring logic only, installs nothing
+```
+
+See [`benchmark/RESULTS.md`](benchmark/RESULTS.md) for the latest run.
+</details>
+
+## Understanding the output
+
+A run produces two kinds of result:
+
+- **Confirmed findings** (`confirmedChains`) — reproduced in fresh processes.
+  These are the real ones, and each ships a standalone PoC under `results/`.
+- **Unproven leads** (`candidateChains`) — a behavioural signal that did *not*
+  reproduce. Kept for manual review, never counted as a vulnerability.
+
+Every confirmed finding is labelled against the built-in CVE database, live
+OSV.dev advisories, and the tool's own discovery store:
+
+| Label | Meaning |
+|-------|---------|
+| **KNOWN CVE** | Matches a published advisory (built-in DB or OSV.dev) |
+| **PREVIOUSLY DISCOVERED** | This tool reproduced the same bug on an earlier run |
+| **UNDOCUMENTED VULNERABILITY** | Not in the advisory DB or OSV.dev — **a candidate that still needs human verification and responsible disclosure**, not a confirmed 0-day |
+
+The proof itself is one of: **prototype pollution** (a real own-property added to
+a builtin prototype), **code execution** (a canary token actually ran), or
+**sink reachability** (a polluted value reached a code/command sink argument —
+flow proven, execution not).
+
+## Reproduction-gated reporting
+
+A finding becomes a reported **vulnerability** only when a second oracle —
+sharing no verdict logic with discovery — reproduces its ground-truth condition
+in **two independent fresh Node processes**. Behavioural heuristics (output
+changed, a property merely read) never confirm on their own.
+
+On the [ground-truth benchmark](benchmark/RESULTS.md) this is a **0%
+false-positive rate** against patched versions. That's a strong empirical
+result, not an absolute guarantee. The tool **files nothing externally** — every
+disclosure decision is yours. See `src/verification/reproduce.js` and
+`tests/integration/zero-fp-validation.test.js`.
 
 ## Safety model
 
-Read this before pointing UoPFuzz at a package you do not control.
+**Target code is executed, not simulated.** Finding gadgets means *running* the
+library with attacker-shaped inputs, and reproduction deliberately lets a canary
+execute to prove code execution. Treat every target as untrusted code that will
+run on your machine.
 
-**Target code is executed, not simulated.** To find gadgets the fuzzer must run
-the library — repeatedly, with attacker-shaped inputs — and reproduction
-deliberately lets a canary payload actually execute to prove code execution. This
-is inherent to dynamic gadget hunting; treat every target as untrusted code that
-will run on your machine.
+> **The real isolation boundary is the container** (`run-sandboxed.sh`, backed by
+> `.devcontainer/`) — dropped capabilities, seccomp, `no-new-privileges`,
+> non-root user, memory/PID caps, no host secrets. **Run untrusted targets there.**
 
-**What isolates it — and what does not:**
+<details>
+<summary>What the in-process hardening does and does not cover</summary>
 
-- The **real isolation boundary is the container** (`run-sandboxed.sh`, backed by
-  `.devcontainer/`): it drops all Linux capabilities (`--cap-drop=ALL`), applies a
-  seccomp profile and `no-new-privileges`, runs as a non-root user, caps memory
-  and PIDs, and carries no host secrets in its environment. **Run untrusted
-  targets inside it.** Two honest caveats about what it does *not* do: network
-  egress is **open** — the container must reach npm to install targets and, unless
-  `--no-osv`, OSV.dev — so add an external egress policy if you need network
-  containment; and the filesystem is not fully ephemeral — the workspace is
-  mounted read-only, but `node_modules` is a **persistent named volume shared
-  across runs** and `results/` is written to a host bind mount. Rely on this layer
-  for capability/privilege containment, not for network or filesystem confinement.
-- Inside that boundary, every discovery mode that *calls* target code — the
-  single-property, forced-branch, and multi-property differentials, the merge-PP
-  and URL-gadget probes, and UOP-property discovery — plus reproduction, run in
-  **forked child processes** with best-effort in-process hardening
-  (`src/utils/worker-hardening.js`): outbound network (opt-in via
-  `--allow-network`), `child_process`, and `worker_threads` are monkey-patched
-  off, and known secret-bearing environment variables are stripped from the
-  child. These are speed bumps against low-effort/accidental bad behavior — **not
-  a sandbox** against a targeted exploit, which shares the process uid,
-  filesystem, and network namespace. Browser-only libraries (jQuery, Backbone, …)
-  load under a jsdom DOM *inside* that child too, so their fuzzed pollution — and
-  any network their DOM attempts (blocked here) — stays contained rather than
-  corrupting the fuzzer's own Node internals.
-- Two caveats keep this honest. First, the fuzzer's own process still runs some
-  target code unsandboxed: the target module is **`import()`ed there** to
-  auto-generate its config and entry points (so *module-load-time* code runs),
-  and auto-discovery then **invokes** the target's exported functions and
-  constructors, while the Phase-A coverage pass calls the entry point in-process
-  too — another reason the container is the boundary that matters. Second,
-  `--no-sandbox` runs *everything* (module load and every call) in-process. Only
-  fuzz code you trust outside the container.
+- Inside the container, every discovery mode that calls target code — plus
+  reproduction — runs in **forked child processes** with best-effort in-process
+  hardening (`src/utils/worker-hardening.js`): outbound network (opt-in via
+  `--allow-network`), `child_process`, and `worker_threads` are patched off, and
+  secret-bearing env vars are stripped. These are speed bumps, **not a sandbox**
+  against a targeted exploit — the child shares the process uid, filesystem, and
+  network namespace.
+- Browser-only libraries load under jsdom *inside* that child.
+- Honest caveats: the target module is `import()`ed in the fuzzer's own process
+  to auto-generate its config (so module-load code runs unsandboxed), and
+  auto-discovery invokes the target's functions in-process. `--no-sandbox` runs
+  *everything* in-process. The container is the boundary that matters.
+- The container gives capability/privilege containment, **not** network or
+  filesystem confinement: egress is open (npm/OSV), `node_modules` is a
+  persistent volume, and `results/` is a host bind-mount.
+
+</details>
 
 **Flags that lower the guardrails** (`--no-sandbox`, `--allow-scripts`,
-`--allow-suspicious`, `--allow-network`) are opt-in and print a warning. The
-supply-chain check (`src/utils/package-safety.js`) is a tripwire on lifecycle
-scripts and obvious obfuscation, not a malware scanner.
+`--allow-suspicious`, `--allow-network`) are opt-in and print a warning.
 
 **Use it ethically.** Only analyze packages you are authorized to test. Live
-network lookups (OSV.dev) telegraph the analyzed `package@version` to a third
-party — `--no-osv` opts out when hunting an unpublished bug. Generated PoCs under
-`results/` are **real, working exploits**: handle them as sensitive, and the tool
-files nothing externally on your behalf — disclosure is a human decision.
+OSV.dev lookups reveal the analyzed `package@version` to a third party
+(`--no-osv` opts out). Generated PoCs under `results/` are **real, working
+exploits** — handle them as sensitive, and disclose responsibly.
 
 ## Documentation
 
-See the `docs/` directory for detailed documentation on:
-- Architecture overview
-- Configuration format
-- Adding new target libraries
-- Interpreting results
+- [`docs/architecture.md`](docs/architecture.md) — pipeline and components
+- [`docs/configuration.md`](docs/configuration.md) — YAML target format
+- [`docs/usage.md`](docs/usage.md) — full CLI reference and the container workflow
+- [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — ground-truth benchmark
+
+## Contributing & security
+
+Contributions are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md). To report a
+security issue in the tool itself, or for the disclosure policy on findings, see
+[`SECURITY.md`](SECURITY.md).
+
+## License
+
+[MIT](LICENSE) © Alexandru Cuciureanu
