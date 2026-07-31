@@ -105,6 +105,7 @@ export async function reproduceRce(packageName, entryPoint, spec, opts = {}) {
     payloadType: first.payloadType,
     canary: first.canary,
     sink: first.sink || null,
+    urlChain: first.urlChain || null,
     gates,
     restriction: gates.length ? 'gated' : 'none',
     runs: REQUIRED_AGREEING_RUNS,
@@ -204,20 +205,37 @@ function buildBrowserGadgetPoC(pkg, version, entryPoint, spec, res) {
   const prop = spec.property;
   const sink = res.sink || (res.payloadType === 'sink_reach' ? 'a DOM sink' : 'a code-execution sink');
   const gateParams = (res.gates || []).map(g => `&__proto__[${encodeURIComponent(g)}]=1`).join('');
-  return `// PoC — CLIENT-SIDE prototype pollution gadget in ${specStr} via ${entryPoint}()
-// Reproduced independently in ${res.runs || 2} fresh processes: a controlled value
-// placed on Object.prototype.${prop} reaches ${sink}.
+  const shape = payloadShapeForSink(res.sink);
+  const chain = res.urlChain;
+
+  if (chain?.verified) {
+    // The target itself parses the URL and pollutes — the whole chain is verified
+    // within this one library (source + gadget), using its own parsing.
+    return `// PoC — CLIENT-SIDE prototype pollution gadget in ${specStr} via ${entryPoint}()
+// VERIFIED END-TO-END in ${res.runs || 2} fresh processes: ${pkg} parses this URL
+// query, pollutes Object.prototype.${prop}, which then reaches ${sink}. The chained
+// syntax "${chain.syntax}" was confirmed to pollute via the library's OWN parsing.
 //
-// ${pkg} reads Object.prototype.${prop} and routes it to ${sink}. On a page whose
-// client-side code pollutes Object.prototype from the URL, this triggers the gadget:
+//   https://TARGET/?${chain.syntax}=<PAYLOAD>${gateParams}
+//
+// <PAYLOAD> is your exploit for ${sink} (${shape}). The tool did not invent one —
+// it verified reachability. REACHABILITY, not script execution (jsdom does not run
+// scripts).`;
+  }
+
+  // Gadget-only: the URL → pollution step depends on a client-side PP SOURCE on
+  // the host page (a vulnerable query parser), which is external to this library
+  // and was NOT verified. Present the URL forms honestly as unverified.
+  return `// PoC — CLIENT-SIDE prototype pollution gadget in ${specStr} via ${entryPoint}()
+// Reproduced in ${res.runs || 2} fresh processes: a controlled value on
+// Object.prototype.${prop} reaches ${sink}. The URL → pollution step was NOT
+// verified (this library is a gadget, not a URL parser), so it requires a
+// client-side PP SOURCE on the target page.
 //
 //   https://TARGET/?__proto__[${prop}]=<PAYLOAD>${gateParams}
 //   https://TARGET/?constructor[prototype][${prop}]=<PAYLOAD>${gateParams}
 //
-// <PAYLOAD> is your exploit for ${sink} (${payloadShapeForSink(res.sink)}). The
-// tool did not invent one — it verified only that a controlled value reaches the
-// sink. REACHABILITY, not execution (jsdom does not run scripts); the full chain
-// also requires a client-side PP source on the target page.`;
+// <PAYLOAD> is your exploit for ${sink} (${shape}). The tool did not invent one.`;
 }
 
 function buildRcePoC(pkg, version, entryPoint, spec, res, browserEnv) {

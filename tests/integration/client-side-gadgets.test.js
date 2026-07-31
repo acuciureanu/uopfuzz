@@ -34,6 +34,16 @@ describe('client-side script-src injection gadget', () => {
       'the PoC must not contain a hardcoded exploit payload');
   });
 
+  test('gadget-only library: URL chain is NOT verified, PoC says a source is required', async () => {
+    const r = await reproduceRce(FIX('client-script-src-gadget'), 'loadWidget',
+      { property: 'scriptSrc' },
+      { browserEnv: true, blockNetwork: true });
+    assert.equal(r.verified, true);
+    assert.equal(r.urlChain?.verified ?? false, false, 'a gadget-only lib does not parse URLs, so no chain');
+    assert.match(r.standalonePoC, /client-side PP SOURCE/);
+    assert.match(r.standalonePoC, /NOT[\s/]+verified/);
+  });
+
   test('the sandbox worker records the script.src DOM sink under jsdom', async () => {
     const res = await executeInSandbox(FIX('client-script-src-gadget'), 'loadWidget', [{}], {
       mode: 'differential',
@@ -44,5 +54,22 @@ describe('client-side script-src injection gadget', () => {
     });
     const sinks = (res?.newSinkAccesses || res?.sinkAccesses || []).map(s => s.sink);
     assert.ok(sinks.includes('script.src'), `expected script.src sink, got: ${sinks.join(', ') || '(none)'}`);
+  });
+});
+
+describe('self-contained client-side chain (URL parser + DOM gadget)', () => {
+  test('verifies the chained URL -> pollution -> sink end-to-end via the library own parsing', async () => {
+    const r = await reproduceRce(FIX('client-url-source-gadget'), 'render',
+      { property: 'template' },
+      { browserEnv: true, blockNetwork: true });
+    assert.equal(r.verified, true, 'the DOM gadget must reproduce');
+    assert.equal(r.sink, 'innerHTML');
+    // The library also parses the URL, so the chain is verified — no assumed source.
+    assert.equal(r.urlChain?.verified, true, 'the URL -> pollution step must be verified');
+    assert.equal(r.urlChain.syntax, '__proto__[template]', 'the confirmed chained syntax is reported');
+    assert.match(r.standalonePoC, /VERIFIED END-TO-END/);
+    assert.match(r.standalonePoC, /https:\/\/TARGET\/\?__proto__\[template\]=<PAYLOAD>/);
+    // still no invented exploit payload
+    assert.doesNotMatch(r.standalonePoC, /alert\(|attacker\.example|onerror=/);
   });
 });

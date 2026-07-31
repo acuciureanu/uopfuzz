@@ -437,12 +437,49 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
       delete globalThis[CANARY_GLOBAL];
       sinkArgs.length = 0;
       domSinkHits.length = 0;
-      return { verified: true, payloadType: payload.type, canary: token, gates, sink: domHit?.sink || null };
+      // For client-side gadgets, also check whether the target ITSELF turns a
+      // chained/nested URL query string into this pollution — verifying the
+      // URL → pollution step with the target's own parsing (no embedded parser).
+      // A confirmed syntax makes the browser-URL PoC a verified end-to-end chain.
+      const urlChain = msg.browserEnv ? await verifyUrlChain(fn, prop, timeoutMs) : null;
+      return { verified: true, payloadType: payload.type, canary: token, gates, sink: domHit?.sink || null, urlChain };
     }
   }
   delete globalThis[CANARY_GLOBAL];
   sinkArgs.length = 0;
   domSinkHits.length = 0;
+  return { verified: false };
+}
+
+// Chained/nested URL query-string forms a vulnerable client-side parser turns
+// into prototype pollution. We feed the RAW query string to the target and check
+// whether IT parses the string and pollutes Object.prototype[prop] with a
+// generated marker — verifying the URL → pollution step with the target's OWN
+// parsing (no embedded parser, no hardcoded payload). Covers the canonical and
+// chained/nested syntaxes. Returns the exact syntax that verified, or unverified.
+async function verifyUrlChain(fn, prop, timeoutMs) {
+  const marker = `UOPFUZZ_URL_${prop}`;
+  const queries = [
+    `__proto__[${prop}]=${marker}`,
+    `constructor[prototype][${prop}]=${marker}`,
+    `a[__proto__][${prop}]=${marker}`,
+    `a[b][__proto__][${prop}]=${marker}`,
+  ];
+  for (const query of queries) {
+    // A parser might take the raw pairs, a leading-'?' string, or the query as a
+    // second argument (fn(target, query)).
+    for (const args of [[query], [`?${query}`], [{}, query]]) {
+      const had = Object.prototype.hasOwnProperty.call(Object.prototype, prop);
+      const orig = had ? Object.prototype[prop] : undefined;
+      try { await callAndAwaitReal(fn, clone(args), timeoutMs); }
+      catch { /* parse/exec errors are expected for non-parser entry points */ }
+      const polluted = Object.prototype.hasOwnProperty.call(Object.prototype, prop) &&
+        Object.prototype[prop] === marker;
+      try { delete Object.prototype[prop]; } catch { /* sealed */ }
+      if (had) { try { Object.prototype[prop] = orig; } catch { /* sealed */ } }
+      if (polluted) return { verified: true, syntax: query.split('=')[0] };
+    }
+  }
   return { verified: false };
 }
 
