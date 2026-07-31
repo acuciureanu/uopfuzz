@@ -1333,8 +1333,17 @@ export class Instrumentation {
     for (const argDef of (step.args || ['input'])) {
       switch (argDef) {
         case 'input':
-        case 'template':
           args.push(input.value);
+          break;
+        case 'template':
+          // Template engines only reach their compile step — where a polluted
+          // option (e.g. ejs `outputFunctionName`) is spliced into generated
+          // source — when handed a STRING template. The fuzzer's input.value is
+          // frequently a non-string here, which silently defeats the whole
+          // template-injection gadget class; fall back to a benign string.
+          args.push(typeof input.value === 'string' && input.value.length > 0
+            ? input.value
+            : '<p>uopfuzz</p>');
           break;
         case 'options':
           // Pass an empty options object - pollution comes from Object.prototype

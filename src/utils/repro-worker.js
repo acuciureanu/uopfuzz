@@ -381,6 +381,14 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
   const payloads = [
     { type: 'function_call', make: () => new Function(`globalThis['${CANARY_GLOBAL}']='${token}'`), fired: canaryFired },
     { type: 'eval_string', make: () => `globalThis['${CANARY_GLOBAL}']='${token}'`, fired: canaryFired },
+    // Template-compilation injection (ejs outputFunctionName, pug, hogan, …): the
+    // polluted value is spliced into GENERATED function source at an identifier /
+    // declaration position (e.g. `var <value> = ...`), so a bare
+    // `globalThis[...]=...` is a syntax error there. This payload is a valid
+    // identifier, then the canary statement, then re-supplies the identifier so
+    // the surrounding `var <ident> = ...` stays syntactically valid and runs. Still
+    // a plain string a prototype-pollution attacker can inject.
+    { type: 'template_injection', make: () => `x;globalThis['${CANARY_GLOBAL}']='${token}';x`, fired: canaryFired },
     { type: 'constructor_chain', make: () => `constructor.constructor("globalThis['${CANARY_GLOBAL}']='${token}'")()${nulChar}`, fired: canaryFired },
     // sink_reach fires when the planted token reaches a sink argument — even
     // after the reversible value transforms real gadget code applies (case fold,
@@ -410,7 +418,18 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
         if (Array.isArray(sequenceSteps) && sequenceSteps.length) {
           await runSequence(targetModule, sequenceSteps, timeoutMs, packageName);
         } else {
-          await callAndAwaitReal(fn, clone(baseArgs), timeoutMs);
+          // Try the discovery-supplied args first, then a few generic argument
+          // shapes. A template engine (ejs/hogan/…) only reaches the gadget when
+          // it's given a STRING template to compile; discovery often probes it
+          // with an object or empty value, which never triggers the sink. Extra
+          // shapes can only surface a REAL gadget — the canary still requires
+          // actual execution, so this adds recall without any false-positive
+          // risk. Stop as soon as the canary fires.
+          for (const av of argVariants(baseArgs)) {
+            try { await callAndAwaitReal(fn, clone(av), timeoutMs); }
+            catch { /* exploit payloads routinely throw after firing */ }
+            if (payload.fired()) break;
+          }
         }
       } catch { /* exploit payloads routinely throw after firing */ }
     } finally {
@@ -458,6 +477,19 @@ function clone(arr) {
     }
     return a;
   });
+}
+
+// Argument shapes reproRCE tries for a direct entry-point call. The
+// discovery-supplied args come first; when they aren't already a non-empty
+// string, a benign template string is added so string-template engines
+// (ejs/hogan/…) actually reach their compile step, where the polluted option is
+// spliced into generated source. Extra shapes only ever surface a REAL gadget —
+// the canary requires genuine execution — so there is no false-positive risk.
+function argVariants(baseArgs) {
+  const variants = [Array.isArray(baseArgs) ? baseArgs : [baseArgs]];
+  const firstIsNonEmptyString = typeof baseArgs?.[0] === 'string' && baseArgs[0].length > 0;
+  if (!firstIsNonEmptyString) variants.push(['<p>x</p>']);
+  return variants;
 }
 
 function lastKey(qualifiedName) {
