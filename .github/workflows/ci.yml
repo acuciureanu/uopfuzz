@@ -1,12 +1,15 @@
 name: CI
 
-# The safety net whose absence once let a silent detection-core crash ship
-# "green". Two jobs: a fast hermetic suite on every push/PR, and a real-package
-# ground-truth benchmark that fails the build if detection regresses.
+# Fast hermetic lint + test suite on every push/PR. The real-package
+# ground-truth benchmark is expensive (installs and runs dozens of packages),
+# so it runs weekly and on-demand rather than blocking every push.
 on:
   push:
     branches: ['**']
   pull_request:
+  schedule:
+    - cron: '0 6 * * 1' # Mondays 06:00 UTC — benchmark
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -36,6 +39,8 @@ jobs:
   benchmark:
     name: Ground-truth benchmark (real packages)
     runs-on: ubuntu-latest
+    # Expensive: only on the weekly schedule or a manual dispatch, never on push/PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # A GitHub-hosted runner is an ephemeral, throwaway VM — isolated from any
     # developer host — so installing/executing the curated corpus packages here
     # never touches a real machine. Installs still use the tool's default
