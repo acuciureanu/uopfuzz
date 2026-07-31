@@ -1,10 +1,44 @@
-import { test, describe } from 'node:test';
+import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert';
+import fs from 'node:fs';
+import os from 'node:os';
 import { TargetIntegration } from '../../src/target-integration/index.js';
 import { fileURLToPath } from 'url';
 import path from 'path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+describe('installed-version resolution (guards against known-CVE-as-0day mislabels)', () => {
+  // _installedVersion / _isInstalledAtVersion read node_modules/<pkg>/package.json
+  // relative to process.cwd(), so drive them from a temp cwd with a fake install.
+  let tmp, origCwd;
+  before(() => {
+    origCwd = process.cwd();
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'uopfuzz-ver-'));
+    fs.mkdirSync(path.join(tmp, 'node_modules', 'foo'), { recursive: true });
+    fs.writeFileSync(path.join(tmp, 'node_modules', 'foo', 'package.json'),
+      JSON.stringify({ name: 'foo', version: '1.0.5' }));
+    process.chdir(tmp);
+  });
+  after(() => { process.chdir(origCwd); fs.rmSync(tmp, { recursive: true, force: true }); });
+
+  test('_installedVersion reads the concrete version npm installed', () => {
+    const ti = new TargetIntegration({});
+    assert.equal(ti._installedVersion('foo'), '1.0.5');
+  });
+
+  test('_installedVersion returns null for a package that is not installed', () => {
+    const ti = new TargetIntegration({});
+    assert.equal(ti._installedVersion('not-there'), null);
+  });
+
+  test('_isInstalledAtVersion is exact-match only; a dist-tag never short-circuits', () => {
+    const ti = new TargetIntegration({});
+    assert.equal(ti._isInstalledAtVersion('foo', '1.0.5'), true);
+    assert.equal(ti._isInstalledAtVersion('foo', '1.0.4'), false);
+    assert.equal(ti._isInstalledAtVersion('foo', 'latest'), false);
+  });
+});
 
 describe('TargetIntegration', () => {
   test('should load valid configuration', async () => {
