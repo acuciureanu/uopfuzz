@@ -74,7 +74,12 @@ echo "[uopfuzz] Security: cap-drop=ALL, seccomp, no-new-privileges, memory=3g, p
 echo "[uopfuzz] Results  -> $RESULTS_DIR  (readable on the host)"
 echo ""
 
-docker run --rm -it \
+# Allocate a TTY only when attached to one. A batch loop (scripts/discovery) or
+# CI has no TTY, and `-it` there fails with "the input device is not a TTY".
+TTY_FLAGS=()
+[ -t 0 ] && [ -t 1 ] && TTY_FLAGS=(-it)
+
+docker run --rm "${TTY_FLAGS[@]}" \
   --cap-drop=ALL \
   --security-opt=no-new-privileges:true \
   --security-opt="seccomp=$SECCOMP" \
