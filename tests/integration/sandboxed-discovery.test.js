@@ -55,7 +55,9 @@ describe('sandboxed forced-branch discovery', () => {
     assert.equal(repro.verified, true);
     assert.equal(repro.runs, 2);
     assert.ok(repro.gates.includes('debug'));
-    assert.match(repro.standalonePoC, /Object\.prototype\.debug = true/);
+    // PoC uses bracket notation so any gate/property name is valid JS
+    // (e.g. Object.prototype["debug"] = true). Accept either notation.
+    assert.match(repro.standalonePoC, /Object\.prototype(?:\.debug|\["debug"\]) = true/);
     assert.match(repro.standalonePoC, /render\(/);
   });
 

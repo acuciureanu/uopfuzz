@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/acuciureanu/uopfuzz/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/acuciureanu/uopfuzz/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/acuciureanu/uopfuzz/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/acuciureanu/uopfuzz/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/License-MIT-blue.svg"></a>
   <img alt="Node >= 18" src="https://img.shields.io/badge/node-%3E%3D18-brightgreen">
   <img alt="Status: research" src="https://img.shields.io/badge/status-research-orange">

@@ -27,9 +27,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      # Fixtures are hermetic (no network); this exercises the detection oracle
-      # against purpose-built vulnerable/safe libraries and the reproduction gate.
-      - run: npm test
+      # Runs the suite serially (--test-concurrency=1). Many integration tests
+      # fork child processes and boot jsdom; running the files in parallel on a
+      # 2-core runner oversubscribes it and makes the timing-sensitive tests
+      # flake. Serial is slower but reliable.
+      - run: npm run test:ci
 
   benchmark:
     name: Ground-truth benchmark (real packages)
