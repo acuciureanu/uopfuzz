@@ -1,0 +1,85 @@
+# UoPFuzz Target Configuration for Pug v3.0.2
+# Known vulnerable template engine for prototype pollution
+# CVE-2021-21353: PP in pug leads to RCE via code generation
+
+name: "pug"
+package: "pug"
+version: "3.0.2"
+description: "Template engine vulnerable to prototype pollution leading to RCE"
+
+# Entry points - functions that accept user input
+entryPoints:
+  - name: "compile"
+    inputType: "template"
+    description: "Compile template string into a function"
+  - name: "render"
+    inputType: "template"
+    description: "Compile and render template in one call"
+
+# Multi-step call sequences for gadget discovery
+# Pug's compile() returns a function; calling it triggers code generation
+sequences:
+  - entryPoint: "compile"
+    steps:
+      - call: "compile"
+        args: ["template", "options"]
+      - call: "__result__"
+        args: ["locals"]
+  - entryPoint: "render"
+    steps:
+      - call: "render"
+        args: ["template", "options"]
+
+# Dangerous sinks - functions that could lead to RCE/XSS
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+  - "vm.runInThisContext"
+  - "vm.runInNewContext"
+
+# Properties that pug's compiler actually reads from options.
+# These are the real properties checked in pug's source code
+# (pug-code-gen, pug-filters, pug-lexer, pug-parser).
+pollutionPoints:
+  # Code generation options (pug-code-gen/index.js)
+  - "block"
+  - "debug"
+  - "compileDebug"
+  - "self"
+  - "pretty"
+  - "inlineRuntimeFunctions"
+  - "globals"
+  - "doctype"
+  # Parser/Lexer options
+  - "filename"
+  - "basedir"
+  - "plugins"
+  - "filters"
+  # Cache and runtime
+  - "cache"
+  - "name"
+  - "module"
+
+# Known vulnerable patterns for this target
+knownPatterns:
+  - description: "PP via block property leads to code injection in compiled function"
+    pattern: "__proto__.block"
+    sink: "Function"
+    reference: "CVE-2021-21353, Silent Spring (USENIX 2023)"
+
+  - description: "PP via compileDebug enables debug code path with eval"
+    pattern: "__proto__.compileDebug"
+    sink: "eval"
+    reference: "Feng et al., prototype pollution analysis"
+
+  - description: "PP via self changes variable scoping in compiled template"
+    pattern: "__proto__.self"
+    sink: "Function"
+    reference: "UOPF paper"
+
+# Testing configuration
+testConfig:
+  timeout: 30
+  maxDepth: 3
+  enableAsyncTesting: true

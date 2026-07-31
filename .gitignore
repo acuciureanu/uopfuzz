@@ -1,0 +1,67 @@
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Results and outputs
+results/
+results-*/
+test-results/
+test-results-*/
+*.log
+
+# Benchmark machine artifact (RESULTS.md is committed; the JSON is regenerated)
+benchmark/results.json
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+
+# package-lock.json IS tracked (CI uses `npm ci`, which requires it).
+yarn.lock
+
+# Coverage reports
+coverage/
+.nyc_output/
+
+# Runtime data
+pids
+*.pid
+*.seed
+*.pid.lock
+
+# Optional npm cache directory
+.npm
+
+# Optional eslint cache
+.eslintcache
+
+# Claude Code local state. `worktrees/` holds full checkouts created by
+# agent worktree-isolation runs; `settings.local.json` is per-machine.
+.claude/worktrees/
+.claude/settings.local.json

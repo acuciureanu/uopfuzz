@@ -1,0 +1,74 @@
+# UoPFuzz Target Configuration for SquirrellyJS v8.0.8
+# Template engine with known prototype pollution to RCE
+# CVE-2021-32819: PP leads to RCE via defaultFilter
+
+name: "squirrelly"
+package: "squirrelly"
+version: "8.0.8"
+description: "Lightweight template engine vulnerable to prototype pollution leading to RCE"
+
+entryPoints:
+  - name: "render"
+    inputType: "template"
+    description: "Render template with data and options"
+  - name: "compile"
+    inputType: "template"
+    description: "Compile template into reusable function"
+
+# Squirrelly.render(template, data, options) is the primary vector.
+# Squirrelly.compile(template)(data, options) is the two-step variant.
+sequences:
+  - entryPoint: "render"
+    steps:
+      - call: "render"
+        args: ["template", "locals", "options"]
+  - entryPoint: "compile"
+    steps:
+      - call: "compile"
+        args: ["template", "options"]
+      - call: "__result__"
+        args: ["locals", "options"]
+
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+
+# Properties that squirrelly actually reads from config/options:
+# Source: squirrelly/src/compile-string.ts, squirrelly/src/config.ts
+pollutionPoints:
+  # The critical one: defaultFilter is evaluated as code
+  - "defaultFilter"
+  # Template compilation options
+  - "autoEscape"
+  - "autoTrim"
+  - "tags"
+  - "varName"
+  - "parse"
+  - "plugins"
+  - "useWith"
+  - "functionHeader"
+  # Cache
+  - "cache"
+  - "templates"
+  - "async"
+  - "rmWhitespace"
+  - "root"
+  - "views"
+  - "e"
+  - "f"
+
+knownPatterns:
+  - description: "PP via defaultFilter leads to arbitrary code execution via Function constructor"
+    pattern: "__proto__.defaultFilter"
+    sink: "Function"
+    reference: "CVE-2021-32819"
+
+  - description: "PP via autoEscape changes output escaping behavior"
+    pattern: "__proto__.autoEscape"
+    sink: "output_injection"
+    reference: "Squirrelly documentation"
+
+testConfig:
+  timeout: 20
+  maxDepth: 2

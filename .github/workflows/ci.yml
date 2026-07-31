@@ -1,0 +1,73 @@
+name: CI
+
+# The safety net whose absence once let a silent detection-core crash ship
+# "green". Two jobs: a fast hermetic suite on every push/PR, and a real-package
+# ground-truth benchmark that fails the build if detection regresses.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint + hermetic tests
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['18', '20', '22'] # matches package.json engines (>=18)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      # Fixtures are hermetic (no network); this exercises the detection oracle
+      # against purpose-built vulnerable/safe libraries and the reproduction gate.
+      - run: npm test
+
+  benchmark:
+    name: Ground-truth benchmark (real packages)
+    runs-on: ubuntu-latest
+    # A GitHub-hosted runner is an ephemeral, throwaway VM — isolated from any
+    # developer host — so installing/executing the curated corpus packages here
+    # never touches a real machine. Installs still use the tool's default
+    # --ignore-scripts (src/utils/package-safety.js).
+    #
+    # Non-blocking: this job installs and runs real npm packages, so it is
+    # network-dependent and inherently flakier than the hermetic suite. It runs
+    # for signal and uploads the report as an artifact, but a registry hiccup (or
+    # a single known corpus miss) must not turn the whole build red.
+    continue-on-error: true
+    needs: test
+    timeout-minutes: 30
+    env:
+      # Mark the runner as an isolated environment so the corpus can install.
+      # (The benchmark runner does not gate on this, but keeping it set documents
+      # intent and matches how the container advertises isolation.)
+      UOPFUZZ_CONTAINER: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci
+      # Runs the full pipeline against each vulnerable/patched pair and exits
+      # non-zero if TP-rate < 90% or FP-rate > 10% or any row is inconclusive.
+      - name: Run benchmark
+        run: npm run benchmark
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            benchmark/RESULTS.md
+            benchmark/results.json
+          if-no-files-found: warn

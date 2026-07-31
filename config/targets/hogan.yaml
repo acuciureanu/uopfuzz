@@ -1,0 +1,66 @@
+# UoPFuzz Target Configuration for Hogan.js v3.0.2
+# Mustache template engine with prototype pollution vectors
+# Known: PP can affect template compilation via code generation
+
+name: "hogan"
+package: "hogan.js"
+version: "3.0.2"
+description: "Mustache template engine with prototype pollution potential in code generation"
+
+entryPoints:
+  - name: "compile"
+    inputType: "template"
+    description: "Compile mustache template into reusable template object"
+
+# Hogan.compile(template, options) returns a template object.
+# template.render(context, partials) renders it.
+sequences:
+  - entryPoint: "compile"
+    steps:
+      - call: "compile"
+        args: ["template", "options"]
+      - call: "__result__"
+        method: "render"
+        args: ["locals"]
+
+sinks:
+  - "eval"
+  - "Function"
+  - "child_process.exec"
+
+# Properties hogan's compiler actually reads:
+# Source: hogan.js/lib/compiler.js, hogan.js/lib/template.js
+pollutionPoints:
+  # Compiler options
+  - "sectionTags"
+  - "delimiters"
+  - "disableLambda"
+  - "modelGet"
+  - "asString"
+  # Template runtime
+  - "partials"
+  - "lambda"
+  - "text"
+  - "indent"
+  # Code generation
+  - "code"
+  - "debug"
+  - "n"
+  - "b"
+  - "buf"
+  - "v"
+
+knownPatterns:
+  - description: "PP via partials can inject template content"
+    pattern: "__proto__.partials"
+    sink: "Function"
+    reference: "Prototype pollution in mustache engines"
+
+  - description: "PP via sectionTags modifies compilation behavior"
+    pattern: "__proto__.sectionTags"
+    sink: "Function"
+    reference: "Hogan compiler analysis"
+
+testConfig:
+  timeout: 25
+  maxDepth: 2
