@@ -232,6 +232,11 @@ node src/cli.js --config config/targets/ejs.yaml --output results/
 Confirmed findings and their PoCs are written under `results/`. Full flag
 reference is in [`docs/usage.md`](docs/usage.md).
 
+> The demo target `lodash@4.17.4` is deliberately ancient: its prototype
+> pollution is long-patched and publicly disclosed (e.g. CVE-2019-10744,
+> CVE-2020-8203). It demonstrates the workflow on a known-good finding —
+> it is not a new vulnerability in lodash.
+
 > `--target` installs a package from npm and **executes its code**. On a
 > non-sandboxed host the command refuses unless you pass
 > `--i-understand-untrusted-code`; the intended way to run untrusted targets is
