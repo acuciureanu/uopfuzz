@@ -26,7 +26,7 @@ with neither, the CLI prints usage help and exits.
 > **This installs the target from npm and executes its code.** `--target` needs
 > network + npm access, and third-party code runs during discovery. Fuzz
 > untrusted packages **inside the dev container** — the real isolation boundary
-> (see the Safety model in `README.md`).
+> (see the Security section in `README.md`).
 
 ## Two ways to choose a target
 

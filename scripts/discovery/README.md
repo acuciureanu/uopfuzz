@@ -38,7 +38,7 @@ never silently dropped. You can always hand-write a `targets.txt`.
 
 ## 2. Sweep them through the sandbox
 
-Requires Docker (see the repo README "Safety model"). Reuses `./run-sandboxed.sh`,
+Requires Docker (see the repo README "Security" section). Reuses `./run-sandboxed.sh`,
 so every target runs with `cap-drop=ALL`, seccomp, `no-new-privileges`, non-root,
 read-only rootfs, and pid/memory caps.
 

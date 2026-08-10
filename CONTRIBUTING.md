@@ -9,7 +9,7 @@ are welcome — bug fixes, new gadget/sink coverage, corpus additions, and docs.
 UoPFuzz **executes untrusted code and generates real exploits**. Only run it
 against packages you are authorized to test, and prefer the containerized
 workflow (see below). See [`SECURITY.md`](SECURITY.md) for the disclosure policy
-and the README's "Safety model" for what is and isn't isolated.
+and the README's "Security" section for what is and isn't isolated.
 
 ## Development setup
 

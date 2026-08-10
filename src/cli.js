@@ -87,7 +87,7 @@ program.action(async (options) => {
     if (!options.dryRun) {
       logger.info(chalk.yellow(
         'Only analyze packages you are authorized to test. Target code IS executed — ' +
-        'run untrusted packages inside the dev container (the real isolation boundary). See the Safety model in README.md.'
+        'run untrusted packages inside the dev container (the real isolation boundary). See the Security section in README.md.'
       ));
       if (!process.env.UOPFUZZ_CONTAINER) {
         logger.info(chalk.yellow(

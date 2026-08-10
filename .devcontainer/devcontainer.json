@@ -19,7 +19,7 @@
   // NOTE: network is intentionally NOT disabled. The tool installs the fuzzer's
   // own dependencies (postCreateCommand) and each --target/benchmark package from
   // npm, and queries OSV.dev — all of which need egress. This matches
-  // run-sandboxed.sh and the README "Safety model": the container provides
+  // run-sandboxed.sh and the README "Security" section: the container provides
   // capability containment, not network isolation. Add an external egress policy
   // if you need to contain the network too.
   "runArgs": [
