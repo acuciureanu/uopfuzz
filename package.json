@@ -49,5 +49,13 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/acuciureanu/uopfuzz.git"
-  }
+  },
+  "bugs": "https://github.com/acuciureanu/uopfuzz/issues",
+  "homepage": "https://github.com/acuciureanu/uopfuzz#readme",
+  "files": [
+    "src",
+    "config",
+    "examples",
+    "docs"
+  ]
 }
