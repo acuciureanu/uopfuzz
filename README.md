@@ -8,11 +8,11 @@ The name comes from the mechanic it hunts: a library reads a property that is *u
 
 ### Key features
 
-- **Reproduction-gated reporting.** Every finding is re-proven in two fresh Node processes by a second oracle that shares no verdict logic with discovery. 0% false-positive rate on the [ground-truth benchmark](benchmark/RESULTS.md).
-- **Behavioural auto-discovery.** `--target pkg@version` needs no config. Entry points are found by probing the library, so code paths its own test suite never exercises stay in scope.
+- **Reproduction-gated reporting.** Every finding is re-proven in two fresh Node processes by a second oracle that shares no verdict logic with discovery. On the project's [ground-truth benchmark](benchmark/RESULTS.md) this produced no false positives against patched versions — a measured result on that benchmark, not a guarantee.
+- **Behavioural auto-discovery.** `--target pkg@version` needs no config. Entry points are found by probing the library, which can cover code paths a package's own test suite never exercises.
 - **Runnable PoCs.** Confirmed findings ship a standalone script. Impact (RCE / SSRF / LFI / XSS) comes from the sink actually reached, not from a heuristic. When one library is both the pollution source and the gadget, the result is a self-contained exploit and is flagged as such.
 - **Server-side and client-side.** Code execution, template-compilation injection (e.g. EJS `outputFunctionName`), SSRF and LFI on the server; browser libraries load under jsdom with DOM-XSS sinks hooked (`innerHTML`, `document.write`, script `src`, …). jsdom does not execute scripts, so client-side findings prove sink reachability.
-- **Runtime gadget mining.** Mines the Node.js runtime itself for gadget properties (`NODE_OPTIONS`, `shell`, TLS verification, …). On Node 24 it reproduces 97% of GHunter's published gadget table that is still live, and finds 145 machine-verified gadgets GHunter never published — see the [A/B report](results/runtime-miner/AB-RESULTS.md).
+- **Runtime gadget mining.** Mines the Node.js runtime itself for gadget properties (`NODE_OPTIONS`, `shell`, TLS verification, …), with a replay of GHunter's published gadget table for comparison — see [Runtime gadgets](#runtime-gadgets).
 - **Novelty triage.** Findings are cross-referenced against a built-in advisory DB, OSV.dev, and the GitHub Advisory DB.
 
 ### Requirements
@@ -81,7 +81,7 @@ npm run ab:ghunter                  # replay GHunter's published table, compare
 
 The miner harvests candidate properties from the runtime source and verifies each one differentially in clean-vs-polluted child processes. A finding requires an observed behaviour change or crash, never sink-reach alone. Effects that only materialize in a live handshake (e.g. disabling TLS certificate verification) are proven by a behavioural oracle against a loopback server.
 
-Replaying GHunter's published, manually-validated table on Node 24: 97% recall on the 33 gadgets still live (17 of their 50 are fixed or mitigated upstream, and are reported as such, with evidence), plus 145 machine-verified gadgets GHunter never published — at zero manual hours vs. their reported 31. Full tables: [benchmark/runtime-gadgets/RESULTS.md](benchmark/runtime-gadgets/RESULTS.md) and [results/runtime-miner/AB-RESULTS.md](results/runtime-miner/AB-RESULTS.md).
+How the comparison was made, so the numbers can be read fairly: GHunter's research artifact requires a patched Node v21 build and does not run on a current runtime, so its side of the comparison is its own published, manually-validated table — this is a replay, not a live head-to-head. On Node 24.17, 33 of GHunter's 50 published gadget properties are still observable; UoPFuzz confirms 32 of them (the remaining one, `fetch.referrer`, shows only weak evidence). The other 17 are fixed or mitigated upstream and are reported as such, with the evidence inline. The miner additionally reports 145 gadget properties absent from GHunter's table — verified by this tool's differential harness on this Node version, not independently audited. For effort: GHunter's authors report 31 person-hours of manual validation, while the replay and the miner run unattended. Full tables: [benchmark/runtime-gadgets/RESULTS.md](benchmark/runtime-gadgets/RESULTS.md) and [results/runtime-miner/AB-RESULTS.md](results/runtime-miner/AB-RESULTS.md).
 
 ### Output
 
@@ -104,7 +104,7 @@ The proof is one of: **prototype pollution** (a real own-property added to a bui
 
 The reference points for server-side gadget hunting are Silent Spring (USENIX '23, static taint), Dasty and GHunter (USENIX '24, driven by the target's own test suite), and Bullseye (NDSS '26). UoPFuzz is not a new detection algorithm; it is an operationalized, reproduction-gated take on dynamic gadget hunting, with behavioural auto-discovery instead of test-suite-driven analysis.
 
-Limits worth knowing: the discovery sweep is deliberately relevance-filtered to a few dozen freshly-published packages a day (see [scripts/discovery](scripts/discovery)), not a whole-registry corpus scan. And the reproduction gate trades recall for its zero-false-positive property — a gadget that only fires under conditions the harness can't recreate is reported as an unproven lead, not a finding.
+Limits worth knowing: the discovery sweep is deliberately relevance-filtered to a few dozen freshly-published packages a day (see [scripts/discovery](scripts/discovery)), not a whole-registry corpus scan. And the reproduction gate trades recall for precision — a gadget that only fires under conditions the harness can't recreate is reported as an unproven lead, not a finding.
 
 ### Security
 
