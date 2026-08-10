@@ -93,6 +93,12 @@ const PAYLOADS = [
   // Array payload — triggers different code paths in merge/extend
   { type: 'array', value: ['__UOPFUZZ_ARRAY__'] },
 
+  // Bullseye-style (NDSS '26) typed array fragments — nested arrays slip past
+  // scalar type checks (typeof x === 'object' passes, String(x) joins) and
+  // fragment into gadgets that index or join array elements.
+  { type: 'array_fragment_pair', value: [['__UOPFUZZ_FRAG1__'], '__UOPFUZZ_FRAG2__'] },
+  { type: 'array_fragment_nested', value: [['__UOPFUZZ_FRAG1__', '__UOPFUZZ_FRAG2__'], '__UOPFUZZ_VALUE__'] },
+
   // Nested object — triggers recursive processing
   { type: 'nested_object', value: { nested: { deep: '__UOPFUZZ_DEEP__' } } },
 ];

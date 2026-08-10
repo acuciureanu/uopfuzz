@@ -19,6 +19,7 @@ import { GATE_PROPERTIES } from '../instrumentation/gate-properties.js';
 import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS, installDomSinkHooks as installDomSinkHooksShared } from './browser-env.js';
 import { callAndAwaitReal, structuralSerialize } from './proto-safe.js';
 import { V8CoverageCollector } from './v8-coverage.js';
+import { collectSinkStrings } from './sink-record.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with repro-worker.js) ───────────────
@@ -126,8 +127,10 @@ try {
     const orig = cp[method];
     if (typeof orig === 'function') {
       cp[method] = function(...args) {
-        const a = typeof args[0] === 'string' ? args[0].substring(0, 200) : '';
-        sinkLog.push({ sink: `child_process.${method}`, args: [a], timestamp: Date.now() });
+        // Options-aware recording: the GHunter env/NODE_OPTIONS gadget class
+        // flows through args[1].env via prototype fall-through — collectSinkStrings
+        // reads it exactly the way Node's spawn normalization would.
+        sinkLog.push({ sink: `child_process.${method}`, args: collectSinkStrings(args), timestamp: Date.now() });
         return orig.apply(this, args);
       };
     }
@@ -147,15 +150,7 @@ try {
       const orig = mod[method];
       if (typeof orig === 'function') {
         mod[method] = function(...args) {
-          const a0 = args[0];
-          let a = '';
-          if (typeof a0 === 'string') {
-            a = a0.substring(0, 200);
-          } else if (a0) {
-            const href = a0.href; // single read — a URL-ish object may define href as a getter
-            if (typeof href === 'string') a = href.substring(0, 200);
-          }
-          sinkLog.push({ sink: `${modName}.${method}`, args: [a], timestamp: Date.now() });
+          sinkLog.push({ sink: `${modName}.${method}`, args: collectSinkStrings(args), timestamp: Date.now() });
           const req = orig.apply(this, args);
           // The network block guarantees this request errors out on a destroyed
           // socket; a target that attaches no 'error' listener would otherwise
@@ -182,13 +177,42 @@ try {
     const orig = fs[method];
     if (typeof orig === 'function') {
       fs[method] = function(...args) {
-        const a = typeof args[0] === 'string' ? args[0].substring(0, 200) : '';
-        sinkLog.push({ sink: `fs.${method}`, args: [a], timestamp: Date.now() });
+        sinkLog.push({ sink: `fs.${method}`, args: collectSinkStrings(args[0]), timestamp: Date.now() });
         return orig.apply(this, args);
       };
     }
   }
 } catch { /* fs not available */ }
+
+// Hook tls.connect / tls.createSecureContext and crypto algorithm selection —
+// CRYPTOGRAPHIC-DOWNGRADE sinks (GHunter taxonomy): a polluted
+// rejectUnauthorized / ciphers / minVersion / algorithm reaches these through
+// options-object fall-through. Delegation is safe: the socket stays blocked and
+// a bogus algorithm just throws in the original.
+try {
+  const tls = require('tls');
+  for (const method of ['connect', 'createSecureContext']) {
+    const orig = tls[method];
+    if (typeof orig === 'function') {
+      tls[method] = function(...args) {
+        sinkLog.push({ sink: `tls.${method}`, args: collectSinkStrings(args), timestamp: Date.now() });
+        return orig.apply(this, args);
+      };
+    }
+  }
+} catch { /* tls not available */ }
+try {
+  const crypto = require('crypto');
+  for (const method of ['createHash', 'createHmac', 'createCipheriv', 'createDecipheriv']) {
+    const orig = crypto[method];
+    if (typeof orig === 'function') {
+      crypto[method] = function(...args) {
+        sinkLog.push({ sink: `crypto.${method}`, args: collectSinkStrings(args[0]), timestamp: Date.now() });
+        return orig.apply(this, args);
+      };
+    }
+  }
+} catch { /* crypto not available */ }
 
 // ─── PERSISTENT TARGET CACHE ─────────────────────────────────
 // A pooled worker serves many requests for the SAME package. Loading the target
@@ -715,7 +739,7 @@ function resolveEntryPoint(module, name, packageName) {
   // never as a catch-all for an unrelated or nonexistent entry point name.
   // Checked BEFORE the dotted-path branch: a package identifier can be a
   // filesystem path (a local target or test fixture) whose directory contains a
-  // dot (e.g. `.../.claude/worktrees/.../bare-merge`); treating that as a dotted
+  // dot (e.g. `.../.worktrees/agent-run-3/bare-merge`); treating that as a dotted
   // property path would walk nonexistent keys and never reach this fallback.
   // Short-circuits only when the module itself is callable.
   if (name === packageName) {

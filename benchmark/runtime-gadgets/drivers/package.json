@@ -1,0 +1,7 @@
+{
+  "name": "uopfuzz-runtime-gadget-drivers",
+  "version": "1.0.0",
+  "type": "commonjs",
+  "main": "index.js",
+  "private": true
+}

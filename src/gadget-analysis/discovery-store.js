@@ -201,6 +201,11 @@ export function buildRecord(chain, ctx) {
     description: `CONFIRMED ${kind}: Object.prototype.${property} via ${entryPoint}`,
     cvssVector: chain.metadata?.cvssVector || null,
     riskLevel: chain.riskLevel ?? null,
+    // Distinguish a verified end-to-end exploit (source → gadget → sink reproduced)
+    // from a gadget-half finding, so the audit trail never conflates the two.
+    endToEnd: chain.endToEnd === true,
+    sameLibrary: chain.sameLibrary === true,
+    sourcePackage: chain.sourcePackage || null,
     standalonePoC: chain.standalonePoC || null,
   };
 }

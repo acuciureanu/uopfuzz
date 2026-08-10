@@ -50,7 +50,8 @@ program
   .option('--i-understand-untrusted-code', 'Proceed with --target on a non-sandboxed host (installs + EXECUTES an arbitrary npm package). Prefer the dev container / run-sandboxed.sh')
   .option('--allow-network', 'Allow network access during target execution')
   .option('--no-isolate', 'Run the whole session in this process instead of a crash-isolated child (for debugging; a target that corrupts Node internals can then take the fuzzer down)')
-  .option('--no-osv', 'Disable live advisory lookups (OSV.dev AND the GitHub Advisory DB / npm bulk endpoint); disclosure labels then use the built-in DB only. Note: a lookup reveals the analyzed package@version to a third party (the npm registry already sees it on install)');
+  .option('--no-osv', 'Disable live advisory lookups (OSV.dev AND the GitHub Advisory DB / npm bulk endpoint); disclosure labels then use the built-in DB only. Note: a lookup reveals the analyzed package@version to a third party (the npm registry already sees it on install)')
+  .option('--no-chain', 'Disable end-to-end chain synthesis (after a gadget is proven, pair it with a proven prototype-pollution source and reproduce the full attacker-input → source → gadget → sink exploit). On by default; findings are then reported gadget-half only.');
 
 program.action(async (options) => {
   try {
@@ -127,6 +128,7 @@ program.action(async (options) => {
       sandbox: options.sandbox !== false,
       blockNetwork: !options.allowNetwork,
       noOsv: options.osv === false,
+      chain: options.chain !== false,
     };
 
     // Crash isolation (default): run the whole session in a forked child so a

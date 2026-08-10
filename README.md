@@ -38,6 +38,10 @@ It covers both server-side and client-side gadgets:
 What makes it different from a heuristic scanner: **a finding is only reported
 after it is independently reproduced in fresh, isolated child processes.** No
 reproduction, no vulnerability — just a clearly-labelled lead for manual review.
+Confirmed gadgets carry their true impact (RCE / SSRF / LFI / XSS) from the sink
+they were proven to reach, and ship with a runnable PoC — including
+**self-contained exploits** where a single library is both the pollution source
+and the gadget (see [How this differs](#how-this-differs)).
 
 > ⚠️ **This is a research tool that executes untrusted code and generates real,
 > working exploits.** Read [Safety model](#safety-model) before pointing it at a
@@ -49,6 +53,8 @@ reproduction, no vulnerability — just a clearly-labelled lead for manual revie
 
 - [Why UoPFuzz](#why-uopfuzz)
 - [How it works](#how-it-works)
+- [How this differs](#how-this-differs)
+- [Runtime gadgets & the GHunter A/B](#runtime-gadgets--the-ghunter-ab)
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Use cases](#use-cases)
@@ -103,6 +109,105 @@ flowchart LR
 | **Verification** | Reproduces each candidate in fresh child processes — the only thing that confirms a finding |
 
 See [`docs/architecture.md`](docs/architecture.md) for the full pipeline.
+
+## How this differs
+
+Server-side prototype-pollution gadget hunting is well-studied — the reference
+points are **Silent Spring** (USENIX '23), **Dasty**, and **GHunter** (USENIX
+'24) from KTH-LangSec, and the recent **Bullseye** (NDSS '26). UoPFuzz is *not* a
+new detection algorithm; it is an operationalized, reproduction-gated take on
+dynamic gadget hunting. Two things set it apart.
+
+**1. Behavioural auto-discovery + a reproduction gate — not a test suite, not a
+heuristic.** Dasty and GHunter are driven by a target's own test suite, so
+they're blind to any code path the tests don't exercise. UoPFuzz auto-discovers
+entry points by *probing* them (`--target pkg` needs no config), so untested
+paths stay in scope. Every finding is then re-proven in two fresh processes
+against a ground-truth oracle (a real own-property added to a prototype, or a
+canary that actually executes) before it's reported; candidates that don't
+reproduce are labelled leads, not vulnerabilities. **That's the real edge: which
+absent property a library reads and which sink it reaches — verified, not
+guessed.**
+
+**2. It can assemble a runnable exploit, and flags the self-contained ones.** A
+gadget only matters if a prototype-pollution *source* can reach it. Because
+pollution is a *global* effect, any function that merges attacker input into an
+object is an interchangeable source — so once UoPFuzz confirms a gadget it pairs
+it with a real, currently-shipping source and reproduces a runnable
+`attacker-input → source → gadget → sink` PoC. This one was assembled
+automatically across two real, installable packages (each with its own CVE):
+
+```javascript
+// PoC — prototype-pollution RCE in ejs@3.1.6 via render(), reproduced in 2 fresh
+// processes. The SOURCE pollutes Object.prototype; the gadget then reaches its
+// code-execution sink. No pollution is assumed — the source does it.
+//
+// Source: assign-deep@1.0.0 (CVE-2019-10747)  — interchangeable; any PP source works
+const source = require('assign-deep');
+const target = require('ejs');
+source({}, JSON.parse('{"__proto__": ' + JSON.stringify({ "outputFunctionName": "<attacker code>" }) + '}'));
+target.render(/* attacker-influenced input */);
+// The polluted property reaches a code-execution sink and runs attacker code.
+```
+
+The cross-library PoC is *actionability, not a second discovery* — the source is
+swappable; the **gadget is the finding**. The genuinely stronger case is when a
+single library is *both* the source and the gadget: a **self-contained exploit**
+that needs no external assumption, which UoPFuzz flags as such. Every finding also
+carries its true impact from the sink it was proven to reach — RCE only for
+genuine code/command execution, otherwise SSRF / LFI / XSS. Chaining is on by
+default; `--no-chain` disables it.
+
+| | Silent Spring | Dasty | GHunter | UoPFuzz |
+|---|---|---|---|---|
+| Approach | static taint | dynamic taint | dynamic (runtime) | differential + coverage-guided fuzzing |
+| Driven by | source analysis | package test suite | runtime test suite | behavioural auto-discovery |
+| Output | candidates | candidates | candidates | reproduced findings |
+| Impact from proven sink (RCE/SSRF/LFI/XSS) | partial | — | — | **✓** |
+| Runnable exploit PoC (self-contained flagged) | — | — | — | **✓** |
+| Novelty triage (CVE · OSV · GHSA) | — | — | — | **✓ built-in** |
+| Maintained runnable CLI | artifact | artifact | artifact | **✓** |
+
+**Honest limits.** This is a *different posture, not a bigger one*. The discovery
+sweep is deliberately relevance-filtered to a few dozen freshly-published
+packages a day (see [`scripts/discovery`](scripts/discovery)), not a
+whole-registry corpus scan like Dasty/Bullseye. And the reproduction gate trades
+recall for its zero-false-positive property: a gadget that only fires under
+conditions the harness can't recreate is reported as an unproven lead, not a
+finding.
+
+> **On the name.** *Undefined-oriented programming (UOP)* is our framing for the
+> read-an-absent-property mechanic — not an established field. Note that the
+> literature already uses *UOPF (Undefined-oriented Programming Framework)* for
+> chaining PP gadgets in template engines; that is prior, separate work.
+
+## Runtime gadgets & the GHunter A/B
+
+Beyond npm packages, UoPFuzz hunts gadgets in the **Node.js runtime itself** —
+the `NODE_OPTIONS`, `shell`, and TLS-verification properties that turn any
+prototype pollution into code execution. Two commands drive this:
+
+```bash
+npm run benchmark:runtime-gadgets   # curated corpus of published runtime gadgets
+npm run mine:runtime-gadgets        # mine the installed runtime for NEW gadgets
+npm run ab:ghunter                  # replay GHunter's published table, compare
+```
+
+The miner harvests candidate properties from the runtime's own source, then
+verifies each one differentially in clean-vs-polluted child processes — a
+finding requires an observed behavior change or crash, never sink-reach alone.
+Effects that only materialize in a live handshake (e.g. disabling TLS
+certificate verification) are proven by a behavioral oracle against a loopback
+server with a runtime-generated throwaway certificate.
+
+Replayed against GHunter's published, manually-validated gadget table on
+Node 24: **97% recall on the 33 gadgets still live** (17 of GHunter's 50 are
+fixed or mitigated upstream and UoPFuzz says so, with evidence), plus **145
+machine-verified gadgets GHunter never published** — at zero manual hours vs
+their reported 31. Full tables:
+[`benchmark/runtime-gadgets/RESULTS.md`](benchmark/runtime-gadgets/RESULTS.md)
+and [`results/runtime-miner/AB-RESULTS.md`](results/runtime-miner/AB-RESULTS.md)
+(regenerated by `npm run ab:ghunter`).
 
 ## Install
 
@@ -276,6 +381,8 @@ exploits** — handle them as sensitive, and disclose responsibly.
 - [`docs/configuration.md`](docs/configuration.md) — YAML target format
 - [`docs/usage.md`](docs/usage.md) — full CLI reference and the container workflow
 - [`benchmark/RESULTS.md`](benchmark/RESULTS.md) — ground-truth benchmark
+- [`benchmark/runtime-gadgets/RESULTS.md`](benchmark/runtime-gadgets/RESULTS.md) — runtime-gadget corpus verdicts
+- [`results/runtime-miner/AB-RESULTS.md`](results/runtime-miner/AB-RESULTS.md) — UoPFuzz vs GHunter A/B
 
 ## Contributing & security
 

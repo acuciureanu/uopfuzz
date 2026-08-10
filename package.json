@@ -15,6 +15,9 @@
     "dev": "node --watch src/cli.js",
     "benchmark": "node benchmark/run-benchmark.js",
     "benchmark:self-test": "node benchmark/run-benchmark.js --self-test",
+    "benchmark:runtime-gadgets": "node benchmark/runtime-gadgets/run.js",
+    "mine:runtime-gadgets": "node benchmark/runtime-gadgets/mine.js",
+    "ab:ghunter": "node benchmark/runtime-gadgets/ab-test.js",
     "demo": "node scripts/gen-demo-cast.mjs && agg --font-size 22 --theme asciinema assets/demo.cast assets/demo.gif"
   },
   "keywords": [
@@ -37,7 +40,8 @@
   },
   "devDependencies": {
     "eslint": "^10.2.0",
-    "qs": "^6.15.0"
+    "qs": "^6.15.0",
+    "selfsigned": "^2.4.1"
   },
   "engines": {
     "node": ">=20.0.0"

@@ -8,8 +8,8 @@ import { benchmarkDetection, getGadgetsForPackage } from '../gadget-analysis/kno
  *   generateMassReport(allResults)          — summary table across many libraries
  *   generateVersionReport(versionResults)   — version timeline for a single library
  *
- * Output is optimised for AI consumption (Claude Code, GPT-4, etc.) by using
- * standard Markdown headings, tables, and fenced code blocks throughout.
+ * Output is optimised for LLM/agent consumption by using standard Markdown
+ * headings, tables, and fenced code blocks throughout.
  */
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -135,7 +135,21 @@ export function generateSingleReport(results, config) {
           : `UNDOCUMENTED VULNERABILITY${disc.regressionSuspect ? ' (REGRESSION SUSPECT)' : ''}`;
       const proof = chain.proof || {};
 
-      md += `### Finding #${i + 1} — ${discLabel} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
+      // Impact is the reproduction-derived category (RCE only for genuine code /
+      // command execution; otherwise the sink's own honest category). A
+      // reachability-only proof says so.
+      const impact = chain.impact || {};
+      const impactLabel = impact.label
+        ? (impact.proven === false && impact.category !== 'prototype-pollution'
+          ? `${impact.label} (reachability)` : impact.label)
+        : null;
+      // Only a SAME-LIBRARY finding earns the strong "self-contained exploit"
+      // framing — it needs no external pollution source. A cross-library chain is
+      // just this gadget with a runnable PoC via a named source (the source is
+      // interchangeable), so it gets no louder tier than the gadget itself.
+      const chainTag = chain.sameLibrary ? ' — ⛓ SELF-CONTAINED EXPLOIT' : '';
+      const impactTag = impactLabel ? `${impactLabel} — ` : '';
+      md += `### Finding #${i + 1} — ${impactTag}${discLabel}${chainTag} — ${riskBadge(chain.riskLevel)} (${score.toFixed(1)}/10)\n\n`;
       md += `| Field | Value |\n|-------|-------|\n`;
       md += `| Library | \`${libName}@${libVersion}\` |\n`;
       md += `| Entry point | \`${escMd(chain.input?.entryPoint)}\` |\n`;
@@ -147,6 +161,9 @@ export function generateSingleReport(results, config) {
           ? 'Sink reachability (polluted value reached a sink argument as a string; execution not proven, sanitization not checked)'
           : 'Prototype pollution (own-property added)';
       md += `| Proof | ${proofText} — reproduced ${proof.runs || 2}× |\n`;
+      if (impactLabel) {
+        md += `| Impact | ${impactLabel}${proof.sink && proof.sink !== 'code-execution' ? ` (sink: \`${escMd(proof.sink)}\`)` : ''} |\n`;
+      }
       if (proof.newProps?.length) {
         md += `| Polluted prototype key(s) | ${proof.newProps.map(p => `\`${p}\``).join(', ')} |\n`;
       }
@@ -158,10 +175,34 @@ export function generateSingleReport(results, config) {
         md += `| CVSS vector | \`${chain.metadata.cvssVector}\` |\n`;
       }
       md += `| Type | ${isURL ? 'URL gadget' : (chain.multiProperty ? 'Multi-property gadget' : 'Direct prototype pollution')} |\n`;
+      if (chain.sameLibrary) {
+        md += `| Exploit chain | **self-contained** — this library is *both* the pollution source and the gadget: attacker input → \`${escMd(chain.input?.entryPoint)}\` → sink |\n`;
+      } else if (chain.endToEnd) {
+        const sp = chain.sourcePackage || {};
+        const srcDesc = sp.fixture
+          ? 'a recursive-merge source'
+          : `\`${escMd(sp.package)}${sp.version ? '@' + sp.version : ''}\``;
+        md += `| Runnable PoC via | ${srcDesc} — *any* prototype-pollution source works; this one just makes the PoC concrete |\n`;
+      }
       if (chain.coPolluteProperties?.length > 0) {
         md += `| Co-polluted properties | ${chain.coPolluteProperties.map(p => `\`${p}\``).join(' + ')} |\n`;
       }
       md += '\n';
+
+      if (chain.sameLibrary) {
+        md += `> ⛓ **Self-contained exploit.** This library is *both* the pollution source and the `;
+        md += `gadget, so it needs no external source — the full attacker-input → sink chain was `;
+        md += `reproduced in fresh processes.\n\n`;
+      } else if (chain.endToEnd) {
+        const rws = chain.realWorldSources || [];
+        md += `> The **finding is the gadget** above. The PoC pairs it with a real prototype-pollution `;
+        md += `source only to be runnable — the source is interchangeable, since *any* function that `;
+        md += `merges attacker input into an object pollutes the prototype`;
+        if (rws.length) {
+          md += ` (currently-shipping examples: ${rws.map(s => `\`${s.package}${s.version ? '@' + s.version : ''}\`${s.cve ? ' ' + s.cve : ''}`).join(', ')})`;
+        }
+        md += `.\n\n`;
+      }
 
       if (disc.regressionSuspect && disc.note) {
         md += `> ⚠ **Regression suspect:** ${disc.note}\n\n`;

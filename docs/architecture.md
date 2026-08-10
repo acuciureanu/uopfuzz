@@ -42,13 +42,42 @@
   - Performance optimization
   - Error handling and recovery
 
+### 6. Verification (`src/verification/`)
+- **Purpose**: The zero-false-positive gate — a finding is reported only after
+  independent reproduction in fresh child processes
+- **Key Features**:
+  - Ground-truth oracles (real prototype mutation, executed canary, named sink reach)
+  - End-to-end chain synthesis: a proven gadget is paired with a proven
+    prototype-pollution *source* (`source-registry.js`) and the full
+    `attacker-input → source → gadget → sink` exploit is reproduced
+    (`reproduce.js` `reproduceChain`, on by default; `--no-chain` disables)
+  - Reproduction-derived impact classification (RCE / command injection / SSRF /
+    LFI / XSS / crypto-downgrade) from the proven sink
+    (`gadget-analysis/sink-impact.js`); the reproduction worker records the
+    string arguments of code/command, network, filesystem, TLS/crypto, and
+    `worker_threads.Worker` sinks — including values reached through an options
+    object's prototype chain (`utils/sink-record.js`)
+  - Standalone runnable PoC generation per confirmed finding
+
+### 7. Runtime Gadget Miner (`src/runtime-miner/`)
+- **Purpose**: Discovers *unknown* universal gadgets in the Node runtime itself
+  (GHunter-style enumeration) on a stock runtime, with no manual validation
+- **Key Features**:
+  - Candidate harvest from the runtime's own source (`process.binding('natives')`)
+    — option-property reads per API class (`harvest.js`)
+  - Automatic validation: value-differential oracle (behavior change = LIVE),
+    exit-code oracle (polluted-only fatal exit = DoS), 2× fresh-process sink
+    reproduction for impact classification (`mine.js`)
+  - CLI: `benchmark/runtime-gadgets/mine.js`; findings in `results/runtime-miner/`
+
 ## Data Flow
 
 1. **Configuration Loading**: Target YAML files define entry points, sinks, and pollution vectors
 2. **Input Generation**: Creates base inputs and applies UOP-specific mutations
 3. **Instrumented Execution**: Runs inputs against target with comprehensive tracing
 4. **Chain Analysis**: Identifies temporal relationships between pollution and sinks
-5. **Result Reporting**: Generates human-readable reports and detailed JSON data
+5. **Verification**: Reproduces every candidate in fresh child processes (twice) against ground-truth oracles; confirmed gadgets are chained with a proven pollution source into an end-to-end exploit and classified by proven impact
+6. **Result Reporting**: Generates human-readable reports and detailed JSON data
 
 ## Security Considerations
 

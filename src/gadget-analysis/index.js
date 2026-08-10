@@ -52,6 +52,14 @@ export class GadgetAnalysis {
       'https.get':          { baseScore: 9.1,  impact: 'SSRF', cvssVector: 'AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N' },
       'fs.readFileSync':    { baseScore: 7.5,  impact: 'LFI',  cvssVector: 'AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N' },
       'fs.readFile':        { baseScore: 7.5,  impact: 'LFI',  cvssVector: 'AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N' },
+      // Cryptographic downgrade (GHunter taxonomy): polluted TLS options or
+      // algorithm selection reaches these sinks.
+      'tls.connect':           { baseScore: 7.4,  impact: 'Crypto downgrade', cvssVector: 'AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:N/A:N' },
+      'tls.createSecureContext': { baseScore: 7.4,  impact: 'Crypto downgrade', cvssVector: 'AV:N/AC:H/PR:N/UI:N/S:C/C:H/I:N/A:N' },
+      'crypto.createHash':       { baseScore: 5.9,  impact: 'Crypto downgrade', cvssVector: 'AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:H/A:N' },
+      'crypto.createHmac':       { baseScore: 5.9,  impact: 'Crypto downgrade', cvssVector: 'AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:H/A:N' },
+      'crypto.createCipheriv':   { baseScore: 5.9,  impact: 'Crypto downgrade', cvssVector: 'AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:H/A:N' },
+      'crypto.createDecipheriv': { baseScore: 5.9,  impact: 'Crypto downgrade', cvssVector: 'AV:N/AC:H/PR:N/UI:N/S:U/C:L/I:H/A:N' },
     };
 
     // Flat sink -> severity map (kept for callers that only need the number).

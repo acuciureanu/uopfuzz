@@ -15,8 +15,16 @@ import { InputGeneration } from '../input-generation/index.js';
 import { Instrumentation } from '../instrumentation/index.js';
 import { GadgetAnalysis } from '../gadget-analysis/index.js';
 import { generateSingleReport } from '../reporting/markdown-report.js';
-import { reproduceProto, reproduceRce } from '../verification/reproduce.js';
+import { reproduceProto, reproduceRce, reproduceChain } from '../verification/reproduce.js';
+import {
+  loadSources,
+  appendSourceIfNew,
+  sourceFromPpProof,
+  REFERENCE_SOURCE,
+  DEFAULT_SOURCES_PATH,
+} from '../verification/source-registry.js';
 import { classifyFinding } from '../gadget-analysis/disclosure.js';
+import { impactFromProof } from '../gadget-analysis/sink-impact.js';
 import { fetchOsvVulns } from '../sources/osv.js';
 import { fetchNpmAdvisories, npmAdvisoryToOsvVuln } from '../sources/npm-advisories.js';
 import {
@@ -51,6 +59,23 @@ export class Orchestrator {
     // not append to the repo's real, tracked store — the suite must not mutate
     // the record of what this tool has genuinely found.
     this._discoveryStorePath = options?.discoveryStorePath || DEFAULT_DISCOVERY_STORE_PATH;
+    // End-to-end chain synthesis: after a gadget is proven, pair it with a proven
+    // PP *source* and reproduce the whole attacker-input → source → gadget → sink
+    // exploit (see _attemptChainSynthesis). On by default; --no-chain disables it
+    // (and dry runs skip it, since there is nothing to reproduce).
+    // Same injectability contract as the discovery store: a test run must never
+    // mutate the repo's tracked registry. When a custom discoveryStorePath is
+    // given (the established test convention) but no sourcesPath, keep the
+    // registry beside it so tests are isolated without each having to know about
+    // this file.
+    this._sourcesPath = options?.sourcesPath
+      || (options?.discoveryStorePath
+        ? path.join(path.dirname(options.discoveryStorePath), 'proven-sources.jsonl')
+        : DEFAULT_SOURCES_PATH);
+    this._chainingEnabled = options?.chain !== false && !options?.dryRun;
+    // Sources proven for THIS target during THIS run — a same-library gadget can
+    // chain against them with no extra install (the target is already loaded).
+    this._selfSources = [];
     this.targetIntegration = null;
     this.inputGeneration = null;
     this.instrumentation = null;
@@ -100,6 +125,13 @@ export class Orchestrator {
       // findings can be recognized as rediscoveries of bugs previously found.
       // Same timing/defensive contract as fetchOsvData: never throws, [] on miss.
       this.priorDiscoveries = loadDiscoveries(this._discoveryStorePath);
+
+      // Load the proven-source registry (once per run) so a confirmed gadget can
+      // be paired with a real, currently-shipping PP source for end-to-end chain
+      // reproduction. Never throws; [] when chaining is disabled or the file is
+      // absent. The hermetic REFERENCE_SOURCE (a recursive-merge fixture) is the
+      // always-available fallback so a chain reproduces offline/deterministically.
+      this.provenSources = this._chainingEnabled ? loadSources(this._sourcesPath) : [];
 
       logger.info('Starting fuzzing workflow...');
       await this.executeFuzzingWorkflow();
@@ -541,7 +573,13 @@ export class Orchestrator {
         payloadType: proof.payloadType || null,
         callConvention: proof.callConvention || null,
         restriction: proof.restriction || null,
+        // The sink actually reached in reproduction (null for a pp source). The
+        // impact category is derived from THIS proven sink, not a discovery guess.
+        sink: proof.sink || null,
       };
+      // Reproduction-derived impact: RCE only for genuine code/command execution,
+      // otherwise the sink's own honest category (SSRF / LFI / XSS / …).
+      chain.impact = impactFromProof(chain.proof);
       chain.standalonePoC = proof.standalonePoC || null;
       // Only a fired canary is "exploit verified". sink_reach proves data flow to
       // a sink, not execution — flag it separately so downstream consumers don't
@@ -549,6 +587,21 @@ export class Orchestrator {
       chain.exploitVerified = proofType === 'rce' && !isSinkReach;
       chain.sinkReachOnly = isSinkReach;
       Object.assign(chain, extra.chainMeta || {});
+
+      // End-to-end chain synthesis. A confirmed PP *source* becomes a reusable
+      // chaining primitive; a confirmed *gadget* is paired with a proven source
+      // and the whole attacker-input → source → gadget → sink exploit is
+      // reproduced in fresh processes (turning a gadget-half lead into a verified
+      // exploit — the thing the field leaves to a human analyst).
+      if (this._chainingEnabled) {
+        if (proofType === 'pp') {
+          this._registerProvenSource(proof, pkg, version, entryPoint);
+        } else {
+          await this._attemptChainSynthesis(chain, {
+            pkg, version, entryPoint, descriptor, testInput, gates: proof.gates || [],
+          });
+        }
+      }
 
       this.results.confirmedChains.push(chain);
       this.inputGeneration.recordConfirmedGadget(descriptor.property, descriptor.value);
@@ -594,6 +647,82 @@ export class Orchestrator {
       });
     }
     return false;
+  }
+
+  /**
+   * Record a confirmed PP *source* (a merge/set function proven to pollute the
+   * prototype) so it can drive end-to-end chains: kept for same-run same-library
+   * chaining and appended to the durable proven-source registry.
+   */
+  _registerProvenSource(proof, pkg, version, entryPoint) {
+    const entry = sourceFromPpProof(proof, { package: pkg, version, entryPoint });
+    if (!entry) return;
+    this._selfSources.push(entry);
+    if (appendSourceIfNew(entry, this._sourcesPath)) {
+      logger.info(`Recorded proven PP source: ${pkg}${version ? '@' + version : ''} via ${entryPoint} (payload ${entry.payloadKind})`);
+    }
+  }
+
+  /**
+   * Turn a confirmed gadget into a verified end-to-end exploit by pairing it with
+   * a proven PP source and reproducing attacker-input → source → gadget → sink in
+   * fresh processes. Candidate sources, best first:
+   *   1. same-library — the target itself is also a proven source (a fully
+   *      self-contained RCE, the strongest possible result);
+   *   2. the hermetic reference merge (REFERENCE_SOURCE) — always loadable, so a
+   *      chain reproduces offline and deterministically for every real gadget.
+   * Prototype pollution is a global effect, so the reference merge is a faithful
+   * stand-in for any real recursive-merge source; the finding names the concrete
+   * currently-shipping sources (the registry) as the real-world vectors. Failure
+   * to reproduce a chain is non-fatal — the gadget-half finding stands.
+   */
+  async _attemptChainSynthesis(chain, ctx) {
+    const { pkg, version, entryPoint, descriptor, testInput, gates } = ctx;
+    const spec = {
+      property: descriptor.property,
+      gates: gates || [],
+      minimalArgs: [testInput.value ?? {}],
+      sequence: this.buildResolvedSequence(testInput),
+    };
+    const opts = {
+      version,
+      blockNetwork: this.options.blockNetwork !== false,
+      browserEnv: this.config?.browserEnv === true,
+    };
+    const candidates = [
+      ...this._selfSources.filter(s => s.package === pkg),
+      REFERENCE_SOURCE,
+    ];
+    for (const source of candidates) {
+      let result;
+      try {
+        result = await reproduceChain(pkg, entryPoint, spec, source, opts);
+      } catch (err) {
+        logger.debug(`Chain synthesis error via ${source.package}: ${err.message}`);
+        continue;
+      }
+      if (!result?.verified) continue;
+      chain.endToEnd = true;
+      chain.sameLibrary = source.package === pkg;
+      chain.sourcePackage = {
+        package: source.package,
+        version: source.version || null,
+        entryPoint: source.entryPoint,
+        fixture: source.fixture === true,
+      };
+      // When reproduced via the reference merge, name the concrete
+      // currently-shipping sources the operator can cite in a real report.
+      if (source.fixture) {
+        chain.realWorldSources = (this.provenSources || [])
+          .slice(0, 5)
+          .map(s => ({ package: s.package, version: s.version || null, cve: s.cve || null }));
+      }
+      chain.standalonePoC = result.standalonePoC || chain.standalonePoC;
+      const via = source.fixture ? 'reference merge source' : `${source.package}${source.version ? '@' + source.version : ''}`;
+      logger.warn(`  ↳ END-TO-END exploit reproduced: ${via} → ${entryPoint} → sink${chain.sameLibrary ? ' [same library]' : ''}`);
+      return;
+    }
+    logger.debug(`No end-to-end chain reproduced for ${descriptor.property} via ${entryPoint}; gadget-half finding stands`);
   }
 
   async executeDifferentialPhase(inputs, iteration) {

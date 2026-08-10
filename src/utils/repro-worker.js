@@ -32,6 +32,8 @@ import { hardenWorkerProcess } from './worker-hardening.js';
 import { setupJsdomGlobals, loadBrowserModule, JSDOM_STARTUP_ALLOWANCE_MS, installDomSinkHooks as installDomSinkHooksShared } from './browser-env.js';
 import { callAndAwaitReal } from './proto-safe.js';
 import { argContainsTransformedValue } from './value-contains.js';
+import { collectSinkStrings } from './sink-record.js';
+import { sourceCallArgs } from '../verification/source-call.js';
 const require = createRequire(import.meta.url);
 
 // ─── SECURITY: capability blocks (shared with sandbox-worker.js) ─────────────
@@ -83,26 +85,38 @@ const sinkArgs = [];
 // untouched.
 const domSinkHits = [];
 function installSinkRecorders() {
-  const record = (arg) => { if (typeof arg === 'string') sinkArgs.push(arg); };
-  const wrap = (obj, name) => {
+  // Record {sink, value}, not a bare string, so a sink_reach proof can name WHICH
+  // sink the polluted value reached — the difference between "reached a code sink"
+  // (RCE) and "reached fs.readFile" (LFI) or "reached http.request" (SSRF). The
+  // impact category is then derived from the PROVEN sink, not a discovery guess.
+  //
+  // collectSinkStrings walks the WHOLE argument list — including options objects
+  // (env/socketPath/TLS options), whose prototype fall-through is exactly how the
+  // GHunter universal-gadget classes flow. Bounded and coercion-free; see
+  // sink-record.js for the safety contract.
+  const record = (sink, args) => {
+    for (const s of collectSinkStrings(args)) sinkArgs.push({ sink, value: s });
+  };
+  const wrap = (obj, name, label) => {
     const orig = obj[name];
     if (typeof orig !== 'function') return;
-    const wrapped = function (...args) { record(args[0]); return orig.apply(this, args); };
+    const sinkName = label || name;
+    const wrapped = function (...args) { record(sinkName, args); return orig.apply(this, args); };
     // Preserve the original's prototype — jsdom and other code rely on
     // `Function.prototype` identity (matches the sandbox worker's eval/Function
     // hooks). Without this, wrapping Function breaks browser-only targets.
     try { wrapped.prototype = orig.prototype; } catch { /* frozen */ }
     obj[name] = wrapped;
   };
-  wrap(globalThis, 'eval');
-  wrap(globalThis, 'Function');
+  wrap(globalThis, 'eval', 'eval');
+  wrap(globalThis, 'Function', 'Function');
   try {
     const vm = require('vm');
-    for (const m of ['runInThisContext', 'runInNewContext', 'compileFunction']) wrap(vm, m);
+    for (const m of ['runInThisContext', 'runInNewContext', 'compileFunction']) wrap(vm, m, `vm.${m}`);
   } catch { /* vm unavailable */ }
   try {
     const cp = require('child_process');
-    for (const m of ['exec', 'execSync', 'spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) wrap(cp, m);
+    for (const m of ['exec', 'execSync', 'spawn', 'spawnSync', 'execFile', 'execFileSync', 'fork']) wrap(cp, m, `child_process.${m}`);
   } catch { /* child_process unavailable */ }
   // SSRF sinks: http(s).request/get — record the URL argument BEFORE delegating,
   // so the token is captured however the call ends: a whole-token-as-URL string
@@ -115,11 +129,11 @@ function installSinkRecorders() {
   // its result, and the zero-FP gate would discard a genuinely proven
   // sink_reach (false negative). A target's own error listener still fires
   // (listeners are additive).
-  const wrapHttp = (obj, name) => {
+  const wrapHttp = (obj, name, label) => {
     const orig = obj[name];
     if (typeof orig !== 'function') return;
     obj[name] = function (...args) {
-      record(args[0]);
+      record(label, args);
       const req = orig.apply(this, args);
       if (req && typeof req.on === 'function') req.on('error', () => {});
       return req;
@@ -127,22 +141,55 @@ function installSinkRecorders() {
   };
   try {
     const http = require('http');
-    wrapHttp(http, 'request');
-    wrapHttp(http, 'get');
+    wrapHttp(http, 'request', 'http.request');
+    wrapHttp(http, 'get', 'http.get');
   } catch { /* http unavailable */ }
   try {
     const https = require('https');
-    wrapHttp(https, 'request');
-    wrapHttp(https, 'get');
+    wrapHttp(https, 'request', 'https.request');
+    wrapHttp(https, 'get', 'https.get');
   } catch { /* https unavailable */ }
   // LFI sinks: fs.readFileSync/readFile — record the path argument. fs is not
   // blocked; a nonexistent token path just throws in the original, which the
   // caller (reproRCE) already expects and catches.
   try {
     const fs = require('fs');
-    wrap(fs, 'readFileSync');
-    wrap(fs, 'readFile');
+    wrap(fs, 'readFileSync', 'fs.readFileSync');
+    wrap(fs, 'readFile', 'fs.readFile');
   } catch { /* fs unavailable */ }
+  // Cryptographic-downgrade sinks (GHunter taxonomy): TLS connection options
+  // (rejectUnauthorized / ciphers / minVersion / port / path fall-through) and
+  // crypto algorithm selection. Delegation is safe — the socket stays blocked
+  // and a bogus algorithm just throws in the original.
+  try {
+    const tls = require('tls');
+    wrap(tls, 'connect', 'tls.connect');
+    wrap(tls, 'createSecureContext', 'tls.createSecureContext');
+  } catch { /* tls unavailable */ }
+  try {
+    const crypto = require('crypto');
+    for (const m of ['createHash', 'createHmac', 'createCipheriv', 'createDecipheriv']) wrap(crypto, m, `crypto.${m}`);
+  } catch { /* crypto unavailable */ }
+  // worker_threads.Worker — the GHunter Node universal gadget: polluted
+  // `env`/`execArgv`/`workerData` on the options object flow into a fresh
+  // thread/process. Hardening has already replaced Worker with a throwing stub;
+  // wrap THAT so the arguments are recorded first, then the stub throws — the
+  // sink_reach proof lands, and no unpatched thread is ever spawned.
+  try {
+    const wt = require('worker_threads');
+    const Current = wt.Worker;
+    if (typeof Current === 'function') {
+      const RecordingWorker = function (...args) {
+        record('worker_threads.Worker', args);
+        return Reflect.construct(Current, args, new.target || Current);
+      };
+      // Preserve prototype identity and the hardened constructor backref (see
+      // worker-hardening.js) so instanceof checks and the stub's throw both
+      // behave exactly as before.
+      RecordingWorker.prototype = Current.prototype;
+      wt.Worker = RecordingWorker;
+    }
+  } catch { /* worker_threads unavailable */ }
 }
 installSinkRecorders();
 
@@ -230,9 +277,10 @@ async function handle(mode, packageName, entryPoint, args, msg, timeoutMs) {
   const realArgs = deserializeArgs(args);
 
   switch (mode) {
-    case 'repro_pp':  return reproPP(fn, realArgs, msg, timeoutMs);
-    case 'repro_rce': return reproRCE(fn, realArgs, msg, timeoutMs, targetModule, packageName);
-    default:          return { error: `Unknown repro mode: ${mode}`, verified: false };
+    case 'repro_pp':    return reproPP(fn, realArgs, msg, timeoutMs);
+    case 'repro_rce':   return reproRCE(fn, realArgs, msg, timeoutMs, targetModule, packageName);
+    case 'repro_chain': return reproChain(fn, realArgs, msg, timeoutMs, targetModule, packageName);
+    default:            return { error: `Unknown repro mode: ${mode}`, verified: false };
   }
 }
 
@@ -358,6 +406,72 @@ async function reproPP(fn, baseArgs, msg, timeoutMs) {
  * injected call survive compilation.
  */
 async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName) {
+  // Gadget-half proof: the pollution is assumed to have happened, so install the
+  // payload straight onto Object.prototype. `pollute` always succeeds (ok:true).
+  const pollute = async (props) => {
+    const installed = [];
+    for (const [k, v] of Object.entries(props)) installProp(k, v, installed);
+    return { ok: true, cleanup: () => { for (const p of installed.reverse()) restoreProp(p); } };
+  };
+  return runRcePayloads({ fn, baseArgs, msg, timeoutMs, targetModule, packageName, pollute });
+}
+
+/**
+ * repro_chain: prove a FULL end-to-end exploit
+ * (`attacker-input -> source -> gadget -> sink`). Identical to reproRCE except
+ * the pollution is not faked with a direct `Object.prototype[prop]=…` write —
+ * a proven PP *source* (a merge/set function, described by msg.source) is called
+ * with attacker JSON so the SOURCE plants the payload, exactly as it would in a
+ * real request. If the source does not actually plant the payload the payload is
+ * abandoned (never a silent fall-through to the gadget-half write), so a
+ * verified result means both halves ran for real in this fresh process.
+ */
+async function reproChain(fn, baseArgs, msg, timeoutMs, targetModule, packageName) {
+  const src = msg.source;
+  if (!src?.package || !src?.entryPoint) return { verified: false, error: 'no source specified' };
+  const sourceModule = await loadPackage(src.package, msg.browserEnv);
+  if (sourceModule?.__loadError) return { verified: false, error: `source load failed: ${sourceModule.__loadError}` };
+  const sourceFn = resolveEntryPoint(sourceModule, src.entryPoint, src.package);
+  if (typeof sourceFn !== 'function') return { verified: false, error: `source entry ${src.entryPoint} not found` };
+
+  const pollute = async (props) => {
+    const before = {};
+    for (const k of Object.keys(props)) {
+      const had = Object.prototype.hasOwnProperty.call(Object.prototype, k);
+      before[k] = { had, val: had ? Object.prototype[k] : undefined };
+    }
+    const cleanup = () => {
+      for (const k of Object.keys(props)) {
+        try { delete Object.prototype[k]; } catch { /* sealed */ }
+        if (before[k].had) { try { Object.prototype[k] = before[k].val; } catch { /* sealed */ } }
+      }
+    };
+    // Drive the source with attacker JSON to pollute every property (primary +
+    // gates). Object-shaped sources plant them in one call; path-shaped sources
+    // plant one per call.
+    for (const callArgs of sourceCallArgs(src.payloadKind, src.callConvention, props)) {
+      try { await callAndAwaitReal(sourceFn, clone(callArgs), timeoutMs); }
+      catch { /* a source may throw after polluting */ }
+    }
+    // The chain is real only if the SOURCE actually planted the payload on the
+    // primary property. If not, skip this payload — do NOT write it directly,
+    // which would downgrade to the gadget-half proof and over-claim end-to-end.
+    const primary = Object.keys(props)[0];
+    const ok = Object.prototype[primary] === props[primary];
+    return { ok, cleanup };
+  };
+
+  return runRcePayloads({ fn, baseArgs, msg, timeoutMs, targetModule, packageName, pollute });
+}
+
+/**
+ * Shared payload loop for reproRCE and reproChain. The two differ ONLY in how the
+ * prototype is polluted (`pollute`): a direct install (gadget half) vs a real
+ * source call (end-to-end). `pollute(props)` returns `{ ok, cleanup }` — `ok`
+ * false means the pollution step didn't take (source failed), so the payload is
+ * skipped rather than tested.
+ */
+async function runRcePayloads({ fn, baseArgs, msg, timeoutMs, targetModule, packageName, pollute }) {
   const prop = msg.property;
   const gates = Array.isArray(msg.gates) ? msg.gates.filter(g => g && g !== prop) : [];
   const sequenceSteps = msg.sequence?.steps;
@@ -389,7 +503,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
     // after the reversible value transforms real gadget code applies (case fold,
     // dash/underscore, URL-encode). argContainsTransformedValue is a strict
     // superset of includes(), so this never loses a plain-substring match.
-    { type: 'sink_reach', make: () => sinkToken, fired: () => sinkArgs.some(a => argContainsTransformedValue(a, sinkToken)) || domSinkHits.some(h => argContainsTransformedValue(h.value, sinkToken)) },
+    { type: 'sink_reach', make: () => sinkToken, fired: () => sinkArgs.some(h => argContainsTransformedValue(h.value, sinkToken)) || domSinkHits.some(h => argContainsTransformedValue(h.value, sinkToken)) },
   ];
 
   for (const payload of payloads) {
@@ -406,10 +520,12 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
     delete globalThis[CANARY_GLOBAL];
     sinkArgs.length = 0;
     domSinkHits.length = 0;
-    const installed = [];
+    const props = { [prop]: payload.make() };
+    for (const g of gates) props[g] = true;
+
+    const { ok, cleanup } = await pollute(props);
+    if (!ok) { cleanup(); continue; } // pollution step didn't take → skip payload
     try {
-      installProp(prop, payload.make(), installed);
-      for (const g of gates) installProp(g, true, installed);
       try {
         if (Array.isArray(sequenceSteps) && sequenceSteps.length) {
           await runSequence(targetModule, sequenceSteps, timeoutMs, packageName);
@@ -429,11 +545,18 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
         }
       } catch { /* exploit payloads routinely throw after firing */ }
     } finally {
-      for (const p of installed.reverse()) restoreProp(p);
+      cleanup();
     }
 
     if (payload.fired()) {
-      const domHit = domSinkHits.find(h => argContainsTransformedValue(h.value, sinkToken));
+      // Name the sink that was actually reached. For sink_reach that is the tagged
+      // Node/DOM sink the token landed in (→ command-injection / SSRF / LFI / XSS);
+      // for the canary payloads the polluted value genuinely executed as code, so
+      // the proven sink is code execution regardless of which eval/Function/vm
+      // mechanism ran it.
+      const hit = sinkArgs.find(h => argContainsTransformedValue(h.value, sinkToken))
+        || domSinkHits.find(h => argContainsTransformedValue(h.value, sinkToken));
+      const provenSink = payload.type === 'sink_reach' ? (hit?.sink || null) : 'code-execution';
       delete globalThis[CANARY_GLOBAL];
       sinkArgs.length = 0;
       domSinkHits.length = 0;
@@ -442,7 +565,7 @@ async function reproRCE(fn, baseArgs, msg, timeoutMs, targetModule, packageName)
       // URL → pollution step with the target's own parsing (no embedded parser).
       // A confirmed syntax makes the browser-URL PoC a verified end-to-end chain.
       const urlChain = msg.browserEnv ? await verifyUrlChain(fn, prop, timeoutMs) : null;
-      return { verified: true, payloadType: payload.type, canary: token, gates, sink: domHit?.sink || null, urlChain };
+      return { verified: true, payloadType: payload.type, canary: token, gates, sink: provenSink, urlChain };
     }
   }
   delete globalThis[CANARY_GLOBAL];
@@ -552,7 +675,7 @@ function resolveEntryPoint(module, name, packageName) {
   // never as a catch-all for an unrelated or nonexistent entry point name.
   // Checked BEFORE the dotted-path branch below: a package identifier can be a
   // filesystem path (a local target, or a test fixture) whose directory contains
-  // a dot — e.g. `.../.claude/worktrees/.../bare-merge`. Treating that as a
+  // a dot — e.g. `.../.worktrees/agent-run-3/bare-merge`. Treating that as a
   // dotted property path would walk nonexistent keys and never reach this
   // fallback, so a bare-function module addressed by a dotted path would fail to
   // resolve. This short-circuits only when the module itself is callable.

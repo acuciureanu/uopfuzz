@@ -131,6 +131,41 @@ npm run benchmark            # real installs; PASS iff TP ≥ 90% and FP ≤ 10%
 npm run benchmark:self-test  # offline check of the scoring logic (no installs)
 ```
 
+### Runtime-gadget benchmark (UoPFuzz vs GHunter)
+
+A second, offline benchmark runs GHunter's published Node.js universal-gadget
+corpus (runtime gadgets like polluted `NODE_OPTIONS` → `child_process.exec`)
+through UoPFuzz's own oracles — no installs, no network:
+
+```bash
+npm run benchmark:runtime-gadgets   # per-gadget verdicts; exit 1 on a capability gap
+```
+
+Entries documented as fixed upstream (e.g. the `require` gadget, fixed in Node
+18.19.0) or verified as incidentally mitigated on the running Node must come
+back unobservable — a regression there fails the run. Results are committed at
+`benchmark/runtime-gadgets/RESULTS.md` (regenerate with `--write`).
+
+### Mining for NEW runtime gadgets (beyond GHunter)
+
+The runtime gadget miner does GHunter's candidate enumeration on a **stock**
+runtime with **zero manual validation**: it harvests option-property reads from
+the Node source exposed via `process.binding('natives')`, then validates every
+candidate with the value-differential oracle (clean vs polluted behavior), the
+exit-code oracle (polluted-only fatal exit = DoS), and the 2× fresh-process
+sink reproduction for impact classification:
+
+```bash
+npm run mine:runtime-gadgets                                   # all 17 API classes
+node benchmark/runtime-gadgets/mine.js --classes tls.connect   # one class
+node benchmark/runtime-gadgets/mine.js --write                 # + FINDINGS.md
+```
+
+Findings land in `results/runtime-miner/`. Because nothing is patched, the
+miner re-runs on every new Node release as a continuous discovery/regression
+gate. Verdicts never rest on sink recording alone — only an observable
+behavior change or an exit-code difference counts as LIVE/DoS.
+
 ## Options
 
 | Flag | Default | Meaning |
@@ -150,6 +185,7 @@ npm run benchmark:self-test  # offline check of the scoring logic (no installs)
 | `--allow-suspicious` | off | Install packages with suspicious install scripts (**DANGEROUS**) |
 | `--skip-integrity-check` | off | Skip package integrity verification |
 | `--no-osv` | OSV on | Disable live OSV.dev lookups (an OSV query reveals the analyzed `package@version` to a third party) |
+| `--no-chain` | chain on | Disable end-to-end chain synthesis (pairing a proven gadget with a proven PP source and reproducing the full attacker-input → source → gadget → sink exploit); findings are then reported gadget-half only |
 
 The guardrail-lowering flags (`--no-sandbox`, `--allow-scripts`,
 `--allow-suspicious`, `--allow-network`) are opt-in and print a warning.
