@@ -44,9 +44,9 @@ Node 24.17.0 — 2026-08-10
 | DETECTED | tls-connect-port | tls.connect | port | second-order-SSRF | sink_reach @ tls.connect (2x) |
 | DETECTED | tls-connect-tls-reject | tls.connect | NODE_TLS_REJECT_UNAUTHORIZED | crypto-downgrade | clean "FP:DEPTH_ZERO_SELF_SIGNED_CERT", polluted "FP:HANDSHAKE-OK" |
 | DETECTED | https-request-tls-reject | https.request | NODE_TLS_REJECT_UNAUTHORIZED | crypto-downgrade | clean "FP:DEPTH_ZERO_SELF_SIGNED_CERT", polluted "FP:ECONNRESET" |
-| MITIGATED-UPSTREAM | import-source | import() | source | ACE | not verified |
-| FIXED-UPSTREAM | require-main | require | main | ACE | not verified |
-| MITIGATED-UPSTREAM | require-node-options | require | NODE_OPTIONS | ACE | not verified |
+| MITIGATED-UPSTREAM | import-source | import() | source | ACE | clean "FP:imported=1", polluted "FP:imported=1" |
+| FIXED-UPSTREAM | require-main | require | main | ACE | clean "FP:main=1", polluted "FP:main=1" |
+| MITIGATED-UPSTREAM | require-node-options | require | NODE_OPTIONS | ACE | clean "FP:main=1", polluted "FP:main=1" |
 | DETECTED | worker-ctor-env | worker_threads.Worker | env | EoP | sink_reach @ worker_threads.Worker (2x) |
 | DETECTED | worker-ctor-eval | worker_threads.Worker | eval | ACE | sink_reach @ worker_threads.Worker (2x) |
 | DETECTED | worker-ctor-argv | worker_threads.Worker | argv | EoP | sink_reach @ worker_threads.Worker (2x) |

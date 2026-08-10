@@ -100,30 +100,6 @@ function probeTlsConnect() {
   }
 }
 
-// ─── dynamic import source (ACE; fixed in current Node) ──────────────────────
-// GHunter PoC: nodejs/import/import.source.PoC.js — polluted `source` is
-// evaluated instead of the file contents when importing an .mjs module.
-async function probeImport() {
-  try {
-    await import('./plain.mjs');
-    return 'imported';
-  } catch (e) {
-    return { error: String(e && e.message || e).slice(0, 120) };
-  }
-}
-
-// ─── require main (ACE; fixed in Node v18.19.0) ──────────────────────────────
-// GHunter PoC: nodejs/require/require.main*.PoC.js — polluted `main` redirects
-// directory requires to an attacker-chosen entry file.
-function probeRequireDir() {
-  try {
-    require('./sub');
-    return 'required';
-  } catch (e) {
-    return { error: String(e && e.message || e).slice(0, 120) };
-  }
-}
-
 // ─── worker_threads ctor options (EoP / second-order ACE) ────────────────────
 // GHunter PoC: nodejs/working_threads/ctor.PoC.js — polluted env/eval/execArgv
 // fall through into the Worker constructor options.
@@ -310,8 +286,6 @@ module.exports = {
   probeFetch,
   probeFetchNetwork,
   probeTlsConnect,
-  probeImport,
-  probeRequireDir,
   probeWorkerCtor,
   // mining probes
   probeHttpListen,
