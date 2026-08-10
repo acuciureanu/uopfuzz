@@ -18,6 +18,28 @@
   - Type coercion exploits
   - Async pollution patterns
 
+### Seeds vs. mechanism
+
+The static lists in this repo are fuzzer **seeds**, not detection logic:
+
+| Artifact | File | Role |
+|---|---|---|
+| `GENERIC_POLLUTION_PROPS`, `PAYLOADS` | `src/input-generation/index.js` | Seed dictionary of property names and payload values (AFL-style; shapes known to be useful across library categories) |
+| Known-gadget/CVE DB | `src/gadget-analysis/known-gadgets.js` | Seed priority for known-CVE properties, novelty triage labels, benchmark ground truth |
+| `GATE_PROPERTIES` | `src/instrumentation/gate-properties.js` | Dasty-style forced-branch co-pollution |
+| Runtime corpus | `benchmark/runtime-gadgets/corpus.js` | Benchmark questions; verdicts are computed by executing every entry |
+
+No verdict depends on these lists. Candidate properties are discovered
+target-first: `discoverUOPProperties` (`src/instrumentation/differential.js`)
+observes which *absent* properties the library actually reads, and those feed
+back into the fuzzer above every static list. Detection is behavioral
+(differential oracle + sink-token capture), and confirmation is the
+reproduction gate in fresh processes. Executable proof:
+`tests/integration/novel-property-detection.test.js` detects and confirms a
+gadget whose property appears in no list. The static lists only bias the
+search order toward known shapes — a target whose gadget property matches
+nothing static is still found whenever its reads are observable.
+
 ### 3. Instrumentation (`src/instrumentation/`)
 - **Purpose**: Executes inputs with comprehensive tracing
 - **Key Features**:

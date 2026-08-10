@@ -103,15 +103,15 @@ export const RUNTIME_GADGETS = [
   { id: 'https-request-tls-reject', api: 'https.request', bhvProbe: 'bhv-https-reject', property: 'NODE_TLS_REJECT_UNAUTHORIZED', value: '0', category: 'crypto-downgrade', via: 'behavioral', ghunter: 'KTH README table' },
 
   // ─── module loaders — ACE (both fixed upstream; verified empirically) ──────
-  // import-source: NOT observable on Node 24 — direct experiment imports the
-  // real file, the polluted `source` is never evaluated (ESM loader rewrite).
-  // No documented fix version (Node treats gadgets as out of threat model).
-  { id: 'import-source', api: 'import()', entryPoint: 'probeImport',     property: 'source', category: 'ACE', via: 'repro', expectSink: null,                    ghunter: 'nodejs/import/import.source.PoC.js', mitigated: 'ESM loader no longer reads prototype source (verified Node 24.17)' },
-  { id: 'require-main',  api: 'require',  entryPoint: 'probeRequireDir', property: 'main',   category: 'ACE', via: 'repro', expectSink: null, fixedIn: '18.19.0', ghunter: 'nodejs/require/require.main2.PoC.js' },
+  // import-source: NOT observable on Node 24 — behavioral probe imports the
+  // real module both ways; the polluted `source` is never used (ESM loader
+  // rewrite). If it ever becomes live, the fingerprint flips to imported=666.
+  { id: 'import-source', api: 'import()', bhvProbe: 'bhv-import-source', property: 'source', value: 'data:text/javascript,export default 666', category: 'ACE', via: 'behavioral', ghunter: 'nodejs/import/import.source.PoC.js', mitigated: 'ESM loader no longer reads prototype source (verified Node 24.17)' },
+  { id: 'require-main',  api: 'require',  bhvProbe: 'bhv-require-main',  property: 'main',   value: 'evil.js', category: 'ACE', via: 'behavioral', ghunter: 'nodejs/require/require.main2.PoC.js', fixedIn: '18.19.0' },
   // require + NODE_OPTIONS: the ACE required the `main` resolution gadget to
   // load the attacker's file; with that fixed (18.19.0) the NODE_OPTIONS half
-  // is inert — verified directly on Node 24.17 (no effect on require).
-  { id: 'require-node-options', api: 'require', entryPoint: 'probeRequireDir', property: 'NODE_OPTIONS', category: 'ACE', via: 'repro', expectSink: null, ghunter: 'KTH README table', mitigated: 'ACE mechanism was the require-main gadget, fixed in 18.19.0; no effect verified Node 24.17' },
+  // is inert — same probe, fingerprint must stay main=1.
+  { id: 'require-node-options', api: 'require', bhvProbe: 'bhv-require-main', property: 'NODE_OPTIONS', value: '--inspect-brk=127.0.0.1:0', category: 'ACE', via: 'behavioral', ghunter: 'KTH README table', mitigated: 'ACE mechanism was the require-main gadget, fixed in 18.19.0; no effect verified Node 24.17' },
 
   // ─── worker_threads ctor options — EoP / second-order ACE ─────────────────
   { id: 'worker-ctor-env', api: 'worker_threads.Worker', entryPoint: 'probeWorkerCtor', property: 'env', category: 'EoP', via: 'repro', expectSink: 'worker_threads.Worker', ghunter: 'nodejs/working_threads/ctor.PoC.js' },

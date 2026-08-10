@@ -52,6 +52,8 @@ The demo target `lodash@4.17.4` is deliberately old: its prototype pollution is 
 
 The pipeline is: discover entry points → coverage-guided fuzzing → differential oracle (clean vs. polluted run; only behaviour the pollution *caused* counts) → reproduction gate → cross-reference against advisory DBs. See [docs/architecture.md](docs/architecture.md) for details.
 
+The fuzzer's built-in property/payload lists are seeds, not detection logic: candidate properties are discovered per target by observing which absent properties the library actually reads, and no verdict depends on a list lookup (see "Seeds vs. mechanism" in the architecture doc, and the proof test `tests/integration/novel-property-detection.test.js`).
+
 A gadget only matters if a prototype-pollution *source* can reach it. Pollution is a global effect, so any function that merges attacker input into an object is an interchangeable source — once a gadget is confirmed, UoPFuzz pairs it with a real, currently-shipping source and reproduces a runnable `attacker-input → source → gadget → sink` PoC:
 
 ```javascript
