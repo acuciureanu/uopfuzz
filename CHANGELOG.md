@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`DETECTED` / `FIXED-UPSTREAM` / `MITIGATED-UPSTREAM` / `NOT-DETECTED`) and a
   behavioral oracle for effects that only materialize in live TLS/HTTP
   handshakes.
-- **GHunter A/B harness** (`npm run ab:ghunter`): replays the published
-  GHunter4Node gadget table against the current runtime and compares recall.
+- **GHunter comparison harness** (`npm run compare:ghunter`): replays the
+  published GHunter4Node gadget table against the current runtime and compares
+  recall.
 - Options-aware sink recording (`src/utils/sink-record.js`), crypto-downgrade
   sink detection, and sink-impact classification.
 - Chain-synthesis verification and a source-call registry for tracing gadget

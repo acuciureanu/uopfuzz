@@ -1,4 +1,4 @@
-# A/B — UoPFuzz vs GHunter
+# Comparison — UoPFuzz vs GHunter
 
 Node 24.17.0 — 2026-08-10
 

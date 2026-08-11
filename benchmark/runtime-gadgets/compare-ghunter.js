@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * A/B comparison — UoPFuzz vs GHunter on a shared ground truth.
+ * Comparison — UoPFuzz vs GHunter on a shared ground truth.
  *
  * GHunter itself cannot be run here (its artifact requires building a patched
  * Node v21/V8 from source — hours and tens of GB — and its verdicts would
@@ -23,7 +23,7 @@
  * for a gadget the runtime no longer has, and the correct detection of a
  * gadget's death is itself signal.
  *
- * Usage: node benchmark/runtime-gadgets/ab-test.js [--write]
+ * Usage: node benchmark/runtime-gadgets/compare-ghunter.js [--write]
  */
 
 import fs from 'node:fs';
@@ -33,7 +33,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const RESULTS_MD = path.join(__dirname, 'RESULTS.md');
 const FINDINGS_JSONL = path.resolve(__dirname, '../../results/runtime-miner/findings.jsonl');
-const OUT_MD = path.resolve(__dirname, '../../results/runtime-miner/AB-RESULTS.md');
+const OUT_MD = path.resolve(__dirname, '../../results/runtime-miner/COMPARISON.md');
 
 // ─── GHunter's published Node.js gadgets (README table, Node.js section) ─────
 // api → properties. Windows-only rows are excluded (cannot run here).
@@ -144,7 +144,7 @@ function summarize(rows) {
 }
 
 function render(rows, s) {
-  let md = `# A/B — UoPFuzz vs GHunter\n\nNode ${process.versions.node} — ${new Date().toISOString().slice(0, 10)}\n\n`;
+  let md = `# Comparison — UoPFuzz vs GHunter\n\nNode ${process.versions.node} — ${new Date().toISOString().slice(0, 10)}\n\n`;
   md += `Ground truth: union of GHunter's published, manually-validated Node gadget table and UoPFuzz's machine-verified findings (corpus + miner). GHunter itself cannot execute here (patched-Node v21 artifact); its answers are its own published table.\n\n`;
   md += `## Headline\n\n`;
   md += `- GHunter-published gadget properties: **${s.publishedTotal}**\n`;

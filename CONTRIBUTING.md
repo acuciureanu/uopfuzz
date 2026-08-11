@@ -30,7 +30,7 @@ npm run benchmark        # full ground-truth benchmark (installs real packages)
 npm run benchmark:self-test   # benchmark scoring logic only, installs nothing
 npm run benchmark:runtime-gadgets  # runtime-gadget corpus (no installs)
 npm run mine:runtime-gadgets       # mine the installed Node runtime for gadgets
-npm run ab:ghunter                 # regenerate the GHunter A/B report
+npm run compare:ghunter            # regenerate the GHunter comparison report
 ```
 
 The test suite is hermetic (purpose-built fixtures under `tests/fixtures/`, no
